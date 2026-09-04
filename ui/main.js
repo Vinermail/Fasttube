@@ -238,9 +238,8 @@ function playYtAt(i) {
     thumbnail: t.thumbnail || "",
     durationSecs: t.duration_secs,
   }));
-  invoke("play_queue", { items, start: i })
-    .then(() => refresh())
-    .catch((e) => showError(e));
+  setMode("youtube");
+  invoke("play_queue", { items, start: i }).catch((e) => showError(e));
 }
 
 // Show the given tracks on the right side (search results, liked songs,
@@ -290,20 +289,37 @@ async function doSearch(append) {
       limit: searchLimit,
       music: false,
     });
-    setMode("youtube");
-    setYtTracks(tracks, append, append ? null : {
-      title: `Search: ${searchQuery}`,
-      subtitle: "YouTube",
-      cover: tracks[0] ? tracks[0].thumbnail || "" : "",
-    });
-    $("yt-more-btn").classList.remove("hidden");
+    setYtTracks(tracks, append, null);
+    renderSearchResults();
+    $("search-more").classList.remove("hidden");
     if (append) searchLimit += 20;
   } catch (e) {
     showError(e);
   }
 }
 
-$("yt-more-btn").onclick = () => doSearch(true);
+function renderSearchResults() {
+  const empty = $("search-empty");
+  const list = $("search-results");
+  if (!currentYtTracks.length) {
+    empty.classList.remove("hidden");
+    list.classList.add("hidden");
+    return;
+  }
+  empty.classList.add("hidden");
+  list.classList.remove("hidden");
+  activeListIsSearch = true;
+  const rows = currentYtTracks.map((t) => ({
+    title: t.title,
+    artist: t.artist,
+    duration: t.duration_secs,
+  }));
+  renderTracks(list, applyFilterSort(rows), -1, "s:" + ytListVersion + ":" + filterText + ":" + sortMode);
+  activeListIsSearch = false;
+}
+
+$("search-more").onclick = () => doSearch(true);
+$("yt-query").addEventListener("focus", () => showMainView("search"));
 $("yt-query").addEventListener("keydown", (e) => {
   if (e.key === "Enter") doSearch(false);
 });
@@ -559,6 +575,8 @@ let renderedTracksKey = null;
 let trackRows = [];
 let trackActive = -1;
 let lastFirst = -1;
+let trackListEl = null;
+let activeListIsSearch = false;
 
 function buildRow(row, i) {
   const div = document.createElement("div");
@@ -572,8 +590,14 @@ function buildRow(row, i) {
     `<div class="t-title">${escapeHtml(row.title)}</div>` +
     `<div class="t-artist">${escapeHtml(row.artist || "")}</div>` +
     `<div class="t-dur">${dur}</div>`;
+  const isSearch = activeListIsSearch;
   div.onclick = () => {
     const orig = row.orig;
+    if (isSearch) {
+      playYtAt(orig);
+      showMainView("player");
+      return;
+    }
     if (mode === "youtube") {
       if (queueInfo && queueInfo.active && queueInfo.items.length) {
         // Jump within the currently playing queue (same order).
@@ -591,7 +615,8 @@ function buildRow(row, i) {
 }
 
 function updateTracks() {
-  const el = $("tracks");
+  const el = trackListEl;
+  if (!el) return;
   const savedScroll = el.scrollTop;
   el.innerHTML = "";
   const total = trackRows.length;
@@ -615,19 +640,26 @@ function updateTracks() {
   el.scrollTop = savedScroll;
 }
 
-$("tracks").addEventListener("scroll", () => {
-  const first = Math.floor($("tracks").scrollTop / ROW_H);
-  if (Math.abs(first - lastFirst) >= OVERSCAN / 2) updateTracks();
+["tracks", "search-results"].forEach((id) => {
+  const el = document.getElementById(id);
+  if (el) {
+    el.addEventListener("scroll", () => {
+      if (trackListEl !== el) return;
+      const first = Math.floor(el.scrollTop / ROW_H);
+      if (Math.abs(first - lastFirst) >= OVERSCAN / 2) updateTracks();
+    });
+  }
 });
 
 // Virtualized track list: only the visible rows exist in the DOM, so huge
 // playlists stay cheap regardless of their size.
-function renderTracks(rows, activeIndex, key) {
+function renderTracks(el, rows, activeIndex, key) {
+  trackListEl = el;
   if (key !== renderedTracksKey) {
     renderedTracksKey = key;
     trackRows = rows;
     trackActive = activeIndex;
-    $("tracks").scrollTop = 0;
+    el.scrollTop = 0;
     updateTracks();
     return;
   }
@@ -639,7 +671,7 @@ function renderTracks(rows, activeIndex, key) {
 
 async function refreshTracks(key, activeIndex) {
   if (key === trackListKey) {
-    renderTracks(applyFilterSort(trackList), activeIndex, key + ":" + filterText + ":" + sortMode);
+    renderTracks($("tracks"), applyFilterSort(trackList), activeIndex, key + ":" + filterText + ":" + sortMode);
     return;
   }
   try {
@@ -650,7 +682,7 @@ async function refreshTracks(key, activeIndex) {
       duration: t.duration,
     }));
     trackListKey = key;
-    renderTracks(applyFilterSort(trackList), activeIndex, key + ":" + filterText + ":" + sortMode);
+    renderTracks($("tracks"), applyFilterSort(trackList), activeIndex, key + ":" + filterText + ":" + sortMode);
   } catch (e) {
     showError(e);
   }
@@ -757,7 +789,7 @@ function renderState(state) {
       key = "y:" + ytListVersion;
       $("lh-related").classList.add("hidden");
     }
-    renderTracks(applyFilterSort(rows), activeIdx, key + ":" + filterText + ":" + sortMode);
+    renderTracks($("tracks"), applyFilterSort(rows), activeIdx, key + ":" + filterText + ":" + sortMode);
   } else if (state) {
     const key = "l:" + state.playlist_name + ":" + state.playlist_len;
     $("lh-related").classList.add("hidden");
@@ -1140,3 +1172,4 @@ pollApiStatus();
 setInterval(refresh, 250);
 setInterval(pollApiStatus, 3000);
 setInterval(highlightLyrics, 250);
+

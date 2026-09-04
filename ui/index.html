@@ -7,10 +7,6 @@
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
-  <button id="mode-settings" class="tbtn pb-settings" title="Settings">⚙</button>
-  <div id="top-search">
-    <input id="yt-query" type="text" placeholder="Поиск" autocomplete="off" />
-  </div>
   <aside id="sidebar">
     <div class="brand">Fasttube</div>
     <div class="nav-row">
@@ -47,6 +43,10 @@
   <div id="splitter" class="splitter"></div>
 
   <main id="main">
+    <div id="topbar">
+      <input id="yt-query" type="text" placeholder="Поиск" autocomplete="off" />
+      <button id="mode-settings" class="tbtn pb-settings" title="Settings">⚙</button>
+    </div>
     <div id="view-player" class="view">
       <div id="empty">
         <div class="empty-inner">
@@ -86,6 +86,12 @@
           <div class="lyrics-empty">Start playing a track and press the lyrics button.</div>
         </div>
       </div>
+    </div>
+
+    <div id="view-search" class="view hidden">
+      <div id="search-empty" class="search-empty">Начни вводить запрос и нажми Enter</div>
+      <div id="search-results" class="tracks hidden"></div>
+      <button id="search-more" class="btn load-more hidden">Load more</button>
     </div>
 
     <div id="view-settings" class="view hidden">
