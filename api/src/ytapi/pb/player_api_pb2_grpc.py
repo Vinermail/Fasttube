@@ -49,6 +49,11 @@ class PlayerApiStub:
                 request_serializer=player__api__pb2.ResolveRequest.SerializeToString,
                 response_deserializer=player__api__pb2.ResolveResponse.FromString,
                 _registered_method=True)
+        self.PrefetchResolve = channel.unary_unary(
+                '/player.PlayerApi/PrefetchResolve',
+                request_serializer=player__api__pb2.PrefetchResolveRequest.SerializeToString,
+                response_deserializer=player__api__pb2.PrefetchResolveResponse.FromString,
+                _registered_method=True)
         self.Recommend = channel.unary_unary(
                 '/player.PlayerApi/Recommend',
                 request_serializer=player__api__pb2.RecommendRequest.SerializeToString,
@@ -107,6 +112,12 @@ class PlayerApiServicer:
         raise NotImplementedError('Method not implemented!')
 
     def ResolveUrl(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def PrefetchResolve(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -177,6 +188,11 @@ def add_PlayerApiServicer_to_server(servicer, server):
                     servicer.ResolveUrl,
                     request_deserializer=player__api__pb2.ResolveRequest.FromString,
                     response_serializer=player__api__pb2.ResolveResponse.SerializeToString,
+            ),
+            'PrefetchResolve': grpc.unary_unary_rpc_method_handler(
+                    servicer.PrefetchResolve,
+                    request_deserializer=player__api__pb2.PrefetchResolveRequest.FromString,
+                    response_serializer=player__api__pb2.PrefetchResolveResponse.SerializeToString,
             ),
             'Recommend': grpc.unary_unary_rpc_method_handler(
                     servicer.Recommend,
@@ -300,6 +316,33 @@ class PlayerApi:
             '/player.PlayerApi/ResolveUrl',
             player__api__pb2.ResolveRequest.SerializeToString,
             player__api__pb2.ResolveResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def PrefetchResolve(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/player.PlayerApi/PrefetchResolve',
+            player__api__pb2.PrefetchResolveRequest.SerializeToString,
+            player__api__pb2.PrefetchResolveResponse.FromString,
             options,
             channel_credentials,
             insecure,

@@ -33,6 +33,7 @@ message SearchResponse {
 message ResolveRequest {
   string video_id = 1;
   string audio_quality = 2; // "standard" | "high"
+  bool force = 3; // skip the cache and re-extract
 }
 
 message ResolveResponse {
@@ -43,6 +44,15 @@ message ResolveResponse {
   string mime_type = 5;
   uint64 content_length = 6;
   int32 itag = 7;
+}
+
+message PrefetchResolveRequest {
+  repeated string ids = 1;
+  string audio_quality = 2;
+}
+
+message PrefetchResolveResponse {
+  int32 resolved = 1;
 }
 
 message RecommendRequest {
@@ -119,6 +129,7 @@ service PlayerApi {
   rpc Health(Empty) returns (HealthResponse);
   rpc Search(SearchRequest) returns (SearchResponse);
   rpc ResolveUrl(ResolveRequest) returns (ResolveResponse);
+  rpc PrefetchResolve(PrefetchResolveRequest) returns (PrefetchResolveResponse);
   rpc Recommend(RecommendRequest) returns (RecommendResponse);
   rpc GetUserPlaylists(Empty) returns (UserPlaylistsResponse);
   rpc GetPlaylistTracks(PlaylistTracksRequest) returns (PlaylistTracksResponse);

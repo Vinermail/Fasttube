@@ -3,6 +3,7 @@
 import logging
 import os
 import sys
+import threading
 from concurrent import futures
 
 import grpc
@@ -69,6 +70,7 @@ class PlayerApiServicer(player_api_pb2_grpc.PlayerApiServicer):
                 request.video_id,
                 cookies,
                 request.audio_quality or youtube.QUALITY_STANDARD,
+                force=request.force,
             )
             resp = player_api_pb2.ResolveResponse(
                 ok=result.get("ok", False),
@@ -83,6 +85,17 @@ class PlayerApiServicer(player_api_pb2_grpc.PlayerApiServicer):
             return resp
         except Exception as e:
             log.exception("resolve failed")
+            context.abort(grpc.StatusCode.INTERNAL, str(e))
+
+    def PrefetchResolve(self, request, context):
+        try:
+            count = youtube.prefetch_resolve(
+                list(request.ids),
+                request.audio_quality or youtube.QUALITY_STANDARD,
+            )
+            return player_api_pb2.PrefetchResolveResponse(resolved=count)
+        except Exception as e:
+            log.exception("prefetch resolve failed")
             context.abort(grpc.StatusCode.INTERNAL, str(e))
 
     def Recommend(self, request, context):
@@ -160,12 +173,31 @@ class PlayerApiServicer(player_api_pb2_grpc.PlayerApiServicer):
 
 def serve():
     logging.basicConfig(level=logging.INFO)
+    _warm_up_ytdlp()
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=8))
     player_api_pb2_grpc.add_PlayerApiServicer_to_server(PlayerApiServicer(), server)
     server.add_insecure_port(f"127.0.0.1:{PORT}")
     server.start()
     log.info("ytapi listening on 127.0.0.1:%s", PORT)
     server.wait_for_termination()
+
+
+def _warm_up_ytdlp() -> None:
+    """Pre-fetches yt-dlp's player data in the background so the first real
+    resolve is fast instead of paying the full extraction cost."""
+
+    def warm():
+        try:
+            import yt_dlp
+
+            opts = dict(youtube.YT_DLP_OPTS)
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                ydl.extract_info("dQw4w9WgXcQ", download=False)
+            log.info("yt-dlp warm-up done")
+        except Exception as e:
+            log.warning("yt-dlp warm-up failed: %s", e)
+
+    threading.Thread(target=warm, name="ytdlp-warmup", daemon=True).start()
 
 
 if __name__ == "__main__":

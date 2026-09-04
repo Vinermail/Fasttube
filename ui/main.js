@@ -259,6 +259,18 @@ function setYtTracks(tracks, append, meta) {
   if (meta) {
     setListHeader(meta);
   }
+  if (!append && tracks.length) {
+    // Warm the backend: resolve the first few tracks in parallel so the
+    // first click starts instantly.
+    const items = tracks.slice(0, 4).map((t) => ({
+      id: t.video_id,
+      title: t.title,
+      artist: t.artist,
+      thumbnail: t.thumbnail || "",
+      durationSecs: t.duration_secs,
+    }));
+    invoke("prefetch_tracks", { items }).catch(() => {});
+  }
   refresh();
 }
 

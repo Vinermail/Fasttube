@@ -9,9 +9,10 @@ pub mod proto {
 
 pub use proto::{
     Empty, HealthResponse, LyricsRequest, LyricsResponse, PlaylistTracksRequest,
-    PlaylistTracksResponse, PollOAuthResponse, RecommendRequest, ResolveRequest, ResolveResponse,
-    SearchRequest, SetBrowserAuthRequest, SetBrowserAuthResponse, StartOAuthRequest,
-    StartOAuthResponse, Track, UserPlaylistsResponse, player_api_client::PlayerApiClient,
+    PlaylistTracksResponse, PollOAuthResponse, PrefetchResolveRequest, PrefetchResolveResponse,
+    RecommendRequest, ResolveRequest, ResolveResponse, SearchRequest, SetBrowserAuthRequest,
+    SetBrowserAuthResponse, StartOAuthRequest, StartOAuthResponse, Track, UserPlaylistsResponse,
+    player_api_client::PlayerApiClient,
 };
 
 pub async fn connect() -> Result<PlayerApiClient<Channel>> {
@@ -25,14 +26,34 @@ pub async fn health() -> Result<HealthResponse> {
 }
 
 pub async fn resolve(video_id: &str, quality: &str) -> Result<ResolveResponse> {
+    resolve_impl(video_id, quality, false).await
+}
+
+pub async fn resolve_forced(video_id: &str, quality: &str) -> Result<ResolveResponse> {
+    resolve_impl(video_id, quality, true).await
+}
+
+async fn resolve_impl(video_id: &str, quality: &str, force: bool) -> Result<ResolveResponse> {
     let mut client = connect().await?;
     let resp = client
         .resolve_url(tonic::Request::new(ResolveRequest {
             video_id: video_id.to_string(),
             audio_quality: quality.to_string(),
+            force,
         }))
         .await?;
     Ok(resp.into_inner())
+}
+
+pub async fn prefetch_resolve(ids: &[String], quality: &str) -> Result<i32> {
+    let mut client = connect().await?;
+    let resp = client
+        .prefetch_resolve(tonic::Request::new(PrefetchResolveRequest {
+            ids: ids.to_vec(),
+            audio_quality: quality.to_string(),
+        }))
+        .await?;
+    Ok(resp.into_inner().resolved)
 }
 
 pub async fn search(query: &str, limit: i32, music: bool) -> Result<Vec<Track>> {

@@ -975,11 +975,56 @@ async fn play_current_download(
             resolved.error
         });
     }
-    downloader::download(&resolved.stream_url, dest, &state.download)
-        .await
-        .map_err(|e| e.to_string())?;
+
+    match downloader::download(&resolved.stream_url, dest, &state.download).await {
+        Ok(()) => {}
+        Err(first_err) => {
+            // The cached URL may have expired: force a fresh resolve and retry.
+            eprintln!(
+                "[yt] download failed ({first_err}), re-resolving {}",
+                item.id
+            );
+            let fresh = grpc::resolve_forced(&item.id, &quality)
+                .await
+                .map_err(|e| e.to_string())?;
+            if !fresh.ok {
+                return Err(first_err.to_string());
+            }
+            if fresh.stream_url == resolved.stream_url {
+                return Err(first_err.to_string());
+            }
+            downloader::download(&fresh.stream_url, dest, &state.download)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+    }
+
     let meta = downloader::cached_meta(&item.id);
     let _ = std::fs::write(&meta, &item.title);
+    Ok(())
+}
+
+/// Pre-resolves (and pre-downloads the first track of) a freshly shown list,
+/// so clicking starts playback instantly.
+#[tauri::command]
+async fn prefetch_tracks(
+    items: Vec<QueueItem>,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    if items.is_empty() {
+        return Ok(());
+    }
+    let quality = current_quality(&state);
+    let ids: Vec<String> = items.iter().take(4).map(|i| i.id.clone()).collect();
+    // Resolve in parallel on the sidecar; failures are non-fatal.
+    let _ = grpc::prefetch_resolve(&ids, &quality).await;
+
+    // Download only the first track in the background (click = instant play).
+    let first = items[0].clone();
+    let fetching = state.fetching.clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = ensure_cached(&first, &fetching, &quality).await;
+    });
     Ok(())
 }
 
@@ -1659,6 +1704,7 @@ fn main() {
             set_browser_auth,
             play_video,
             play_queue,
+            prefetch_tracks,
             get_queue_info,
             get_queue_version,
             get_settings,

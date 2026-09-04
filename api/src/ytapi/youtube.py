@@ -98,7 +98,10 @@ QUALITIES = (QUALITY_STANDARD, QUALITY_HIGH)
 
 
 def resolve_url(
-    video_id: str, cookies_file: str | None = None, quality: str = QUALITY_STANDARD
+    video_id: str,
+    cookies_file: str | None = None,
+    quality: str = QUALITY_STANDARD,
+    force: bool = False,
 ) -> dict:
     """Extract direct stream URL + metadata for a video id.
 
@@ -110,10 +113,11 @@ def resolve_url(
     if quality not in QUALITIES:
         quality = QUALITY_STANDARD
     cache_key = f"{video_id}@{quality}"
-    with _resolve_lock:
-        hit = _RESOLVE_CACHE.get(cache_key)
-        if hit and time.time() - hit[0] < _RESOLVE_TTL:
-            return hit[1]
+    if not force:
+        with _resolve_lock:
+            hit = _RESOLVE_CACHE.get(cache_key)
+            if hit and time.time() - hit[0] < _RESOLVE_TTL:
+                return hit[1]
 
     import yt_dlp
 
@@ -172,7 +176,7 @@ def resolve_url(
 
     with _resolve_lock:
         _RESOLVE_CACHE[cache_key] = (time.time(), result)
-    _save_resolve_cache()
+        _save_resolve_cache()
     return result
 
 
@@ -230,6 +234,36 @@ def search(query: str, limit: int = 20, music: bool = False) -> list[dict]:
         if entry:
             out.append(_track_from_info(entry))
     return out
+
+
+def prefetch_resolve(video_ids: list[str], quality: str = QUALITY_STANDARD) -> int:
+    """Resolves multiple ids in parallel (fills the cache). Returns the number
+    of successfully resolved ids."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    if not video_ids:
+        return 0
+    with _resolve_lock:
+        pending = [
+            vid
+            for vid in video_ids
+            if f"{vid}@{quality}" not in _RESOLVE_CACHE
+            or time.time() - _RESOLVE_CACHE[f"{vid}@{quality}"][0] >= _RESOLVE_TTL
+        ]
+    if not pending:
+        return 0
+
+    def work(vid: str) -> bool:
+        try:
+            result = resolve_url(vid, quality=quality, force=True)
+            return bool(result.get("ok"))
+        except Exception:
+            log.exception("prefetch resolve failed for %s", vid)
+            return False
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(work, pending))
+    return sum(1 for ok in results if ok)
 
 
 def _mime_for_ext(ext: str | None) -> str:
