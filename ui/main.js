@@ -284,12 +284,16 @@ async function doSearch(append) {
     searchQuery = query;
     searchLimit = 20;
   }
-  const music = $("yt-music").checked;
   try {
-    const tracks = await invoke("search_youtube", { query: searchQuery, limit: searchLimit, music });
+    const tracks = await invoke("search_youtube", {
+      query: searchQuery,
+      limit: searchLimit,
+      music: false,
+    });
+    setMode("youtube");
     setYtTracks(tracks, append, append ? null : {
       title: `Search: ${searchQuery}`,
-      subtitle: music ? "YouTube Music" : "YouTube",
+      subtitle: "YouTube",
       cover: tracks[0] ? tracks[0].thumbnail || "" : "",
     });
     $("yt-more-btn").classList.remove("hidden");
@@ -299,7 +303,6 @@ async function doSearch(append) {
   }
 }
 
-$("yt-search-btn").onclick = () => doSearch(false);
 $("yt-more-btn").onclick = () => doSearch(true);
 $("yt-query").addEventListener("keydown", (e) => {
   if (e.key === "Enter") doSearch(false);

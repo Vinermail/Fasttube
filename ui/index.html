@@ -7,7 +7,10 @@
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
- <button id="mode-settings" class="tbtn pb-settings" title="Settings">⚙</button>
+  <button id="mode-settings" class="tbtn pb-settings" title="Settings">⚙</button>
+  <div id="top-search">
+    <input id="yt-query" type="text" placeholder="Поиск" autocomplete="off" />
+  </div>
   <aside id="sidebar">
     <div class="brand">Fasttube</div>
     <div class="nav-row">
@@ -22,13 +25,7 @@
     </div>
 
     <div id="side-youtube" class="hidden">
-      <div class="side-label">YouTube</div>
-      <div class="yt-search-row">
-        <input id="yt-query" type="text" placeholder="Search..." />
-        <button id="yt-search-btn" class="btn">Go</button>
-        <label class="yt-music-toggle"><input id="yt-music" type="checkbox" />Music</label>
-      </div>
-      <div id="yt-progress" class="yt-progress hidden">
+      <div class="yt-progress hidden" id="yt-progress">
         <div class="bar-track"><div id="yt-progress-bar"></div></div>
         <span id="yt-progress-text"></span>
       </div>

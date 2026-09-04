@@ -208,37 +208,6 @@ body:has(#player-bar:not(.hidden)) {
   gap: 7px;
 }
 
-.yt-search-row {
-  display: flex;
-  gap: 6px;
-  align-items: center;
-}
-
-.yt-search-row input[type="text"] {
-  flex: 1;
-  min-width: 0;
-  background: var(--bg);
-  color: var(--fg);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 8px 10px;
-  font-size: 13.5px;
-  outline: none;
-}
-
-.yt-search-row input[type="text"]:focus {
-  border-color: var(--accent);
-}
-
-.yt-music-toggle {
-  display: flex;
-  align-items: center;
-  gap: 3px;
-  color: var(--fg-dim);
-  font-size: 11px;
-  white-space: nowrap;
-}
-
 .yt-user-row {
   display: flex;
   gap: 6px;
@@ -683,6 +652,39 @@ body:has(#player-bar:not(.hidden)) {
 
 .pb-settings:hover {
   color: var(--fg);
+}
+
+/* ---------- global search ---------- */
+
+#top-search {
+  position: fixed;
+  top: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 1050;
+  width: min(520px, 55vw);
+}
+
+#top-search input {
+  width: 100%;
+  background: rgba(27, 31, 40, 0.85);
+  backdrop-filter: blur(10px);
+  border: 1px solid var(--border);
+  border-radius: 24px;
+  padding: 9px 18px;
+  color: var(--fg);
+  font-size: 13.5px;
+  outline: none;
+  transition: border-color 0.15s, background 0.15s;
+}
+
+#top-search input::placeholder {
+  color: rgba(255, 255, 255, 0.35);
+}
+
+#top-search input:focus {
+  border-color: var(--accent);
+  background: rgba(27, 31, 40, 0.95);
 }
 
 /* ---------- queue panel ---------- */
