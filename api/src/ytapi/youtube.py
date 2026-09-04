@@ -180,10 +180,140 @@ def resolve_url(
     return result
 
 
+def _search_web_direct(query: str, limit: int) -> list[dict]:
+    """Calls the innertube search endpoint directly with the browser's
+    headers (the same way youtube.com does), including continuation pages."""
+    if not os.path.exists(BROWSER_FILE):
+        return []
+    try:
+        import requests
+
+        with open(BROWSER_FILE, encoding="utf8") as f:
+            headers = json.load(f)
+        if "cookie" not in headers and "Cookie" not in headers:
+            return []
+
+        proxy = net.detect_proxy()
+        proxies = {"http": proxy, "https": proxy} if proxy else None
+        session = requests.Session()
+
+        hdrs = {
+            k: v
+            for k, v in headers.items()
+            if k
+            in (
+                "authorization",
+                "cookie",
+                "x-goog-authuser",
+                "x-origin",
+                "origin",
+                "referer",
+                "user-agent",
+                "x-youtube-client-name",
+                "x-youtube-client-version",
+            )
+        }
+
+        context = {
+            "context": {
+                "client": {
+                    "clientName": "WEB",
+                    "clientVersion": hdrs.get("x-youtube-client-version", "2.20240926.05.00"),
+                    "hl": "ru",
+                    "gl": "RU",
+                }
+            }
+        }
+
+        tracks: list[dict] = []
+        continuation: str | None = None
+
+        for _ in range(max(1, (limit // 20) + 1)):
+            url = "https://www.youtube.com/youtubei/v1/search?prettyPrint=false"
+            body: dict = dict(context)
+            if continuation:
+                url += f"&continuation={continuation}"
+                body["continuation"] = continuation
+            else:
+                body["query"] = query
+
+            resp = session.post(url, headers=hdrs, json=body, proxies=proxies, timeout=30)
+            if resp.status_code != 200:
+                log.warning("direct search HTTP %s", resp.status_code)
+                break
+            data = resp.json()
+
+            items: list[dict] = []
+            if continuation is not None or "continuation" in body:
+                # continuation response shape
+                for cmd in data.get("onResponseReceivedCommands") or []:
+                    for item in (
+                        cmd.get("appendContinuationItemsAction") or {}
+                    ).get("continuationItems", []):
+                        items.append(item)
+            else:
+                for section in (
+                    (
+                        ((data.get("contents") or {}).get("twoColumnSearchResultsRenderer") or {})
+                        .get("primaryContents", {})
+                        .get("sectionListRenderer", {})
+                        .get("contents", [])
+                    )
+                    or []
+                ):
+                    for item in (section.get("itemSectionRenderer") or {}).get("contents", []):
+                        items.append(item)
+
+            next_token = None
+            for item in items:
+                vr = item.get("videoRenderer")
+                if vr:
+                    vid = vr.get("videoId")
+                    if not vid:
+                        continue
+                    title = "".join(r.get("text", "") for r in (vr.get("title") or {}).get("runs", []))
+                    artist = "".join(r.get("text", "") for r in (vr.get("ownerText") or {}).get("runs", []))
+                    duration = 0.0
+                    for part in ((vr.get("lengthText") or {}).get("simpleText") or "").split(":"):
+                        duration = duration * 60 + float(part or 0)
+                    thumbnails = (vr.get("thumbnail") or {}).get("thumbnails") or []
+                    thumbnail = thumbnails[-1].get("url", "") if thumbnails else ""
+                    tracks.append(
+                        {
+                            "video_id": vid,
+                            "title": title,
+                            "artist": artist,
+                            "album": "",
+                            "duration_secs": duration,
+                            "thumbnail": thumbnail,
+                        }
+                    )
+                    if len(tracks) >= limit:
+                        return tracks
+                    continue
+                cont = item.get("continuationItemRenderer")
+                if cont:
+                    endpoint = (cont.get("continuationEndpoint") or {}).get("continuationCommand") or {}
+                    next_token = endpoint.get("token")
+            continuation = next_token
+            if not continuation:
+                break
+
+        return tracks
+    except Exception:
+        log.exception("direct web search failed")
+        return []
+
+
 def search(query: str, limit: int = 20, music: bool = False) -> list[dict]:
-    """Search. `music=False` mirrors the youtube.com web search (yt-dlp
-    innertube web client). `music=True` searches the YouTube Music catalog."""
+    """Search. `music=False` mirrors the youtube.com web search: when browser
+    auth is present the innertube search endpoint is called directly with the
+    browser's headers (personalized, logged-in results); otherwise yt-dlp's
+    anonymous search is used. `music=True` searches the YouTube Music catalog."""
     if not music:
+        tracks = _search_web_direct(query, limit)
+        if tracks:
+            return tracks
         import yt_dlp
 
         opts = {"quiet": True, "no_warnings": True, "skip_download": True, "noplaylist": True}
