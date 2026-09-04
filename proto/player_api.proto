@@ -1,0 +1,130 @@
+syntax = "proto3";
+
+package player;
+
+message Empty {}
+
+message HealthResponse {
+  string status = 1;
+  string version = 2;
+  bool ytdlp_ready = 3;
+  bool auth_ok = 4;
+}
+
+message Track {
+  string video_id = 1;
+  string title = 2;
+  string artist = 3;
+  string album = 4;
+  double duration_secs = 5;
+  string thumbnail = 6;
+}
+
+message SearchRequest {
+  string query = 1;
+  int32 limit = 2;
+  bool music = 3;
+}
+
+message SearchResponse {
+  repeated Track tracks = 1;
+}
+
+message ResolveRequest {
+  string video_id = 1;
+  string audio_quality = 2; // "standard" | "high"
+}
+
+message ResolveResponse {
+  bool ok = 1;
+  string error = 2;
+  Track track = 3;
+  string stream_url = 4;
+  string mime_type = 5;
+  uint64 content_length = 6;
+  int32 itag = 7;
+}
+
+message RecommendRequest {
+  string video_id = 1;
+  int32 limit = 2;
+}
+
+message RecommendResponse {
+  repeated Track tracks = 1;
+}
+
+message UserPlaylist {
+  string id = 1;
+  string name = 2;
+  int32 track_count = 3;
+  string thumbnail = 4;
+}
+
+message UserPlaylistsResponse {
+  repeated UserPlaylist playlists = 1;
+  bool has_auth = 2;
+  string hint = 3;
+  string error = 4;
+}
+
+message PlaylistTracksRequest {
+  string id = 1;
+}
+
+message PlaylistTracksResponse {
+  repeated Track tracks = 1;
+  string error = 2;
+}
+
+message StartOAuthRequest {
+  string client_id = 1;
+  string client_secret = 2;
+}
+
+message StartOAuthResponse {
+  bool ok = 1;
+  string error = 2;
+  string url = 3;
+}
+
+message PollOAuthResponse {
+  bool done = 1;
+  string error = 2;
+}
+
+message SetBrowserAuthRequest {
+  string auth_text = 1;
+}
+
+message SetBrowserAuthResponse {
+  bool ok = 1;
+  string error = 2;
+}
+
+message LyricsRequest {
+  string artist = 1;
+  string title = 2;
+  double duration_secs = 3;
+}
+
+message LyricsResponse {
+  bool ok = 1;
+  string synced = 2;
+  string plain = 3;
+  string error = 4;
+}
+
+service PlayerApi {
+  rpc Health(Empty) returns (HealthResponse);
+  rpc Search(SearchRequest) returns (SearchResponse);
+  rpc ResolveUrl(ResolveRequest) returns (ResolveResponse);
+  rpc Recommend(RecommendRequest) returns (RecommendResponse);
+  rpc GetUserPlaylists(Empty) returns (UserPlaylistsResponse);
+  rpc GetPlaylistTracks(PlaylistTracksRequest) returns (PlaylistTracksResponse);
+  rpc GetLikedSongs(Empty) returns (PlaylistTracksResponse);
+  rpc GetLyrics(LyricsRequest) returns (LyricsResponse);
+  rpc StartOAuth(StartOAuthRequest) returns (StartOAuthResponse);
+  rpc PollOAuth(Empty) returns (PollOAuthResponse);
+  rpc SetBrowserAuth(SetBrowserAuthRequest) returns (SetBrowserAuthResponse);
+}

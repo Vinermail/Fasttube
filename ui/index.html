@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Fasttube</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+ <button id="mode-settings" class="tbtn pb-settings" title="Settings">⚙</button>
+  <aside id="sidebar">
+    <div class="brand">Fasttube</div>
+    <div class="nav-row">
+      <button id="mode-local" class="btn nav active">Local</button>
+      <button id="mode-youtube" class="btn nav">YouTube</button>
+    </div>
+
+    <div id="side-local">
+      <div class="side-label">Local library</div>
+      <div id="playlists" class="list"></div>
+      <button id="btn-favorites" class="btn side-action">♥ Favorites</button>
+    </div>
+
+    <div id="side-youtube" class="hidden">
+      <div class="side-label">YouTube</div>
+      <div class="yt-search-row">
+        <input id="yt-query" type="text" placeholder="Search..." />
+        <button id="yt-search-btn" class="btn">Go</button>
+        <label class="yt-music-toggle"><input id="yt-music" type="checkbox" />Music</label>
+      </div>
+      <div id="yt-progress" class="yt-progress hidden">
+        <div class="bar-track"><div id="yt-progress-bar"></div></div>
+        <span id="yt-progress-text"></span>
+      </div>
+      <div class="yt-user-row">
+        <button id="yt-user-btn" class="btn">My playlists</button>
+        <button id="yt-liked-btn" class="btn">Liked</button>
+        <button id="yt-history-btn" class="btn">History</button>
+      </div>
+      <div id="yt-user-playlists" class="list sub"></div>
+      <button id="yt-more-btn" class="btn hidden">Load more</button>
+    </div>
+
+    <div id="sidebar-error" class="error hidden"></div>
+    <div class="sidebar-footer">
+      <div id="api-badge-side" class="badge api-side">API: ...</div>
+    </div>
+  </aside>
+
+  <div id="splitter" class="splitter"></div>
+
+  <main id="main">
+    <div id="view-player" class="view">
+      <div id="empty">
+        <div class="empty-inner">
+          <div class="empty-icon">♪</div>
+          <p>Choose a playlist on the left or search YouTube to start listening</p>
+        </div>
+      </div>
+
+      <div id="player" class="hidden">
+        <div id="list-header" class="list-header hidden">
+          <img id="lh-cover" class="lh-cover hidden" alt="" />
+          <div id="lh-placeholder" class="lh-placeholder hidden">♪</div>
+          <div class="lh-meta">
+            <div class="lh-title-row">
+              <div id="lh-title"></div>
+              <button id="lh-related" class="btn small hidden">Related</button>
+            </div>
+            <div id="lh-subtitle"></div>
+            <div class="lh-filter-row">
+              <input id="lh-filter" type="text" placeholder="Filter..." />
+              <button id="lh-sort" class="btn small">Sort: default</button>
+            </div>
+          </div>
+          <div class="lh-actions">
+            <button id="lh-play" class="btn primary">Play</button>
+            <button id="lh-shuffle" class="btn">Shuffle</button>
+          </div>
+        </div>
+        <div id="tracks" class="tracks"></div>
+      </div>
+    </div>
+
+    <div id="view-lyrics" class="view hidden">
+      <div id="lyrics-wrap">
+        <div id="lyrics-title"></div>
+        <div id="lyrics-body" class="lyrics-body">
+          <div class="lyrics-empty">Start playing a track and press the lyrics button.</div>
+        </div>
+      </div>
+    </div>
+
+    <div id="view-settings" class="view hidden">
+      <div class="settings-wrap">
+        <h2>Settings</h2>
+
+        <section class="settings-section">
+          <h3>Local library</h3>
+          <p class="hint">Folder with your audio files. Subfolders become playlists.</p>
+          <button id="open-folder" class="btn primary">Choose music folder...</button>
+        </section>
+
+        <section class="settings-section">
+          <h3>Audio quality (YouTube)</h3>
+          <p class="hint">Без YouTube Premium максимум — AAC 128 kbps (itag 140). С Premium доступен AAC до 256+ kbps (itag 141/256/258). Opus-формат встроенный декодер не поддерживает.</p>
+          <label class="quality-opt"><input type="radio" name="quality" value="standard" /> Standard — AAC 128 kbps</label>
+          <label class="quality-opt"><input type="radio" name="quality" value="high" /> High — лучший доступный AAC (до 256+ kbps с Premium)</label>
+          <p class="hint">Применяется к новым загрузкам треков.</p>
+          <div class="cache-row">
+            <button id="btn-clear-cache" class="btn">Clear download cache</button>
+            <span id="cache-status"></span>
+          </div>
+          <p class="hint">Normalization level (постоянный уровень громкости):</p>
+          <label class="quality-opt"><input type="radio" name="normlevel" value="off" /> Off</label>
+          <label class="quality-opt"><input type="radio" name="normlevel" value="light" /> Light — тише, больше запаса</label>
+          <label class="quality-opt"><input type="radio" name="normlevel" value="medium" /> Medium — сбалансированно</label>
+          <label class="quality-opt"><input type="radio" name="normlevel" value="strong" /> Strong — громче, как современные треки</label>
+          <p class="hint">Первый запуск трека анализируется ~1 секунду (первые 60с записи), далее — мгновенно из кэша. Смена уровня сбрасывает кэш.</p>
+        </section>
+
+        <section class="settings-section">
+          <h3>Sleep timer</h3>
+          <p class="hint">Stop playback after N minutes.</p>
+          <div class="sleep-row">
+            <input id="sleep-input" type="number" min="1" max="480" placeholder="Minutes" />
+            <button id="btn-sleep-start" class="btn">Start</button>
+            <button id="btn-sleep-cancel" class="btn">Cancel</button>
+            <span id="sleep-status"></span>
+          </div>
+        </section>
+
+        <section class="settings-section">
+          <h3>YouTube account</h3>
+          <div id="yt-auth-status" class="auth-status">Checking...</div>
+          <div id="yt-auth-form">
+            <input id="yt-auth-cid" type="text" placeholder="Client ID" />
+            <input id="yt-auth-csec" type="text" placeholder="Client Secret" />
+            <button id="yt-auth-start" class="btn primary">Start Google login</button>
+            <div id="yt-auth-url" class="hidden">
+              <p>Open this URL and sign in:</p>
+              <a id="yt-auth-link" href="#" target="_blank"></a>
+            </div>
+            <div class="yt-browser-auth">
+              <p class="hint">OAuth сломан на стороне Google — используй browser-auth:</p>
+              <textarea id="yt-auth-headers" placeholder="Paste headers here..."></textarea>
+              <button id="yt-browser-auth-btn" class="btn">Use browser auth</button>
+            </div>
+          </div>
+        </section>
+      </div>
+    </div>
+  </main>
+
+  <footer id="player-bar" class="hidden">
+    <div class="pb-left">
+      <div class="pb-art">
+        <img id="np-cover" class="hidden" alt="" />
+        <div id="np-placeholder">♪</div>
+      </div>
+      <div class="pb-meta">
+        <div id="np-title">Nothing playing</div>
+        <div id="np-artist"></div>
+        <span id="np-status" class="np-status">stopped</span>
+      </div>
+    </div>
+
+    <div class="pb-center">
+      <div class="pb-controls">
+        <button id="btn-shuffle" class="tbtn" title="Shuffle">⤨</button>
+        <button id="btn-prev" class="tbtn" title="Previous">⏮</button>
+        <button id="btn-play" class="tbtn play">▶</button>
+        <button id="btn-next" class="tbtn" title="Next">⏭</button>
+        <button id="btn-repeat" class="tbtn repeat" title="Repeat: off">↻</button>
+        <button id="btn-stop" class="tbtn" title="Stop">⏹</button>
+      </div>
+      <div class="pb-seek">
+        <span id="time-elapsed">00:00</span>
+        <input id="seek" type="range" min="0" max="100" value="0" step="0.1" />
+        <span id="time-total">00:00</span>
+      </div>
+    </div>
+
+    <div class="pb-right">
+      <button id="btn-fav" class="tbtn fav" title="Add to favorites">♡</button>
+      <button id="btn-lyrics" class="tbtn pill" title="Lyrics">Lyrics</button>
+      <button id="btn-queue" class="tbtn pill" title="Queue">Queue</button>
+      <button id="btn-speed" class="tbtn pill" title="Playback speed">1x</button>
+      <div class="pb-vol">
+        <span>Vol</span>
+        <input id="volume" type="range" min="0" max="100" value="80" />
+        <span id="volume-value">80%</span>
+      </div>
+    </div>
+  </footer>
+
+  <div id="queue-panel" class="queue-panel hidden">
+    <div class="queue-head">
+      <span>Queue</span>
+      <button id="queue-clear" class="btn small">Clear</button>
+      <button id="queue-close" class="tbtn small-t">✕</button>
+    </div>
+    <div id="queue-list" class="queue-list"></div>
+  </div>
+
+  <script src="main.js"></script>
+</body>
+</html>

@@ -1,0 +1,17 @@
+/target
+/gen
+
+# Python
+api/.venv/
+__pycache__/
+
+# Local runtime data & secrets (never commit)
+api/cache/
+api/oauth.json
+api/oauth_creds.json
+api/browser.json
+api/cookies.txt
+code.txt
+
+# Misc
+*.part

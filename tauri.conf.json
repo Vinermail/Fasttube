@@ -1,0 +1,33 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Fasttube",
+  "version": "0.1.0",
+  "identifier": "com.local.fasttube",
+  "build": {
+    "frontendDist": "ui"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "title": "Fasttube",
+        "width": 1360,
+        "height": 850,
+        "minWidth": 900,
+        "minHeight": 560,
+        "resizable": true,
+        "center": true
+      }
+    ],
+    "security": {
+      "csp": null,
+      "assetProtocol": {
+        "enable": true,
+        "scope": ["$LOCALAPPDATA/fasttube/**"]
+      }
+    }
+  },
+  "bundle": {
+    "active": false
+  }
+}
