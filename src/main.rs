@@ -1052,9 +1052,19 @@ async fn ensure_cached(
             return Ok(());
         }
         let handle = downloader::ProgressHandle::default();
-        downloader::download(&resolved.stream_url, &dest, &handle)
-            .await
-            .map_err(|e| e.to_string())?;
+        if let Err(first_err) = downloader::download(&resolved.stream_url, &dest, &handle).await {
+            // Cached URL may have expired: force a fresh resolve and retry.
+            let fresh = grpc::resolve_forced(&item.id, quality)
+                .await
+                .map_err(|e| e.to_string())?;
+            if fresh.ok && fresh.stream_url != resolved.stream_url {
+                downloader::download(&fresh.stream_url, &dest, &handle)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            } else {
+                return Err(first_err.to_string());
+            }
+        }
         let meta = downloader::cached_meta(&item.id);
         let _ = std::fs::write(&meta, &item.title);
         Ok(())
