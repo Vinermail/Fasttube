@@ -22,6 +22,8 @@ pub enum Cmd {
     SetGain(String, f32),
     /// Drop all stored gains (used when the normalization level changes).
     ClearGains,
+    /// Toggle the perceptual (exponential) volume curve.
+    SetVolumeCurve(bool),
 }
 
 #[derive(Serialize, Clone)]
@@ -116,6 +118,7 @@ struct Engine {
     speed: f32,
     gain: f32,
     target_gain: f32,
+    curve: bool,
     status: Status,
     dirty: bool,
 }
@@ -150,6 +153,7 @@ impl Engine {
             speed: 1.0,
             gain: 1.0,
             target_gain: 1.0,
+            curve: true,
             status: Status::Stopped,
             dirty: true,
         };
@@ -267,8 +271,22 @@ impl Engine {
     }
 
     fn apply_volume(&self) {
-        self.player
-            .set_volume((self.volume * self.gain).clamp(0.0, 4.0));
+        // Perceptual volume curve (exponent 3): human loudness perception is
+        // logarithmic, so a linear slider feels wrong. With the curve the
+        // slider position maps roughly linearly to perceived loudness.
+        let user = if self.curve {
+            self.volume.powf(3.0)
+        } else {
+            self.volume
+        };
+        self.player.set_volume((user * self.gain).clamp(0.0, 4.0));
+    }
+
+    fn set_volume_curve(&mut self, enabled: bool) {
+        self.curve = enabled;
+        // Force-apply the current volume under the new curve immediately.
+        self.apply_volume();
+        self.dirty = true;
     }
 
     /// Applies a freshly computed loudness gain. If it belongs to the
@@ -388,6 +406,7 @@ impl Engine {
 fn run(rx: Receiver<Cmd>, snapshot: Arc<RwLock<Option<Snapshot>>>) {
     let mut engine: Option<Engine> = None;
     let mut last_publish = Instant::now();
+    let mut pending_curve: Option<bool> = None;
 
     loop {
         if let Some(e) = engine.as_mut()
@@ -402,7 +421,13 @@ fn run(rx: Receiver<Cmd>, snapshot: Arc<RwLock<Option<Snapshot>>>) {
                 Cmd::SetPlaylist(pl) => {
                     if engine.is_none() {
                         match Engine::create() {
-                            Ok(e) => engine = Some(e),
+                            Ok(mut e) => {
+                                if let Some(c) = pending_curve.take() {
+                                    e.curve = c;
+                                    e.apply_volume();
+                                }
+                                engine = Some(e);
+                            }
                             Err(err) => {
                                 eprintln!("[eng] audio device error: {err}");
                             }
@@ -415,7 +440,13 @@ fn run(rx: Receiver<Cmd>, snapshot: Arc<RwLock<Option<Snapshot>>>) {
                 Cmd::OpenPlaylist(pl) => {
                     if engine.is_none() {
                         match Engine::create() {
-                            Ok(e) => engine = Some(e),
+                            Ok(mut e) => {
+                                if let Some(c) = pending_curve.take() {
+                                    e.curve = c;
+                                    e.apply_volume();
+                                }
+                                engine = Some(e);
+                            }
                             Err(err) => {
                                 eprintln!("[eng] audio device error: {err}");
                             }
@@ -473,6 +504,13 @@ fn run(rx: Receiver<Cmd>, snapshot: Arc<RwLock<Option<Snapshot>>>) {
                 Cmd::ClearGains => {
                     if let Some(e) = engine.as_mut() {
                         e.clear_gains();
+                    }
+                }
+                Cmd::SetVolumeCurve(enabled) => {
+                    if let Some(e) = engine.as_mut() {
+                        e.set_volume_curve(enabled);
+                    } else {
+                        pending_curve = Some(enabled);
                     }
                 }
             },

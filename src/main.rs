@@ -54,6 +54,8 @@ struct Settings {
     audio_quality: String,
     #[serde(default = "default_normalize_level")]
     normalize_level: String,
+    #[serde(default = "default_true")]
+    volume_curve: bool,
 }
 
 fn default_quality() -> String {
@@ -64,11 +66,16 @@ fn default_normalize_level() -> String {
     "medium".to_string()
 }
 
+fn default_true() -> bool {
+    true
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
             audio_quality: default_quality(),
             normalize_level: default_normalize_level(),
+            volume_curve: true,
         }
     }
 }
@@ -1120,6 +1127,20 @@ fn set_audio_quality(quality: String, state: tauri::State<AppState>) -> Result<(
 }
 
 #[tauri::command]
+fn set_volume_curve(enabled: bool, state: tauri::State<AppState>) {
+    {
+        let mut settings = state.settings.lock().unwrap();
+        settings.volume_curve = enabled;
+        save_settings(&settings);
+    }
+    state
+        .engine
+        .lock()
+        .unwrap()
+        .send(Cmd::SetVolumeCurve(enabled));
+}
+
+#[tauri::command]
 fn set_normalize_level(level: String, state: tauri::State<AppState>) -> Result<(), String> {
     if !matches!(level.as_str(), "off" | "light" | "medium" | "strong") {
         return Err("unknown normalize level".to_string());
@@ -1650,6 +1671,14 @@ fn main() {
         loudness: load_loudness(),
     };
     let api_status = app_state.api_status.clone();
+    {
+        let curve = app_state.settings.lock().unwrap().volume_curve;
+        app_state
+            .engine
+            .lock()
+            .unwrap()
+            .send(Cmd::SetVolumeCurve(curve));
+    }
     let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let sidecar_shutdown = shutdown.clone();
     let sidecar = sidecar::spawn_and_supervise(api_status, sidecar_shutdown);
@@ -1720,6 +1749,7 @@ fn main() {
             get_settings,
             set_audio_quality,
             set_normalize_level,
+            set_volume_curve,
             clear_cache,
             cycle_repeat,
             set_speed,

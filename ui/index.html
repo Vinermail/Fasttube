@@ -120,6 +120,10 @@
           <label class="quality-opt"><input type="radio" name="normlevel" value="medium" /> Medium — сбалансированно</label>
           <label class="quality-opt"><input type="radio" name="normlevel" value="strong" /> Strong — громче, как современные треки</label>
           <p class="hint">Первый запуск трека анализируется ~1 секунду (первые 60с записи), далее — мгновенно из кэша. Смена уровня сбрасывает кэш.</p>
+          <label class="quality-opt">
+            <input id="opt-volume-curve" type="checkbox" />
+            Экспоненциальная громкость (v³) — ползунок меняет громкость по кривой восприятия
+          </label>
         </section>
 
         <section class="settings-section">

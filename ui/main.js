@@ -465,10 +465,16 @@ async function loadSettings() {
     if (radio) radio.checked = true;
     const norm = document.querySelector(`input[name="normlevel"][value="${s.normalize_level || "medium"}"]`);
     if (norm) norm.checked = true;
+    const curve = $("opt-volume-curve");
+    if (curve) curve.checked = !!s.volume_curve;
   } catch (e) {
     showError(e);
   }
 }
+
+$("opt-volume-curve").addEventListener("change", (e) => {
+  invoke("set_volume_curve", { enabled: e.target.checked }).catch((err) => showError(err));
+});
 
 document.querySelectorAll('input[name="normlevel"]').forEach((r) => {
   r.onchange = async () => {
