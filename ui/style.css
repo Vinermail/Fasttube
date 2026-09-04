@@ -662,6 +662,19 @@ body:has(#player-bar:not(.hidden)) {
   flex-shrink: 0;
 }
 
+.nav-arrow {
+  width: 30px;
+  height: 30px;
+  font-size: 15px;
+  color: var(--fg);
+  flex-shrink: 0;
+}
+
+.nav-arrow.disabled {
+  opacity: 0.3;
+  pointer-events: none;
+}
+
 #topbar input {
   flex: 1;
   max-width: 520px;

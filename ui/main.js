@@ -18,6 +18,9 @@ let lyricsActiveIdx = -1;
 let isFav = false;
 let sortMode = 0;
 let filterText = "";
+let viewHistory = ["player"];
+let viewHistoryIdx = 0;
+let currentViewName = "player";
 
 function showError(message) {
   $("sidebar-error").textContent = String(message);
@@ -43,10 +46,50 @@ function setMode(m) {
 }
 
 function showMainView(name) {
+  if (name === currentViewName) {
+    applyView(name);
+    return;
+  }
+  // Record navigation (truncate any forward history).
+  viewHistory = viewHistory.slice(0, viewHistoryIdx + 1);
+  viewHistory.push(name);
+  viewHistoryIdx = viewHistory.length - 1;
+  if (viewHistory.length > 100) {
+    viewHistory.shift();
+    viewHistoryIdx--;
+  }
+  applyView(name);
+  updateNavButtons();
+}
+
+function applyView(name) {
+  currentViewName = name;
   document.querySelectorAll(".view").forEach((v) => v.classList.add("hidden"));
   $("view-" + name).classList.remove("hidden");
   $("mode-settings").classList.toggle("active", name === "settings");
 }
+
+function goBack() {
+  if (viewHistoryIdx <= 0) return;
+  viewHistoryIdx--;
+  applyView(viewHistory[viewHistoryIdx]);
+  updateNavButtons();
+}
+
+function goForward() {
+  if (viewHistoryIdx >= viewHistory.length - 1) return;
+  viewHistoryIdx++;
+  applyView(viewHistory[viewHistoryIdx]);
+  updateNavButtons();
+}
+
+function updateNavButtons() {
+  $("btn-back").classList.toggle("disabled", viewHistoryIdx <= 0);
+  $("btn-forward").classList.toggle("disabled", viewHistoryIdx >= viewHistory.length - 1);
+}
+
+$("btn-back").onclick = goBack;
+$("btn-forward").onclick = goForward;
 
 $("mode-local").onclick = () => setMode("local");
 $("mode-youtube").onclick = () => setMode("youtube");
@@ -1135,6 +1178,16 @@ function changeVolume(delta) {
 }
 
 window.addEventListener("keydown", (e) => {
+  if (e.altKey && e.code === "ArrowLeft") {
+    e.preventDefault();
+    goBack();
+    return;
+  }
+  if (e.altKey && e.code === "ArrowRight") {
+    e.preventDefault();
+    goForward();
+    return;
+  }
   const tag = (document.activeElement && document.activeElement.tagName) || "";
   if (tag === "INPUT" || tag === "TEXTAREA") return;
   if (e.code === "Space") {
