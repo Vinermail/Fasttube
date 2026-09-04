@@ -40,11 +40,18 @@ fn project_root() -> PathBuf {
 fn python_executable() -> PathBuf {
     // Prefer the project venv directly: we own the process and can kill it
     // (spawning via `uv run` makes python a grandchild that survives kills).
+    #[cfg(target_os = "windows")]
     let venv_python = project_root()
         .join("api")
         .join(".venv")
         .join("Scripts")
         .join("python.exe");
+    #[cfg(not(target_os = "windows"))]
+    let venv_python = project_root()
+        .join("api")
+        .join(".venv")
+        .join("bin")
+        .join("python");
     if venv_python.exists() {
         venv_python
     } else {
@@ -52,9 +59,10 @@ fn python_executable() -> PathBuf {
     }
 }
 
-fn spawn_child() -> std::io::Result<Child> {
+fn spawn_child(token: &str) -> std::io::Result<Child> {
     let mut cmd = Command::new(python_executable());
     cmd.args(["-m", "ytapi.server"])
+        .env("FASTTUBE_API_TOKEN", token)
         .current_dir(project_root())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -71,7 +79,11 @@ fn spawn_child() -> std::io::Result<Child> {
 /// If a healthy sidecar is already running (e.g. started manually or left
 /// over from a previous run), it is reused instead of spawning a new one.
 /// When `shutdown` is set, the spawned child is killed.
-pub fn spawn_and_supervise(status: SharedApiStatus, shutdown: Arc<AtomicBool>) -> Sidecar {
+pub fn spawn_and_supervise(
+    status: SharedApiStatus,
+    shutdown: Arc<AtomicBool>,
+    token: String,
+) -> Sidecar {
     let sidecar = Sidecar::default();
     let slot = sidecar.child.clone();
     std::thread::Builder::new()
@@ -81,7 +93,7 @@ pub fn spawn_and_supervise(status: SharedApiStatus, shutdown: Arc<AtomicBool>) -
                 .enable_all()
                 .build()
                 .expect("failed to build tokio runtime for sidecar supervisor");
-            rt.block_on(supervise_loop(status, shutdown, slot));
+            rt.block_on(supervise_loop(status, shutdown, slot, token));
         })
         .expect("failed to spawn ytapi supervisor thread");
     sidecar
@@ -91,6 +103,7 @@ async fn supervise_loop(
     status: SharedApiStatus,
     shutdown: Arc<AtomicBool>,
     slot: Arc<Mutex<Option<Child>>>,
+    token: String,
 ) {
     if crate::grpc::health().await.is_ok() {
         eprintln!("[ytapi] reusing healthy sidecar");
@@ -98,7 +111,7 @@ async fn supervise_loop(
         return;
     }
 
-    let mut child = match spawn_child() {
+    let mut child = match spawn_child(&token) {
         Ok(c) => Some(c),
         Err(e) => {
             eprintln!("[ytapi] failed to spawn sidecar: {e}");
@@ -136,7 +149,7 @@ async fn supervise_loop(
             }
             restarts += 1;
             eprintln!("[ytapi] sidecar died, restarting ({restarts}/{MAX_RESTARTS})");
-            let respawned = match spawn_child() {
+            let respawned = match spawn_child(&token) {
                 Ok(c) => Some(c),
                 Err(e) => {
                     eprintln!("[ytapi] respawn failed: {e}");

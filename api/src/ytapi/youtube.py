@@ -71,9 +71,12 @@ def _load_resolve_cache() -> None:
 def _save_resolve_cache() -> None:
     try:
         os.makedirs(CACHE_DIR, exist_ok=True)
+        now = time.time()
+        # Prune entries older than a day: the file would only grow forever.
+        pruned = {k: (ts, v) for k, (ts, v) in _RESOLVE_CACHE.items() if now - ts < 86400}
         tmp = _RESOLVE_CACHE_FILE + ".tmp"
         with open(tmp, "w", encoding="utf8") as f:
-            json.dump(_RESOLVE_CACHE, f)
+            json.dump(pruned, f)
         os.replace(tmp, _RESOLVE_CACHE_FILE)
     except Exception:
         log.exception("failed to save resolve cache")
@@ -112,6 +115,8 @@ def resolve_url(
     """
     if quality not in QUALITIES:
         quality = QUALITY_STANDARD
+    if not _VIDEO_ID_RE.match(video_id):
+        return {"ok": False, "error": "invalid video id"}
     cache_key = f"{video_id}@{quality}"
     if not force:
         with _resolve_lock:
@@ -387,6 +392,7 @@ def prefetch_resolve(video_ids: list[str], quality: str = QUALITY_STANDARD) -> i
     of successfully resolved ids."""
     from concurrent.futures import ThreadPoolExecutor
 
+    video_ids = [vid for vid in video_ids if _VIDEO_ID_RE.match(vid)]
     if not video_ids:
         return 0
     with _resolve_lock:
@@ -476,6 +482,8 @@ def related_tracks(video_id: str, limit: int = 20) -> dict:
     The `player/next` related endpoint is broken server-side (HTTP 400) in
     many regions, so fall back to a music search by the track's artist.
     """
+    if not _VIDEO_ID_RE.match(video_id):
+        return {"tracks": [], "error": "invalid video id"}
     try:
         from ytmusicapi import YTMusic
 

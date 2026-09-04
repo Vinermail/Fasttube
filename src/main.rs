@@ -209,7 +209,7 @@ fn full_replaygain(path: &std::path::Path) -> Option<f32> {
             rg.process_samples(&buf);
         }
         let (gain_db, peak) = rg.finish();
-        let linear = 10f32.powf(gain_db as f32 / 20.0);
+        let linear = 10f32.powf(gain_db / 20.0);
         let limited = if peak > 0.0 {
             linear.min(0.95 / peak)
         } else {
@@ -528,22 +528,21 @@ fn play_track(index: usize, state: tauri::State<AppState>) {
         q.version += 1;
     }
     // Prioritize loudness scanning of the clicked track.
-    if normalize_enabled(&state.settings.lock().unwrap()) {
-        if let Some(track) = state
+    if normalize_enabled(&state.settings.lock().unwrap())
+        && let Some(track) = state
             .local_current
             .lock()
             .unwrap()
             .as_ref()
             .and_then(|tracks| tracks.get(index))
-            && let Some(path) = track.path.as_ref()
-        {
-            spawn_loudness_scan(
-                vec![std::path::PathBuf::from(path)],
-                state.loudness.clone(),
-                state.engine.lock().unwrap().clone(),
-                target_rms(&state.settings.lock().unwrap().normalize_level).unwrap_or(0.12),
-            );
-        }
+        && let Some(path) = track.path.as_ref()
+    {
+        spawn_loudness_scan(
+            vec![std::path::PathBuf::from(path)],
+            state.loudness.clone(),
+            state.engine.lock().unwrap().clone(),
+            target_rms(&state.settings.lock().unwrap().normalize_level).unwrap_or(0.12),
+        );
     }
     state.engine.lock().unwrap().send(Cmd::PlayTrack(index));
 }
@@ -1029,9 +1028,10 @@ async fn play_current_download(
 /// so clicking starts playback instantly.
 #[tauri::command]
 async fn prefetch_tracks(
-    items: Vec<QueueItem>,
+    mut items: Vec<QueueItem>,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
+    items.retain(|i| downloader::is_valid_video_id(&i.id));
     if items.is_empty() {
         return Ok(());
     }
@@ -1270,10 +1270,11 @@ async fn recommend_tracks(
 
 #[tauri::command]
 async fn queue_add(
-    items: Vec<QueueItem>,
+    mut items: Vec<QueueItem>,
     play_next: Option<bool>,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
+    items.retain(|i| downloader::is_valid_video_id(&i.id));
     if items.is_empty() {
         return Ok(());
     }
@@ -1482,10 +1483,11 @@ fn get_sleep_timer(state: tauri::State<AppState>) -> Option<f64> {
 
 #[tauri::command]
 async fn play_queue(
-    items: Vec<QueueItem>,
+    mut items: Vec<QueueItem>,
     start: usize,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
+    items.retain(|i| downloader::is_valid_video_id(&i.id));
     if items.is_empty() {
         return Err("empty queue".to_string());
     }
@@ -1626,6 +1628,41 @@ fn spawn_queue_watcher(handle: tauri::AppHandle) {
         .expect("failed to spawn queue watcher");
 }
 
+/// Loads or creates the gRPC auth token. Persisted across runs so that a
+/// leftover sidecar from a previous run can be reused (same token) instead of
+/// blocking the port with a different one.
+fn load_or_create_api_token() -> String {
+    let path = downloader::data_dir().join("api_token");
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        let existing = existing.trim().to_string();
+        if !existing.is_empty() {
+            return existing;
+        }
+    }
+    let token = generate_api_token();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&path, &token);
+    token
+}
+
+/// Generates a random token shared between the app and the sidecar so that
+/// other local processes cannot use the unauthenticated gRPC endpoint.
+fn generate_api_token() -> String {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mut h = RandomState::new().build_hasher();
+    h.write_u64(nanos as u64);
+    h.write_usize(std::process::id() as usize);
+    format!("{:016x}{:016x}", h.finish(), nanos)
+}
+
 fn extract_video_id(input: &str) -> Option<String> {
     let s = input.trim();
     if s.len() == 11
@@ -1659,6 +1696,8 @@ fn extract_video_id(input: &str) -> Option<String> {
 
 fn main() {
     downloader::migrate_legacy_dir();
+    let api_token = load_or_create_api_token();
+    grpc::set_api_token(api_token.clone());
     let initial_dir = std::env::args()
         .skip(1)
         .map(std::path::PathBuf::from)
@@ -1695,7 +1734,7 @@ fn main() {
     }
     let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let sidecar_shutdown = shutdown.clone();
-    let sidecar = sidecar::spawn_and_supervise(api_status, sidecar_shutdown);
+    let sidecar = sidecar::spawn_and_supervise(api_status, sidecar_shutdown, api_token);
 
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())

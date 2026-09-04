@@ -56,13 +56,23 @@ def apply_env_proxy() -> None:
             os.environ[name] = proxy
 
 
+class _DohConnection(http.client.HTTPSConnection):
+    """Connects to the DoH server by IP literal but verifies the TLS
+    certificate against the real hostname (cloudflare-dns.com)."""
+
+    _DOH_HOSTNAME = "cloudflare-dns.com"
+
+    def connect(self) -> None:
+        sock = socket.create_connection((self.host, self.port), self.timeout)
+        ctx = ssl.create_default_context()
+        self.sock = ctx.wrap_socket(sock, server_hostname=self._DOH_HOSTNAME)
+
+
 def _doh_a_records(host: str) -> list[str]:
     if host in _DOH_CACHE:
         return _DOH_CACHE[host]
     try:
-        conn = http.client.HTTPSConnection(
-            "1.1.1.1", 443, timeout=10, context=ssl._create_unverified_context()
-        )
+        conn = _DohConnection("1.1.1.1", 443, timeout=10)
         conn.request(
             "GET",
             f"/dns-query?name={host}&type=A",
@@ -80,15 +90,28 @@ def _doh_a_records(host: str) -> list[str]:
         return []
 
 
+# Only these hosts are ever routed through the DoH fallback: the patch must
+# not affect unrelated HTTP calls in the process.
+_DOH_HOSTS = (
+    "youtube.com",
+    "googlevideo.com",
+    "googleusercontent.com",
+    "ytimg.com",
+    "googleapis.com",
+    "lrclib.net",
+)
+
+
 def force_ipv4_dns() -> None:
-    """Patch getaddrinfo: try IPv4 via system DNS, fall back to DoH."""
+    """Patch getaddrinfo: try IPv4 via system DNS, fall back to DoH (only
+    for YouTube/Google hosts)."""
     global _patched
     if _patched:
         return
     _patched = True
 
     def patched(host, port, family=0, type=socket.SOCK_STREAM, proto=0, flags=0):
-        if family in (0, socket.AF_INET):
+        if family in (0, socket.AF_INET) and any(s in host for s in _DOH_HOSTS):
             try:
                 return _orig_getaddrinfo(host, port, socket.AF_INET, type, proto, flags)
             except socket.gaierror:

@@ -21,6 +21,8 @@ tonic = { version = "0.14", default-features = false, features = ["transport", "
 tonic-prost = "0.14"
 walkdir = "2.5.0"
 replaygain = "1.0.1"
+tower = "0.5"
+http = "1"
 
 [build-dependencies]
 protoc-bin-vendored = "3.2.0"

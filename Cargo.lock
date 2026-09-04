@@ -933,6 +933,7 @@ dependencies = [
  "anyhow",
  "cpal",
  "futures-util",
+ "http",
  "lofty",
  "prost",
  "protoc-bin-vendored",
@@ -949,6 +950,7 @@ dependencies = [
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
+ "tower",
  "walkdir",
 ]
 

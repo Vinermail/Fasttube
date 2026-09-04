@@ -1,4 +1,6 @@
 use anyhow::Result;
+use std::sync::OnceLock;
+use tonic::metadata::MetadataValue;
 use tonic::transport::Channel;
 
 pub const API_ADDR: &str = "http://127.0.0.1:50051";
@@ -9,14 +11,34 @@ pub mod proto {
 
 pub use proto::{
     Empty, HealthResponse, LyricsRequest, LyricsResponse, PlaylistTracksRequest,
-    PlaylistTracksResponse, PollOAuthResponse, PrefetchResolveRequest, PrefetchResolveResponse,
-    RecommendRequest, ResolveRequest, ResolveResponse, SearchRequest, SetBrowserAuthRequest,
-    SetBrowserAuthResponse, StartOAuthRequest, StartOAuthResponse, Track, UserPlaylistsResponse,
+    PlaylistTracksResponse, PollOAuthResponse, PrefetchResolveRequest, RecommendRequest,
+    ResolveRequest, ResolveResponse, SearchRequest, SetBrowserAuthRequest, SetBrowserAuthResponse,
+    StartOAuthRequest, StartOAuthResponse, Track, UserPlaylistsResponse,
     player_api_client::PlayerApiClient,
 };
 
-pub async fn connect() -> Result<PlayerApiClient<Channel>> {
-    Ok(PlayerApiClient::connect(API_ADDR.to_string()).await?)
+static API_TOKEN: OnceLock<String> = OnceLock::new();
+
+pub fn set_api_token(token: String) {
+    let _ = API_TOKEN.set(token);
+}
+
+pub async fn connect() -> Result<
+    PlayerApiClient<
+        tonic::service::interceptor::InterceptedService<Channel, impl tonic::service::Interceptor>,
+    >,
+> {
+    let channel = Channel::from_static(API_ADDR).connect_lazy();
+    let token = API_TOKEN.get().cloned().unwrap_or_default();
+    let client = PlayerApiClient::with_interceptor(channel, move |mut req: tonic::Request<()>| {
+        if !token.is_empty()
+            && let Ok(value) = MetadataValue::try_from(token.clone())
+        {
+            req.metadata_mut().insert("x-fasttube-token", value);
+        }
+        Ok(req)
+    });
+    Ok(client)
 }
 
 pub async fn health() -> Result<HealthResponse> {

@@ -76,12 +76,31 @@ pub fn clear_cache() -> std::io::Result<()> {
     Ok(())
 }
 
+/// True for a well-formed YouTube video id (11 chars of [A-Za-z0-9_-]).
+pub fn is_valid_video_id(video_id: &str) -> bool {
+    video_id.len() == 11
+        && video_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// Last line of defense against path traversal: strips everything except
+/// [A-Za-z0-9_-] and caps the length, so arbitrary input can never escape
+/// the cache directory.
+fn safe_id(video_id: &str) -> String {
+    video_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .take(64)
+        .collect()
+}
+
 pub fn cached_file(video_id: &str) -> PathBuf {
-    cache_dir().join(format!("{video_id}.m4a"))
+    cache_dir().join(format!("{}.m4a", safe_id(video_id)))
 }
 
 pub fn cached_meta(video_id: &str) -> PathBuf {
-    cache_dir().join(format!("{video_id}.json"))
+    cache_dir().join(format!("{}.json", safe_id(video_id)))
 }
 
 /// Downloads `url` to `dest`, publishing progress via `handle`.

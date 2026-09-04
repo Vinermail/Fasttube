@@ -20,6 +20,23 @@ log = logging.getLogger("ytapi.server")
 VERSION = "0.1.0"
 PORT = int(os.environ.get("YTAPI_PORT", "50051"))
 
+API_TOKEN = os.environ.get("FASTTUBE_API_TOKEN", "")
+
+
+class _TokenInterceptor(grpc.ServerInterceptor):
+    """Rejects calls without the shared app<->sidecar token, so other local
+    processes cannot use the YouTube session via the open port."""
+
+    def intercept_service(self, continuation, handler_call_details):
+        md = dict(handler_call_details.invocation_metadata or [])
+        if API_TOKEN and md.get("x-fasttube-token") != API_TOKEN:
+
+            def deny(request, context):
+                context.abort(grpc.StatusCode.UNAUTHENTICATED, "invalid or missing token")
+
+            return grpc.unary_unary_rpc_method_handler(deny)
+        return continuation(handler_call_details)
+
 COOKIES_FILE = os.environ.get(
     "YTAPI_COOKIES",
     os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "cookies.txt"),
@@ -174,7 +191,8 @@ class PlayerApiServicer(player_api_pb2_grpc.PlayerApiServicer):
 def serve():
     logging.basicConfig(level=logging.INFO)
     _warm_up_ytdlp()
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=8))
+    interceptors = [_TokenInterceptor()] if API_TOKEN else None
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=8), interceptors=interceptors)
     player_api_pb2_grpc.add_PlayerApiServicer_to_server(PlayerApiServicer(), server)
     server.add_insecure_port(f"127.0.0.1:{PORT}")
     server.start()
