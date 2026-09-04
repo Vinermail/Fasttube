@@ -254,6 +254,7 @@ function renderPlaylists(library) {
           subtitle: `${infos.length} tracks`,
           cover: coverPath ? convertFileSrc(coverPath) : "",
         });
+        setMode("local");
         refresh();
       } catch (e) {
         showError(e);
@@ -284,7 +285,6 @@ function playYtAt(i) {
     durationSecs: t.duration_secs,
   }));
   setMode("youtube");
-  viewIsQueue = true;
   invoke("play_queue", { items, start: i }).catch((e) => showError(e));
 }
 
@@ -292,16 +292,12 @@ function playYtAt(i) {
 // user playlist contents). Playback is not started.
 let ytRows = [];
 let ytListVersion = 0;
-let viewIsQueue = false;
 
 function setYtTracks(tracks, append, meta) {
   currentYtTracks = append ? currentYtTracks.concat(tracks) : tracks;
-  if (!append) {
-    ytListVersion++;
-    // A newly opened list takes over the view; stop mirroring the queue.
-    viewIsQueue = false;
-  }
+  if (!append) ytListVersion++;
   ytRows = currentYtTracks.map((t) => ({
+    id: t.video_id,
     title: t.title,
     artist: t.artist,
     duration: t.duration_secs,
@@ -377,15 +373,22 @@ $("yt-query").addEventListener("keydown", (e) => {
 
 function shuffleYt() {
   if (!currentYtTracks.length) return;
+  // Shuffle only the queue: the main list keeps its original order, the
+  // actual (shuffled) order is visible in the Queue panel.
   const arr = currentYtTracks.slice();
   for (let i = arr.length - 1; i > 0; i--) {
     const j = Math.floor(Math.random() * (i + 1));
     [arr[i], arr[j]] = [arr[j], arr[i]];
   }
-  currentYtTracks = arr;
-  ytListVersion++;
-  refresh();
-  playYtAt(0);
+  const items = arr.map((t) => ({
+    id: t.video_id,
+    title: t.title,
+    artist: t.artist,
+    thumbnail: t.thumbnail || "",
+    durationSecs: t.duration_secs,
+  }));
+  setMode("youtube");
+  invoke("play_queue", { items, start: 0 }).catch((e) => showError(e));
 }
 
 $("btn-shuffle").onclick = shuffleYt;
@@ -656,14 +659,7 @@ function buildRow(row, i) {
       return;
     }
     if (mode === "youtube") {
-      if (queueInfo && queueInfo.active && queueInfo.items.length && viewIsQueue) {
-        // Jump within the currently playing queue (same order).
-        invoke("play_queue", { items: queueInfo.items, start: orig })
-          .then(refresh)
-          .catch((e) => showError(e));
-      } else {
-        playYtAt(orig);
-      }
+      playYtAt(orig);
     } else {
       invoke("play_track", { index: orig }).then(refresh);
     }
@@ -827,28 +823,22 @@ function renderState(state) {
   }
 
   if (mode === "youtube") {
-    // Mirror the playing queue only while the user is viewing the list it
-    // was started from (needed for shuffle/auto-advance). Opening a new
-    // list (playlist, search, liked...) switches the view back to that list.
+    // The main list always shows the opened list in its original order.
+    // The playing track is highlighted by id; the shuffled queue order is
+    // visible in the Queue panel.
     const queueActive = queueInfo && queueInfo.active && queueInfo.items.length > 0;
-    const showQueue = queueActive && viewIsQueue;
-    let rows, activeIdx, key;
-    if (showQueue) {
-      rows = queueInfo.items.map((it) => ({
-        title: it.title,
-        artist: it.artist,
-        duration: it.duration_secs || 0,
-      }));
-      activeIdx = queueInfo.current;
-      key = "q:" + (queueInfo.version || 0);
-      $("lh-related").classList.remove("hidden");
-    } else {
-      rows = ytRows;
-      activeIdx = -1;
-      key = "y:" + ytListVersion;
-      $("lh-related").classList.add("hidden");
+    let activeIdx = -1;
+    if (queueActive && queueInfo.items[queueInfo.current]) {
+      const playingId = queueInfo.items[queueInfo.current].id;
+      activeIdx = currentYtTracks.findIndex((t) => t.video_id === playingId);
     }
-    renderTracks($("tracks"), applyFilterSort(rows), activeIdx, key + ":" + filterText + ":" + sortMode);
+    $("lh-related").classList.toggle("hidden", !queueActive);
+    renderTracks(
+      $("tracks"),
+      applyFilterSort(ytRows),
+      activeIdx,
+      "y:" + ytListVersion + ":" + filterText + ":" + sortMode
+    );
   } else if (state) {
     const key = "l:" + state.playlist_name + ":" + state.playlist_len;
     $("lh-related").classList.add("hidden");
@@ -1099,6 +1089,7 @@ $("btn-favorites").onclick = async () => {
       subtitle: `${infos.length} tracks`,
       cover: coverPath ? convertFileSrc(coverPath) : "",
     });
+    setMode("local");
     refresh();
   } catch (e) {
     showError(e);
