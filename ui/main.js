@@ -239,6 +239,7 @@ function playYtAt(i) {
     durationSecs: t.duration_secs,
   }));
   setMode("youtube");
+  viewIsQueue = true;
   invoke("play_queue", { items, start: i }).catch((e) => showError(e));
 }
 
@@ -246,10 +247,15 @@ function playYtAt(i) {
 // user playlist contents). Playback is not started.
 let ytRows = [];
 let ytListVersion = 0;
+let viewIsQueue = false;
 
 function setYtTracks(tracks, append, meta) {
   currentYtTracks = append ? currentYtTracks.concat(tracks) : tracks;
-  if (!append) ytListVersion++;
+  if (!append) {
+    ytListVersion++;
+    // A newly opened list takes over the view; stop mirroring the queue.
+    viewIsQueue = false;
+  }
   ytRows = currentYtTracks.map((t) => ({
     title: t.title,
     artist: t.artist,
@@ -599,7 +605,7 @@ function buildRow(row, i) {
       return;
     }
     if (mode === "youtube") {
-      if (queueInfo && queueInfo.active && queueInfo.items.length) {
+      if (queueInfo && queueInfo.active && queueInfo.items.length && viewIsQueue) {
         // Jump within the currently playing queue (same order).
         invoke("play_queue", { items: queueInfo.items, start: orig })
           .then(refresh)
@@ -770,11 +776,13 @@ function renderState(state) {
   }
 
   if (mode === "youtube") {
-    // Show the actual playing queue whenever one is active, so the list
-    // always matches what is playing (including after shuffle / auto-advance).
+    // Mirror the playing queue only while the user is viewing the list it
+    // was started from (needed for shuffle/auto-advance). Opening a new
+    // list (playlist, search, liked...) switches the view back to that list.
     const queueActive = queueInfo && queueInfo.active && queueInfo.items.length > 0;
+    const showQueue = queueActive && viewIsQueue;
     let rows, activeIdx, key;
-    if (queueActive) {
+    if (showQueue) {
       rows = queueInfo.items.map((it) => ({
         title: it.title,
         artist: it.artist,
