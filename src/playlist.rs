@@ -121,6 +121,7 @@ fn read_track(path: &Path, cover_dir: &Path) -> Track {
     let mut duration = None;
     let mut cover = None;
     let mut gain = None;
+    let mut peak: Option<f32> = None;
 
     if let Ok(tagged) = lofty::read_from_path(path) {
         if let Some(tag) = tagged.primary_tag() {
@@ -133,9 +134,16 @@ fn read_track(path: &Path, cover_dir: &Path) -> Track {
             if let Some(pic) = tag.pictures().first() {
                 cover = write_cover(cover_dir, pic.data(), pic.mime_type().map(|m| m.as_str()));
             }
-            // Prefer embedded ReplayGain tags: instant and exact.
+            // ReplayGain always comes as a pair: gain + peak. The peak keeps
+            // the boost from clipping (samples must never exceed 0 dBFS).
             if let Some(raw) = tag.get_string(lofty::tag::ItemKey::ReplayGainTrackGain) {
                 gain = parse_replaygain_tag(raw);
+            }
+            if let Some(raw) = tag.get_string(lofty::tag::ItemKey::ReplayGainTrackPeak) {
+                peak = raw
+                    .split_whitespace()
+                    .next()
+                    .and_then(|s| s.parse::<f32>().ok());
             }
         }
         let d = tagged.properties().duration().as_secs_f64();
@@ -156,14 +164,23 @@ fn read_track(path: &Path, cover_dir: &Path) -> Track {
         artist,
         duration,
         cover,
-        gain,
+        gain: gain.map(|g| limit_gain_by_peak(g, peak)),
     }
 }
 
 /// Parses ReplayGain tag values like "-7.23 dB" into a linear gain factor.
 fn parse_replaygain_tag(raw: &str) -> Option<f32> {
     let db: f32 = raw.split_whitespace().next()?.parse().ok()?;
-    Some(10f32.powf(db / 20.0).clamp(0.1, 4.0))
+    Some(10f32.powf(db / 20.0).clamp(0.1, 8.0))
+}
+
+/// Caps the gain so that gain * peak <= 0.95 (no digital clipping).
+/// Without peak info we never boost beyond unity — only attenuate.
+fn limit_gain_by_peak(gain: f32, peak: Option<f32>) -> f32 {
+    match peak {
+        Some(p) if p > 0.0 => gain.min(0.95 / p.max(0.0001)),
+        _ => gain.min(1.0),
+    }
 }
 
 fn folder_cover(dir: &Path, cover_dir: &Path) -> Option<PathBuf> {

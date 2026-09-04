@@ -279,6 +279,8 @@ impl Engine {
         } else {
             self.volume
         };
+        // Safety net: gains are peak-limited elsewhere (never boosting into
+        // clipping), the 4.0 cap only guards against corrupt cached values.
         self.player.set_volume((user * self.gain).clamp(0.0, 4.0));
     }
 

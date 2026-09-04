@@ -148,7 +148,12 @@ fn save_loudness(cache: &LoudnessCache) {
 }
 
 /// Fast loudness estimate: RMS over the first ~2 seconds of actual audio
-/// (silence skipped). Used for immediate normalization on first play.
+/// (silence skipped). Applied immediately on first play.
+///
+/// Deliberately conservative: without knowing the full-track peak, boosting
+/// could clip the loud parts later in the track, so the quick gain only
+/// attenuates (<= 1.0). The full ReplayGain scan then replaces it with the
+/// peak-safe value.
 fn quick_gain(path: &std::path::Path, target: f64) -> Option<f32> {
     const ACTIVE_TARGET: u64 = 200_000; // ~2.3s of audio content
     const MAX_DECODE: usize = 1_000_000; // safety cap
@@ -156,7 +161,6 @@ fn quick_gain(path: &std::path::Path, target: f64) -> Option<f32> {
     let file = std::fs::File::open(path).ok()?;
     let decoder = rodio::Decoder::try_from(file).ok()?;
     let mut sum = 0f64;
-    let mut peak = 0f32;
     let mut n = 0u64;
     for sample in decoder.take(MAX_DECODE) {
         let a = sample.abs();
@@ -165,7 +169,6 @@ fn quick_gain(path: &std::path::Path, target: f64) -> Option<f32> {
         }
         let v = sample as f64;
         sum += v * v;
-        peak = peak.max(a);
         n += 1;
         if n >= ACTIVE_TARGET {
             break;
@@ -178,13 +181,11 @@ fn quick_gain(path: &std::path::Path, target: f64) -> Option<f32> {
     if rms < 1e-6 {
         return None;
     }
-    let rms_gain = target / rms;
-    let peak_limit = if peak > 1e-6 { 0.95 / peak as f64 } else { 4.0 };
-    Some((rms_gain.min(peak_limit)).clamp(0.1, 4.0) as f32)
+    Some((target / rms).clamp(0.1, 1.0) as f32)
 }
 
 /// Full-track loudness analysis using the proper ReplayGain 2.0 (EBU R128)
-/// algorithm. Runs in the background; replaces the quick estimate.
+/// algorithm. The peak is used to cap the gain so playback never clips.
 fn full_replaygain(path: &std::path::Path) -> Option<f32> {
     use rodio::Source;
 
@@ -207,9 +208,14 @@ fn full_replaygain(path: &std::path::Path) -> Option<f32> {
         if !buf.is_empty() {
             rg.process_samples(&buf);
         }
-        let (gain_db, _peak) = rg.finish();
+        let (gain_db, peak) = rg.finish();
         let linear = 10f32.powf(gain_db as f32 / 20.0);
-        return Some(linear.clamp(0.05, 20.0));
+        let limited = if peak > 0.0 {
+            linear.min(0.95 / peak)
+        } else {
+            linear.min(1.0)
+        };
+        return Some(limited.max(0.05));
     }
 
     // Fallback: full-file RMS for mono / unsupported sample rates.
@@ -217,10 +223,12 @@ fn full_replaygain(path: &std::path::Path) -> Option<f32> {
         .ok()
         .and_then(|f| rodio::Decoder::try_from(f).ok())?;
     let mut sum = 0f64;
+    let mut peak = 0f32;
     let mut n = 0u64;
     for sample in decoder {
         let v = sample as f64;
         sum += v * v;
+        peak = peak.max(sample.abs());
         n += 1;
     }
     if n == 0 {
@@ -230,7 +238,13 @@ fn full_replaygain(path: &std::path::Path) -> Option<f32> {
     if rms < 1e-6 {
         return None;
     }
-    Some((0.12 / rms).clamp(0.1, 4.0) as f32)
+    let rms_gain = 0.12 / rms;
+    let limited = if peak > 0.0 {
+        rms_gain.min(0.95 / peak as f64)
+    } else {
+        rms_gain.min(1.0)
+    };
+    Some(limited.clamp(0.1, 4.0) as f32)
 }
 
 /// Fills `Track.gain` from the loudness cache (when normalization is on).
