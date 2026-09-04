@@ -205,14 +205,17 @@ def _search_web_direct(query: str, limit: int) -> list[dict]:
                 "authorization",
                 "cookie",
                 "x-goog-authuser",
-                "x-origin",
-                "origin",
-                "referer",
                 "user-agent",
                 "x-youtube-client-name",
                 "x-youtube-client-version",
             )
         }
+        # The browser headers were captured on music.youtube.com; the web
+        # search endpoint requires Origin/Referer to match www.youtube.com,
+        # otherwise it rejects the request with a 400.
+        hdrs["Origin"] = "https://www.youtube.com"
+        hdrs["Referer"] = "https://www.youtube.com/"
+        hdrs["X-Origin"] = "https://www.youtube.com"
 
         context = {
             "context": {
@@ -244,27 +247,40 @@ def _search_web_direct(query: str, limit: int) -> list[dict]:
             data = resp.json()
 
             items: list[dict] = []
+            next_token = None
             if continuation is not None or "continuation" in body:
-                # continuation response shape
-                for cmd in data.get("onResponseReceivedCommands") or []:
-                    for item in (
-                        cmd.get("appendContinuationItemsAction") or {}
-                    ).get("continuationItems", []):
-                        items.append(item)
-            else:
-                for section in (
-                    (
-                        ((data.get("contents") or {}).get("twoColumnSearchResultsRenderer") or {})
-                        .get("primaryContents", {})
-                        .get("sectionListRenderer", {})
-                        .get("contents", [])
-                    )
-                    or []
-                ):
+                # Continuation responses use `continuationContents`.
+                cc = data.get("continuationContents") or {}
+                slc = cc.get("sectionListContinuation") or {}
+                for section in slc.get("contents", []) or []:
                     for item in (section.get("itemSectionRenderer") or {}).get("contents", []):
                         items.append(item)
+                if not items:
+                    isc = cc.get("itemSectionContinuation") or {}
+                    items = isc.get("continuationItems", []) or []
+                if not items:
+                    # Older shape fallback.
+                    for cmd in data.get("onResponseReceivedCommands") or []:
+                        for item in (
+                            cmd.get("appendContinuationItemsAction") or {}
+                        ).get("continuationItems", []):
+                            items.append(item)
+            else:
+                primary = (
+                    (data.get("contents") or {})
+                    .get("twoColumnSearchResultsRenderer", {})
+                    .get("primaryContents", {})
+                    .get("sectionListRenderer", {})
+                )
+                for section in primary.get("contents", []) or []:
+                    for item in (section.get("itemSectionRenderer") or {}).get("contents", []):
+                        items.append(item)
+                # Modern responses keep the token in `continuations`, not in items.
+                for c in primary.get("continuations", []) or []:
+                    tok = (c.get("nextContinuationData") or {}).get("continuation")
+                    if tok:
+                        next_token = tok
 
-            next_token = None
             for item in items:
                 vr = item.get("videoRenderer")
                 if vr:
