@@ -6,6 +6,7 @@ mod engine;
 mod grpc;
 mod net;
 mod playlist;
+mod secrets;
 mod sidecar;
 
 use downloader::ProgressHandle;
