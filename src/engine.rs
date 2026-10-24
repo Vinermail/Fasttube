@@ -2,8 +2,9 @@ use crate::playlist::Playlist;
 use rodio::{Decoder, DeviceSinkBuilder, Player, Source, source::Zero};
 use serde::Serialize;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use std::sync::Arc;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use std::time::{Duration, Instant};
 
 const BUFFER_FRAMES: u32 = 2048;
@@ -25,6 +26,18 @@ pub enum Cmd {
     ClearGains,
     /// Toggle the perceptual (exponential) volume curve.
     SetVolumeCurve(bool),
+}
+
+/// What the engine tells the rest of the app about playback.
+///
+/// The queue used to poll the snapshot every 250 ms to notice that a track
+/// had ended; these events carry the same information the moment it happens.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Event {
+    /// A track started playing (engine playlist index [`Event::TrackStarted`]).
+    TrackStarted,
+    /// The current track played to its end on its own (not stopped by us).
+    TrackEnded,
 }
 
 #[derive(Serialize, Clone)]
@@ -52,6 +65,8 @@ pub struct Snapshot {
 pub struct EngineHandle {
     tx: Sender<Cmd>,
     snapshot: Arc<RwLock<Option<Snapshot>>>,
+    /// Taken once by whoever consumes [`Event`]s (the queue task).
+    events: Arc<Mutex<Option<UnboundedReceiver<Event>>>>,
 }
 
 impl Clone for EngineHandle {
@@ -59,6 +74,7 @@ impl Clone for EngineHandle {
         Self {
             tx: self.tx.clone(),
             snapshot: self.snapshot.clone(),
+            events: self.events.clone(),
         }
     }
 }
@@ -74,11 +90,16 @@ impl EngineHandle {
         let (tx, rx) = channel();
         let snapshot = Arc::new(RwLock::new(None));
         let snap = snapshot.clone();
+        let (events_tx, events_rx) = unbounded_channel();
         std::thread::Builder::new()
             .name("audio-engine".to_string())
-            .spawn(move || run(rx, snap))
+            .spawn(move || run(rx, snap, events_tx))
             .expect("failed to spawn audio engine thread");
-        Self { tx, snapshot }
+        Self {
+            tx,
+            snapshot,
+            events: Arc::new(Mutex::new(Some(events_rx))),
+        }
     }
 
     pub fn send(&self, cmd: Cmd) {
@@ -87,6 +108,12 @@ impl EngineHandle {
 
     pub fn snapshot(&self) -> Option<Snapshot> {
         self.snapshot.read().clone()
+    }
+
+    /// Hands the event stream to its single consumer. `None` when another
+    /// part of the app already took it.
+    pub fn take_events(&self) -> Option<UnboundedReceiver<Event>> {
+        self.events.lock().take()
     }
 }
 
@@ -122,6 +149,8 @@ struct Engine {
     curve: bool,
     status: Status,
     dirty: bool,
+    /// Counter of successful starts, so the run loop can announce them.
+    started: u64,
 }
 
 impl Engine {
@@ -157,6 +186,7 @@ impl Engine {
             curve: true,
             status: Status::Stopped,
             dirty: true,
+            started: 0,
         };
         engine.apply_volume();
         engine.player.set_speed(engine.speed);
@@ -268,6 +298,7 @@ impl Engine {
         self.apply_volume();
         self.player.play();
         self.status = Status::Playing;
+        self.started = self.started.wrapping_add(1);
         true
     }
 
@@ -406,16 +437,24 @@ impl Engine {
     }
 }
 
-fn run(rx: Receiver<Cmd>, snapshot: Arc<RwLock<Option<Snapshot>>>) {
+fn run(
+    rx: Receiver<Cmd>,
+    snapshot: Arc<RwLock<Option<Snapshot>>>,
+    events: UnboundedSender<Event>,
+) {
     let mut engine: Option<Engine> = None;
     let mut last_publish = Instant::now();
     let mut pending_curve: Option<bool> = None;
+    let mut seen_starts: u64 = 0;
 
     loop {
         if let Some(e) = engine.as_mut()
             && e.status == Status::Playing
             && e.player.empty()
         {
+            // The source ran dry: this is the natural end of the track,
+            // not a stop we asked for.
+            let _ = events.send(Event::TrackEnded);
             e.advance();
         }
 
@@ -522,6 +561,10 @@ fn run(rx: Receiver<Cmd>, snapshot: Arc<RwLock<Option<Snapshot>>>) {
         }
 
         if let Some(e) = engine.as_ref() {
+            if e.started != seen_starts {
+                seen_starts = e.started;
+                let _ = events.send(Event::TrackStarted);
+            }
             let due = e.dirty || last_publish.elapsed() >= Duration::from_millis(100);
             if due {
                 *snapshot.write() = Some(e.snapshot());

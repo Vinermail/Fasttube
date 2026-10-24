@@ -1751,16 +1751,10 @@ async fn play_queue(
         return Err("empty queue".to_string());
     }
     state.queue.lock().set_items(items, start);
+    // The preload of the next two tracks is triggered by the engine's
+    // TrackStarted event, so a queue started from here and a track started by
+    // "next" follow exactly the same path.
     play_current(&state).await?;
-
-    // Preload the next two tracks in the background so advancing is instant.
-    let next_items = state.queue.lock().upcoming(2);
-    spawn_prefetch(
-        next_items,
-        state.fetching.clone(),
-        current_quality(&state),
-        streaming_account(&state),
-    );
     Ok(())
 }
 
@@ -1779,6 +1773,24 @@ fn spawn_prefetch(items: Vec<QueueItem>, fetching: FetchGuard, quality: String, 
     });
 }
 
+/// Drives the queue from the engine's own signal.
+///
+/// `TrackEnded` arrives the moment the decoder runs dry, so advancing no longer
+/// waits for the next 250 ms tick of a polling loop. `TrackStarted` triggers the
+/// preload of the next tracks.
+///
+/// TODO(gapless): the switch between two tracks still has a small gap (engine
+/// tick + decoder open). Sample-accurate gapless needs the engine to append the
+/// next source to the same `Player` before the current one ends, and to report
+/// which playlist entry is playing when it rolls over. Plan:
+///   1. `Cmd::QueueNext(Playlist)` — engine keeps a `pending: Option<Track>` and
+///      appends its decoder to the same player when `remaining() < 2 s`.
+///   2. `Event::TrackChanged { idx }` so the queue advances its cursor without
+///      calling play_current (no download, no SetPlaylist round trip).
+///   3. The queue hands over the next cached file as soon as `TrackStarted`
+///      fires, capped at one track ahead; repeat-one keeps the current source.
+/// Only worth doing once playback is gapless in the engine: rodio's `Player`
+/// already supports queueing sources, so this is an engine-local change.
 fn spawn_queue_watcher(handle: tauri::AppHandle) {
     std::thread::Builder::new()
         .name("queue-watcher".to_string())
@@ -1788,65 +1800,64 @@ fn spawn_queue_watcher(handle: tauri::AppHandle) {
                 .build()
                 .expect("failed to build queue watcher runtime");
             rt.block_on(async move {
+                let state = handle.state::<AppState>();
+                let Some(mut events) = state.engine.lock().take_events() else {
+                    eprintln!("[queue] engine events were already taken");
+                    return;
+                };
                 let mut prefetched_for: Option<usize> = None;
-                let mut prev_playing = false;
-                loop {
-                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                    let state = handle.state::<AppState>();
 
-                    let snapshot = state.engine.lock().snapshot();
-                    let playing_now = snapshot
-                        .as_ref()
-                        .map(|s| s.status == "playing")
-                        .unwrap_or(false);
-                    let stopped_now = snapshot
-                        .as_ref()
-                        .map(|s| s.status == "stopped")
-                        .unwrap_or(false);
-
-                    let mut advance = false;
-                    let mut prefetch: Vec<QueueItem> = Vec::new();
-                    {
-                        let mut q = state.queue.lock();
-                        if !q.active() || q.manual_stop() {
-                            prev_playing = false;
-                            prefetched_for = None;
-                            continue;
-                        }
-                        if prev_playing && stopped_now {
-                            // The track ended on its own: ask the queue
-                            // what to play next under the current repeat.
-                            let repeat = *state.repeat.lock();
-                            let action = q.advance(repeat);
-                            advance = action == Action::PlayCurrent;
-                            prev_playing = false;
-                            if advance {
+                while let Some(event) = events.recv().await {
+                    match event {
+                        engine::Event::TrackEnded => {
+                            let action = {
+                                let mut q = state.queue.lock();
+                                if !q.active() || q.manual_stop() {
+                                    None
+                                } else {
+                                    let repeat = *state.repeat.lock();
+                                    Some(q.advance(repeat))
+                                }
+                            };
+                            if action == Some(Action::PlayCurrent) {
                                 prefetched_for = None;
-                            }
-                        } else {
-                            prev_playing = playing_now;
-                        }
-
-                        // Once the current track starts playing, prefetch the
-                        // next two in the background.
-                        if playing_now && prefetched_for != Some(q.current()) {
-                            prefetched_for = Some(q.current());
-                            if *state.repeat.lock() != RepeatMode::One {
-                                prefetch = q.upcoming(2);
+                                if let Err(e) = play_current(&state).await {
+                                    eprintln!("[queue] play_current failed: {e}");
+                                }
                             }
                         }
-                    }
-
-                    if advance && let Err(e) = play_current(&state).await {
-                        eprintln!("[queue] play_current failed: {e}");
-                    }
-                    if !prefetch.is_empty() {
-                        spawn_prefetch(
-                            prefetch,
-                            state.fetching.clone(),
-                            current_quality(&state),
-                            streaming_account(&state),
-                        );
+                        engine::Event::TrackStarted => {
+                            let plan = {
+                                let q = state.queue.lock();
+                                if !q.active() || q.manual_stop() {
+                                    None
+                                } else if prefetched_for == Some(q.current()) {
+                                    None
+                                } else if *state.repeat.lock() == RepeatMode::One {
+                                    // Same file again: nothing to preload, but
+                                    // remember the index.
+                                    Some((q.current(), Vec::new()))
+                                } else {
+                                    Some((q.current(), q.upcoming(2)))
+                                }
+                            };
+                            match plan {
+                                Some((current, items)) => {
+                                    prefetched_for = Some(current);
+                                    if !items.is_empty() {
+                                        spawn_prefetch(
+                                            items,
+                                            state.fetching.clone(),
+                                            current_quality(&state),
+                                            streaming_account(&state),
+                                        );
+                                    }
+                                }
+                                // Local playback or a stopped queue: forget the
+                                // index so the next queue start preloads again.
+                                None => prefetched_for = None,
+                            }
+                        }
                     }
                 }
             });
