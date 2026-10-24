@@ -142,21 +142,24 @@
         <section class="settings-section">
           <h3>YouTube account</h3>
           <div id="yt-auth-status" class="auth-status">Checking...</div>
+          <button id="yt-signin-btn" class="btn primary">Sign in</button>
           <button id="yt-logout-btn" class="btn">Sign out</button>
-          <div id="yt-auth-form">
-            <input id="yt-auth-cid" type="text" placeholder="Client ID" />
-            <input id="yt-auth-csec" type="text" placeholder="Client Secret" />
-            <button id="yt-auth-start" class="btn primary">Start Google login</button>
-            <div id="yt-auth-url" class="hidden">
-              <p>Open this URL and sign in:</p>
-              <a id="yt-auth-link" href="#" target="_blank"></a>
+          <p class="hint">
+            Opens a separate window on music.youtube.com. The app reads the
+            session cookies there; this window never sees them.
+          </p>
+          <details id="yt-oauth-advanced">
+            <summary class="hint">Advanced: OAuth client</summary>
+            <div id="yt-auth-form">
+              <input id="yt-auth-cid" type="text" placeholder="Client ID" />
+              <input id="yt-auth-csec" type="text" placeholder="Client Secret" />
+              <button id="yt-auth-start" class="btn">Start device login</button>
+              <div id="yt-auth-url" class="hidden">
+                <p>Open this URL and sign in:</p>
+                <a id="yt-auth-link" href="#" target="_blank"></a>
+              </div>
             </div>
-            <div class="yt-browser-auth">
-              <p class="hint">OAuth сломан на стороне Google — используй browser-auth:</p>
-              <textarea id="yt-auth-headers" placeholder="Paste headers here..."></textarea>
-              <button id="yt-browser-auth-btn" class="btn">Use browser auth</button>
-            </div>
-          </div>
+          </details>
         </section>
       </div>
     </div>

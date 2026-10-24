@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod auth_window;
 mod downloader;
 mod engine;
 mod grpc;
@@ -743,11 +744,21 @@ async fn set_browser_auth(
     Ok(())
 }
 
+/// Async on purpose: window creation must not run on the main thread, where it
+/// would block the event loop that has to create the window.
 #[tauri::command]
-async fn logout(_state: tauri::State<'_, AppState>) -> Result<(), String> {
+async fn start_yt_login(app: tauri::AppHandle) -> Result<(), String> {
+    auth_window::open(&app)
+}
+
+#[tauri::command]
+async fn logout(state: tauri::State<'_, AppState>) -> Result<(), String> {
     let resp = grpc::clear_auth().await.map_err(|e| e.to_string())?;
     if !resp.ok {
         return Err(resp.error);
+    }
+    if let Ok(mut status) = state.api_status.write() {
+        status.auth_ok = false;
     }
     Ok(())
 }
@@ -1804,6 +1815,7 @@ fn main() {
             start_oauth,
             poll_oauth,
             set_browser_auth,
+            start_yt_login,
             logout,
             play_video,
             play_queue,

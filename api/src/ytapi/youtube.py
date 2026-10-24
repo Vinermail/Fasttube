@@ -556,7 +556,15 @@ def _authed_ytm():
     # Browser (cookies) auth is the recommended workaround while ytmusicapi's
     # OAuth is broken upstream (github.com/sigma67/ytmusicapi/issues/813).
     if os.path.exists(BROWSER_FILE):
-        return YTMusic(BROWSER_FILE)
+        # Files written by older versions lack the `authorization` header that
+        # ytmusicapi >= 1.12 requires to recognise browser auth; add it from the
+        # stored cookie instead of forcing everyone to sign in again.
+        try:
+            _ensure_browser_authorization()
+        except Exception:
+            log.exception("stored browser auth is unusable, ignoring it")
+        else:
+            return YTMusic(BROWSER_FILE)
 
     oauth_credentials = None
     if os.path.exists(OAUTH_CREDS_FILE):
@@ -568,6 +576,11 @@ def _authed_ytm():
             )
         except Exception:
             log.exception("failed to load oauth credentials")
+
+    if not os.path.exists(OAUTH_FILE):
+        raise RuntimeError(
+            "no usable YouTube auth: the stored browser session is invalid, sign in again"
+        )
 
     return YTMusic(OAUTH_FILE, oauth_credentials=oauth_credentials)
 
@@ -600,16 +613,44 @@ def clear_auth() -> dict:
     return {"ok": True, "error": ""}
 
 
+def _ensure_browser_authorization(path: str | None = None) -> None:
+    """Add the `authorization` header ytmusicapi needs to treat a header file
+    as browser auth.
+
+    ytmusicapi >= 1.12 no longer derives SAPISIDHASH from the cookie when
+    loading headers: `determine_auth_type()` only returns BROWSER if the file
+    already carries `authorization: SAPISIDHASH ...`, otherwise it assumes an
+    OAuth token and fails with "oauth_credentials not provided". setup_browser()
+    does not write that header, so we write it here from the session cookie.
+
+    Raises KeyError if the cookie has no __Secure-3PAPISID (not signed in).
+    """
+    from ytmusicapi.helpers import get_authorization, sapisid_from_cookie
+
+    path = path or BROWSER_FILE
+    with open(path, encoding="utf8") as f:
+        headers = json.load(f)
+    if "SAPISIDHASH" in headers.get("authorization", ""):
+        return  # already usable
+    cookie = next((v for k, v in headers.items() if k.lower() == "cookie"), "")
+    sapisid = sapisid_from_cookie(cookie)
+    origin = next(
+        (v for k, v in headers.items() if k.lower() in ("origin", "x-origin")),
+        "https://music.youtube.com",
+    ).rstrip("/")
+    headers["authorization"] = get_authorization(f"{sapisid} {origin}")
+    with open(path, "w", encoding="utf8") as f:
+        json.dump(headers, f, ensure_ascii=True, indent=4, sort_keys=True)
+
+
 def set_browser_auth(auth_text: str) -> dict:
-    """Parse request headers pasted from the browser (DevTools copy) and
-    store them for browser-based auth."""
+    """Parse request headers pasted from the browser (DevTools copy) or built
+    from captured cookies and store them for browser-based auth."""
     from ytmusicapi.auth.browser import setup_browser
 
     normalized = _normalize_auth_text(auth_text)
     try:
         setup_browser(BROWSER_FILE, headers_raw=normalized)
-        invalidate_account_caches()
-        return {"ok": True, "error": ""}
     except Exception as e:
         log.exception("set_browser_auth failed")
         msg = str(e)
@@ -619,6 +660,23 @@ def set_browser_auth(auth_text: str) -> dict:
                 "(DevTools -> Network -> refresh the page)."
             )
         return {"ok": False, "error": msg}
+
+    try:
+        _ensure_browser_authorization()
+    except Exception:
+        log.exception("captured session has no usable SAPISID cookie")
+        try:
+            os.remove(BROWSER_FILE)
+        except OSError:
+            pass
+        return {
+            "ok": False,
+            "error": "no __Secure-3PAPISID cookie in the captured session: "
+            "sign-in did not complete",
+        }
+
+    invalidate_account_caches()
+    return {"ok": True, "error": ""}
 
 
 def _normalize_auth_text(text: str) -> str:

@@ -489,20 +489,30 @@ async function pollOauthUntilDone() {
   }
 }
 
-$("yt-browser-auth-btn").onclick = async () => {
-  const text = $("yt-auth-headers").value.trim();
-  if (!text) {
-    showError("Вставь заголовки запроса из браузера");
-    return;
-  }
+$("yt-signin-btn").onclick = async () => {
   try {
-    await invoke("set_browser_auth", { authText: text });
     hideError();
-    setAuthStatus("Signed in", true);
+    await invoke("start_yt_login");
+    setAuthStatus("Waiting for sign-in in the window...", null);
   } catch (e) {
     showError(e);
   }
 };
+
+// The sign-in window reports here; the payload never contains cookies.
+event.listen("yt-auth-changed", (e) => {
+  const p = e.payload || {};
+  if (p.ok) {
+    hideError();
+    setAuthStatus("Signed in", true);
+    refresh();
+  } else if (p.cancelled) {
+    setAuthStatus("Not signed in", false);
+  } else {
+    setAuthStatus("Not signed in", false);
+    showError(p.error || "sign-in failed");
+  }
+});
 
 $("yt-logout-btn").onclick = async () => {
   try {
