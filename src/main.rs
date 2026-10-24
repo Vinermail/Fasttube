@@ -1689,39 +1689,18 @@ fn spawn_queue_watcher(handle: tauri::AppHandle) {
         .expect("failed to spawn queue watcher");
 }
 
-/// Loads or creates the gRPC auth token. Persisted across runs so that a
-/// leftover sidecar from a previous run can be reused (same token) instead of
-/// blocking the port with a different one.
-fn load_or_create_api_token() -> String {
-    let path = downloader::data_dir().join("api_token");
-    if let Ok(existing) = std::fs::read_to_string(&path) {
-        let existing = existing.trim().to_string();
-        if !existing.is_empty() {
-            return existing;
-        }
-    }
-    let token = generate_api_token();
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let _ = std::fs::write(&path, &token);
-    token
-}
-
 /// Generates a random token shared between the app and the sidecar so that
-/// other local processes cannot use the unauthenticated gRPC endpoint.
+/// other local processes cannot use the gRPC endpoint. 32 bytes straight from
+/// the OS CSPRNG, hex encoded; never written to disk.
 fn generate_api_token() -> String {
-    use std::collections::hash_map::RandomState;
-    use std::hash::{BuildHasher, Hasher};
-
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let mut h = RandomState::new().build_hasher();
-    h.write_u64(nanos as u64);
-    h.write_usize(std::process::id() as usize);
-    format!("{:016x}{:016x}", h.finish(), nanos)
+    let mut bytes = [0u8; 32];
+    getrandom::fill(&mut bytes).expect("OS random number generator failed");
+    let mut token = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(token, "{byte:02x}");
+    }
+    token
 }
 
 fn extract_video_id(input: &str) -> Option<String> {
@@ -1757,8 +1736,11 @@ fn extract_video_id(input: &str) -> Option<String> {
 
 fn main() {
     downloader::migrate_legacy_dir();
-    let api_token = load_or_create_api_token();
-    grpc::set_api_token(api_token.clone());
+    // Older builds persisted the token to %LOCALAPPDATA%\fasttube\api_token.
+    // It authenticates nothing now (a new token is generated per launch), so
+    // drop the leftover secret instead of leaving it on disk.
+    let _ = std::fs::remove_file(downloader::data_dir().join("api_token"));
+    let api_token = generate_api_token();
     let initial_dir = std::env::args()
         .skip(1)
         .map(std::path::PathBuf::from)
@@ -1898,8 +1880,8 @@ fn main() {
             event,
             tauri::RunEvent::Exit | tauri::RunEvent::ExitRequested { .. }
         ) {
-            sidecar.kill();
             shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+            sidecar.kill();
         }
     });
 }
@@ -1907,6 +1889,14 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::migrate_loudness_keys;
+
+    #[test]
+    fn api_token_is_32_os_bytes_as_hex() {
+        let token = super::generate_api_token();
+        assert_eq!(token.len(), 64, "32 bytes -> 64 hex chars");
+        assert!(token.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(token, super::generate_api_token(), "must not repeat");
+    }
 
     #[test]
     fn loudness_keys_follow_cache_layout() {

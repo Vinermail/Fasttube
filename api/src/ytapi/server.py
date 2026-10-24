@@ -1,5 +1,6 @@
 """gRPC server for the YouTube catalog service."""
 
+import hmac
 import logging
 import os
 import sys
@@ -18,7 +19,9 @@ net.force_ipv4_dns()
 log = logging.getLogger("ytapi.server")
 
 VERSION = "0.1.0"
-PORT = int(os.environ.get("YTAPI_PORT", "50051"))
+# 0 lets the OS pick a free port; the chosen one is printed as `PORT=<n>` on
+# stdout, which is the handshake the Rust supervisor reads.
+PORT = int(os.environ.get("YTAPI_PORT", "0"))
 
 API_TOKEN = os.environ.get("FASTTUBE_API_TOKEN", "")
 
@@ -29,7 +32,10 @@ class _TokenInterceptor(grpc.ServerInterceptor):
 
     def intercept_service(self, continuation, handler_call_details):
         md = dict(handler_call_details.invocation_metadata or [])
-        if API_TOKEN and md.get("x-fasttube-token") != API_TOKEN:
+        got = md.get("x-fasttube-token")
+        if not isinstance(got, str) or not hmac.compare_digest(
+            got.encode("utf-8"), API_TOKEN.encode("utf-8")
+        ):
 
             def deny(request, context):
                 context.abort(grpc.StatusCode.UNAUTHENTICATED, "invalid or missing token")
@@ -197,14 +203,50 @@ class PlayerApiServicer(player_api_pb2_grpc.PlayerApiServicer):
 
 def serve():
     logging.basicConfig(level=logging.INFO)
-    _warm_up_ytdlp()
-    interceptors = [_TokenInterceptor()] if API_TOKEN else None
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=8), interceptors=interceptors)
+    if not API_TOKEN:
+        # Fail closed: an unauthenticated sidecar would expose the YouTube
+        # session to every process on the machine.
+        log.error("FASTTUBE_API_TOKEN is not set; refusing to start")
+        sys.exit(2)
+
+    server = grpc.server(
+        futures.ThreadPoolExecutor(max_workers=8),
+        interceptors=[_TokenInterceptor()],
+    )
     player_api_pb2_grpc.add_PlayerApiServicer_to_server(PlayerApiServicer(), server)
-    server.add_insecure_port(f"127.0.0.1:{PORT}")
+    port = server.add_insecure_port(f"127.0.0.1:{PORT}")
+    if port == 0:
+        log.error("could not bind 127.0.0.1:%s", PORT)
+        sys.exit(1)
     server.start()
-    log.info("ytapi listening on 127.0.0.1:%s", PORT)
+    # Handshake: the first stdout line tells the Rust supervisor where to dial.
+    print(f"PORT={port}", flush=True)
+    log.info("ytapi listening on 127.0.0.1:%s", port)
+    if os.environ.get("FASTTUBE_PARENT_PIPE") == "1":
+        _watch_parent_pipe()
+    _warm_up_ytdlp()
     server.wait_for_termination()
+
+
+def _watch_parent_pipe() -> None:
+    """Exits when the app closes our stdin.
+
+    The Rust supervisor holds the write end of this pipe. If the app dies
+    without killing us (crash, task manager), the pipe hits EOF and we must
+    not linger as an orphaned process nobody can authenticate against.
+    """
+
+    def watch():
+        try:
+            while True:
+                if sys.stdin.readline() == "":
+                    log.info("stdin closed (app exited); shutting down")
+                    break
+        except Exception:
+            log.exception("stdin watchdog failed; shutting down")
+        os._exit(0)
+
+    threading.Thread(target=watch, name="parent-watchdog", daemon=True).start()
 
 
 def _warm_up_ytdlp() -> None:

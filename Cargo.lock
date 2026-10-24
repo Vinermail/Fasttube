@@ -933,6 +933,7 @@ dependencies = [
  "anyhow",
  "cpal",
  "futures-util",
+ "getrandom 0.4.3",
  "http",
  "lofty",
  "prost",
