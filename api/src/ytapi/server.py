@@ -43,12 +43,6 @@ class _TokenInterceptor(grpc.ServerInterceptor):
             return grpc.unary_unary_rpc_method_handler(deny)
         return continuation(handler_call_details)
 
-COOKIES_FILE = os.environ.get(
-    "YTAPI_COOKIES",
-    os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "cookies.txt"),
-)
-
-
 def _to_pb_track(t: dict) -> player_api_pb2.Track:
     return player_api_pb2.Track(
         video_id=t.get("video_id", ""),
@@ -57,6 +51,21 @@ def _to_pb_track(t: dict) -> player_api_pb2.Track:
         album=t.get("album", ""),
         duration_secs=t.get("duration_secs", 0.0),
         thumbnail=t.get("thumbnail", ""),
+    )
+
+
+_SESSION_STATES = {
+    "signed_out": player_api_pb2.SIGNED_OUT,
+    "active": player_api_pb2.ACTIVE,
+    "expired": player_api_pb2.EXPIRED,
+}
+
+
+def _to_session_status(result: dict) -> player_api_pb2.SessionStatus:
+    return player_api_pb2.SessionStatus(
+        state=_SESSION_STATES.get(result.get("state", ""), player_api_pb2.SESSION_STATE_UNSPECIFIED),
+        account_name=result.get("account_name", ""),
+        error=result.get("error", ""),
     )
 
 
@@ -88,7 +97,7 @@ class PlayerApiServicer(player_api_pb2_grpc.PlayerApiServicer):
 
     def ResolveUrl(self, request, context):
         try:
-            cookies = COOKIES_FILE if os.path.exists(COOKIES_FILE) else None
+            cookies = youtube.session_cookie() if request.use_account else None
             result = youtube.resolve_url(
                 request.video_id,
                 cookies,
@@ -115,6 +124,7 @@ class PlayerApiServicer(player_api_pb2_grpc.PlayerApiServicer):
             count = youtube.prefetch_resolve(
                 list(request.ids),
                 request.audio_quality or youtube.QUALITY_STANDARD,
+                use_account=request.use_account,
             )
             return player_api_pb2.PrefetchResolveResponse(resolved=count)
         except Exception as e:
@@ -171,34 +181,29 @@ class PlayerApiServicer(player_api_pb2_grpc.PlayerApiServicer):
             error=result.get("error", ""),
         )
 
-    def StartOAuth(self, request, context):
-        result = youtube.start_oauth(request.client_id, request.client_secret)
-        return player_api_pb2.StartOAuthResponse(
-            ok=result.get("ok", False),
-            error=result.get("error", ""),
-            url=result.get("url", ""),
+    def SetSession(self, request, context):
+        result = youtube.set_session(
+            request.cookie, request.user_agent, request.x_goog_authuser
+        )
+        return _to_session_status(result)
+
+    def ParseAuthHeaders(self, request, context):
+        try:
+            fields = youtube.parse_auth_headers(request.text)
+        except Exception as e:
+            context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(e))
+            return player_api_pb2.SetSessionRequest()
+        return player_api_pb2.SetSessionRequest(
+            cookie=fields["cookie"],
+            user_agent=fields["user_agent"],
+            x_goog_authuser=fields["x_goog_authuser"],
         )
 
-    def PollOAuth(self, request, context):
-        result = youtube.poll_oauth()
-        return player_api_pb2.PollOAuthResponse(
-            done=result.get("done", False),
-            error=result.get("error", ""),
-        )
+    def ValidateSession(self, request, context):
+        return _to_session_status(youtube.validate_session())
 
-    def SetBrowserAuth(self, request, context):
-        result = youtube.set_browser_auth(request.auth_text)
-        return player_api_pb2.SetBrowserAuthResponse(
-            ok=result.get("ok", False),
-            error=result.get("error", ""),
-        )
-
-    def ClearAuth(self, request, context):
-        result = youtube.clear_auth()
-        return player_api_pb2.ClearAuthResponse(
-            ok=result.get("ok", False),
-            error=result.get("error", ""),
-        )
+    def ClearSession(self, request, context):
+        return _to_session_status(youtube.clear_session())
 
 
 def serve():

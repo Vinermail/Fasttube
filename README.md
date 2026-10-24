@@ -77,6 +77,10 @@ cargo run -- "C:\путь\к\музыке"
 ```bash
 uv run --project api python -m grpc_tools.protoc -I proto \
   --python_out=api/src/ytapi/pb --grpc_python_out=api/src/ytapi/pb proto/player_api.proto
+# protoc emits `import player_api_pb2`, which does not resolve from the
+# ytapi.pb package; fix it up after every regeneration:
+sed -i 's/^import player_api_pb2 as player__api__pb2$/from . import player_api_pb2 as player__api__pb2/' \
+  api/src/ytapi/pb/player_api_pb2_grpc.py
 ```
 
 ## Авторизация YouTube

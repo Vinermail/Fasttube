@@ -451,66 +451,56 @@ function setAuthStatus(text, ok) {
   el.className = "auth-status" + (ok === true ? " ok" : ok === false ? " no" : "");
 }
 
-$("yt-auth-start").onclick = async () => {
-  const clientId = $("yt-auth-cid").value.trim();
-  const clientSecret = $("yt-auth-csec").value.trim();
-  if (!clientId || !clientSecret) {
-    showError("Client ID / Secret from Google Cloud Console. Client type must be 'TVs and Limited Input devices'");
-    return;
-  }
-  try {
-    const resp = await invoke("start_oauth", { clientId, clientSecret });
-    if (!resp.ok) {
-      showError(resp.error);
-      return;
-    }
-    $("yt-auth-link").href = resp.url;
-    $("yt-auth-link").textContent = resp.url;
-    $("yt-auth-url").classList.remove("hidden");
-    showError("Sign in in the browser, then this app finishes automatically");
-    pollOauthUntilDone();
-  } catch (e) {
-    showError(e);
-  }
-};
-
-async function pollOauthUntilDone() {
-  try {
-    const resp = await invoke("poll_oauth");
-    if (resp.done) {
-      hideError();
-      $("yt-auth-url").classList.add("hidden");
-      setAuthStatus("Signed in", true);
-      return;
-    }
-    showError(resp.error || "oauth failed");
-  } catch (e) {
-    showError(e);
-  }
-}
-
 $("yt-signin-btn").onclick = async () => {
   try {
     hideError();
-    await invoke("start_yt_login");
+    await invoke("yt_login_start");
     setAuthStatus("Waiting for sign-in in the window...", null);
   } catch (e) {
     showError(e);
   }
 };
 
+$("yt-advanced-btn").onclick = async () => {
+  const text = $("yt-auth-headers").value.trim();
+  if (!text) {
+    showError("Paste the request headers first");
+    return;
+  }
+  try {
+    hideError();
+    const info = await invoke("yt_login_advanced", { authText: text });
+    $("yt-auth-headers").value = "";
+    applySessionInfo(info);
+    refresh();
+  } catch (e) {
+    showError(e);
+  }
+};
+
+function applySessionInfo(info) {
+  if (!info) return;
+  if (info.state === "active") {
+    setAuthStatus(info.account_name ? "Signed in as " + info.account_name : "Signed in", true);
+  } else if (info.state === "expired") {
+    setAuthStatus("Session expired", false);
+  } else {
+    setAuthStatus("Not signed in", false);
+  }
+}
+
 // The sign-in window reports here; the payload never contains cookies.
 event.listen("yt-auth-changed", (e) => {
   const p = e.payload || {};
   if (p.ok) {
     hideError();
-    setAuthStatus("Signed in", true);
+    applySessionInfo({ state: p.state || "active", account_name: p.account_name || "" });
     refresh();
   } else if (p.cancelled) {
-    setAuthStatus("Not signed in", false);
+    refresh(); // status comes from the shared state, not from the cancel
   } else {
-    setAuthStatus("Not signed in", false);
     showError(p.error || "sign-in failed");
+    refresh();
   }
 });
 

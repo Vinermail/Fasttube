@@ -146,19 +146,18 @@
           <button id="yt-logout-btn" class="btn">Sign out</button>
           <p class="hint">
             Opens a separate window on music.youtube.com. The app reads the
-            session cookies there; this window never sees them.
+            session cookies itself and keeps them encrypted; no plain-text
+            cookie file is written.
           </p>
-          <details id="yt-oauth-advanced">
-            <summary class="hint">Advanced: OAuth client</summary>
-            <div id="yt-auth-form">
-              <input id="yt-auth-cid" type="text" placeholder="Client ID" />
-              <input id="yt-auth-csec" type="text" placeholder="Client Secret" />
-              <button id="yt-auth-start" class="btn">Start device login</button>
-              <div id="yt-auth-url" class="hidden">
-                <p>Open this URL and sign in:</p>
-                <a id="yt-auth-link" href="#" target="_blank"></a>
-              </div>
-            </div>
+          <details id="yt-advanced">
+            <summary class="hint">Advanced: paste request headers</summary>
+            <textarea id="yt-auth-headers" placeholder="Paste request headers (or cURL) for https://music.youtube.com/youtubei/v1/browse"></textarea>
+            <button id="yt-advanced-btn" class="btn">Use these headers</button>
+            <p class="hint">
+              Fallback if Google refuses the embedded sign-in window.
+              DevTools &rarr; Network &rarr; the <code>browse</code> request &rarr;
+              Copy request headers.
+            </p>
           </details>
         </section>
       </div>

@@ -10,10 +10,10 @@ pub mod proto {
 }
 
 pub use proto::{
-    ClearAuthResponse, Empty, HealthResponse, LyricsRequest, LyricsResponse, PlaylistTracksRequest,
-    PlaylistTracksResponse, PollOAuthResponse, PrefetchResolveRequest, RecommendRequest,
-    ResolveRequest, ResolveResponse, SearchRequest, SetBrowserAuthRequest, SetBrowserAuthResponse,
-    StartOAuthRequest, StartOAuthResponse, Track, UserPlaylistsResponse,
+    Empty, HealthResponse, LyricsRequest, LyricsResponse, ParseAuthHeadersRequest,
+    PlaylistTracksRequest, PlaylistTracksResponse, PrefetchResolveRequest, RecommendRequest,
+    ResolveRequest, ResolveResponse, SearchRequest, SessionState, SessionStatus, SetSessionRequest,
+    Track, UserPlaylistsResponse,
     player_api_client::PlayerApiClient,
 };
 
@@ -85,15 +85,24 @@ pub async fn health() -> Result<HealthResponse> {
     Ok(resp.into_inner())
 }
 
-pub async fn resolve(video_id: &str, quality: &str) -> Result<ResolveResponse> {
-    resolve_impl(video_id, quality, false).await
+pub async fn resolve(video_id: &str, quality: &str, use_account: bool) -> Result<ResolveResponse> {
+    resolve_impl(video_id, quality, use_account, false).await
 }
 
-pub async fn resolve_forced(video_id: &str, quality: &str) -> Result<ResolveResponse> {
-    resolve_impl(video_id, quality, true).await
+pub async fn resolve_forced(
+    video_id: &str,
+    quality: &str,
+    use_account: bool,
+) -> Result<ResolveResponse> {
+    resolve_impl(video_id, quality, use_account, true).await
 }
 
-async fn resolve_impl(video_id: &str, quality: &str, force: bool) -> Result<ResolveResponse> {
+async fn resolve_impl(
+    video_id: &str,
+    quality: &str,
+    use_account: bool,
+    force: bool,
+) -> Result<ResolveResponse> {
     let mut client = connect().await?;
     let resp = client
         .resolve_url(with_timeout(
@@ -101,6 +110,7 @@ async fn resolve_impl(video_id: &str, quality: &str, force: bool) -> Result<Reso
                 video_id: video_id.to_string(),
                 audio_quality: quality.to_string(),
                 force,
+                use_account,
             },
             RESOLVE_TIMEOUT,
         ))
@@ -108,12 +118,17 @@ async fn resolve_impl(video_id: &str, quality: &str, force: bool) -> Result<Reso
     Ok(resp.into_inner())
 }
 
-pub async fn prefetch_resolve(ids: &[String], quality: &str) -> Result<i32> {
+pub async fn prefetch_resolve(
+    ids: &[String],
+    quality: &str,
+    use_account: bool,
+) -> Result<i32> {
     let mut client = connect().await?;
     let resp = client
         .prefetch_resolve(request(PrefetchResolveRequest {
             ids: ids.to_vec(),
             audio_quality: quality.to_string(),
+            use_account,
         }))
         .await?;
     Ok(resp.into_inner().resolved)
@@ -157,36 +172,38 @@ pub async fn get_liked_songs() -> Result<PlaylistTracksResponse> {
     Ok(resp.into_inner())
 }
 
-pub async fn start_oauth(client_id: &str, client_secret: &str) -> Result<StartOAuthResponse> {
+pub async fn set_session(cookie: &str, user_agent: &str, authuser: &str) -> Result<SessionStatus> {
     let mut client = connect().await?;
     let resp = client
-        .start_o_auth(request(StartOAuthRequest {
-            client_id: client_id.to_string(),
-            client_secret: client_secret.to_string(),
+        .set_session(request(SetSessionRequest {
+            cookie: cookie.to_string(),
+            user_agent: user_agent.to_string(),
+            x_goog_authuser: authuser.to_string(),
         }))
         .await?;
     Ok(resp.into_inner())
 }
 
-pub async fn poll_oauth() -> Result<PollOAuthResponse> {
-    let mut client = connect().await?;
-    let resp = client.poll_o_auth(request(Empty {})).await?;
-    Ok(resp.into_inner())
-}
-
-pub async fn set_browser_auth(auth_text: &str) -> Result<SetBrowserAuthResponse> {
+/// Normalises pasted browser headers into session fields (sidecar-side parser).
+pub async fn parse_auth_headers(text: &str) -> Result<SetSessionRequest> {
     let mut client = connect().await?;
     let resp = client
-        .set_browser_auth(request(SetBrowserAuthRequest {
-            auth_text: auth_text.to_string(),
+        .parse_auth_headers(request(ParseAuthHeadersRequest {
+            text: text.to_string(),
         }))
         .await?;
     Ok(resp.into_inner())
 }
 
-pub async fn clear_auth() -> Result<ClearAuthResponse> {
+pub async fn validate_session() -> Result<SessionStatus> {
     let mut client = connect().await?;
-    let resp = client.clear_auth(request(Empty {})).await?;
+    let resp = client.validate_session(request(Empty {})).await?;
+    Ok(resp.into_inner())
+}
+
+pub async fn clear_session() -> Result<SessionStatus> {
+    let mut client = connect().await?;
+    let resp = client.clear_session(request(Empty {})).await?;
     Ok(resp.into_inner())
 }
 

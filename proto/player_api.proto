@@ -34,6 +34,7 @@ message ResolveRequest {
   string video_id = 1;
   string audio_quality = 2; // "standard" | "high"
   bool force = 3; // skip the cache and re-extract
+  bool use_account = 4; // stream with the signed-in session (Premium/age-gated)
 }
 
 message ResolveResponse {
@@ -49,6 +50,7 @@ message ResolveResponse {
 message PrefetchResolveRequest {
   repeated string ids = 1;
   string audio_quality = 2;
+  bool use_account = 3;
 }
 
 message PrefetchResolveResponse {
@@ -87,34 +89,27 @@ message PlaylistTracksResponse {
   string error = 2;
 }
 
-message StartOAuthRequest {
-  string client_id = 1;
-  string client_secret = 2;
+message ParseAuthHeadersRequest {
+  string text = 1;
 }
 
-message StartOAuthResponse {
-  bool ok = 1;
-  string error = 2;
-  string url = 3;
+message SetSessionRequest {
+  string cookie = 1;
+  string user_agent = 2;
+  string x_goog_authuser = 3;
 }
 
-message PollOAuthResponse {
-  bool done = 1;
-  string error = 2;
+enum SessionState {
+  SESSION_STATE_UNSPECIFIED = 0;
+  SIGNED_OUT = 1;
+  ACTIVE = 2;
+  EXPIRED = 3;
 }
 
-message SetBrowserAuthRequest {
-  string auth_text = 1;
-}
-
-message SetBrowserAuthResponse {
-  bool ok = 1;
-  string error = 2;
-}
-
-message ClearAuthResponse {
-  bool ok = 1;
-  string error = 2;
+message SessionStatus {
+  SessionState state = 1;
+  string account_name = 2;
+  string error = 3;
 }
 
 message LyricsRequest {
@@ -140,8 +135,8 @@ service PlayerApi {
   rpc GetPlaylistTracks(PlaylistTracksRequest) returns (PlaylistTracksResponse);
   rpc GetLikedSongs(Empty) returns (PlaylistTracksResponse);
   rpc GetLyrics(LyricsRequest) returns (LyricsResponse);
-  rpc StartOAuth(StartOAuthRequest) returns (StartOAuthResponse);
-  rpc PollOAuth(Empty) returns (PollOAuthResponse);
-  rpc SetBrowserAuth(SetBrowserAuthRequest) returns (SetBrowserAuthResponse);
-  rpc ClearAuth(Empty) returns (ClearAuthResponse);
+  rpc SetSession(SetSessionRequest) returns (SessionStatus);
+  rpc ParseAuthHeaders(ParseAuthHeadersRequest) returns (SetSessionRequest);
+  rpc ValidateSession(Empty) returns (SessionStatus);
+  rpc ClearSession(Empty) returns (SessionStatus);
 }

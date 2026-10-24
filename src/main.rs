@@ -734,72 +734,108 @@ async fn get_liked_songs(_state: tauri::State<'_, AppState>) -> Result<Vec<Searc
 }
 
 #[derive(Serialize, Clone)]
-struct StartOAuthInfo {
-    ok: bool,
-    error: String,
-    url: String,
+pub(crate) struct SessionInfo {
+    pub state: String, // signed_out | active | expired
+    pub account_name: String,
+    pub error: String,
 }
 
-#[tauri::command]
-async fn start_oauth(
-    client_id: String,
-    client_secret: String,
-    _state: tauri::State<'_, AppState>,
-) -> Result<StartOAuthInfo, String> {
-    let resp = grpc::start_oauth(&client_id, &client_secret)
-        .await
-        .map_err(|e| e.to_string())?;
-    Ok(StartOAuthInfo {
-        ok: resp.ok,
-        error: resp.error,
-        url: resp.url,
-    })
-}
-
-#[derive(Serialize, Clone)]
-struct PollOAuthInfo {
-    done: bool,
-    error: String,
-}
-
-#[tauri::command]
-async fn poll_oauth(_state: tauri::State<'_, AppState>) -> Result<PollOAuthInfo, String> {
-    let resp = grpc::poll_oauth().await.map_err(|e| e.to_string())?;
-    Ok(PollOAuthInfo {
-        done: resp.done,
-        error: resp.error,
-    })
-}
-
-#[tauri::command]
-async fn set_browser_auth(
-    auth_text: String,
-    _state: tauri::State<'_, AppState>,
-) -> Result<(), String> {
-    let resp = grpc::set_browser_auth(&auth_text)
-        .await
-        .map_err(|e| e.to_string())?;
-    if !resp.ok {
-        return Err(resp.error);
+impl SessionInfo {
+    fn from_status(status: &grpc::SessionStatus) -> Self {
+        let state = match status.state() {
+            grpc::SessionState::Active => "active",
+            grpc::SessionState::Expired => "expired",
+            _ => "signed_out",
+        };
+        Self {
+            state: state.to_string(),
+            account_name: status.account_name.clone(),
+            error: status.error.clone(),
+        }
     }
-    Ok(())
 }
 
-/// Async on purpose: window creation must not run on the main thread, where it
-/// would block the event loop that has to create the window.
+fn set_session_status(app: &tauri::AppHandle, info: &SessionInfo) {
+    if let Some(state) = app.try_state::<AppState>()
+        && let Ok(mut status) = state.api_status.write()
+    {
+        status.session_state = info.state.clone();
+        status.account_name = info.account_name.clone();
+        status.auth_ok = info.state == "active";
+    }
+}
+
+/// Installs a session in the sidecar, validates it, and only then persists the
+/// bundle. A session YouTube already rejects must never overwrite a working
+/// one. Shared by the login window and the advanced paste path.
+pub(crate) async fn install_session(
+    app: &tauri::AppHandle,
+    bundle: secrets::AuthBundle,
+) -> Result<SessionInfo, String> {
+    let status = grpc::set_session(&bundle.cookie, &bundle.user_agent, &bundle.x_goog_authuser)
+        .await
+        .map_err(|e| e.to_string())?;
+    let installed = SessionInfo::from_status(&status);
+    if installed.state != "active" {
+        return Err(if installed.error.is_empty() {
+            "the sidecar rejected the session".to_string()
+        } else {
+            installed.error
+        });
+    }
+
+    let validated = grpc::validate_session().await.map_err(|e| e.to_string())?;
+    let info = SessionInfo::from_status(&validated);
+    if info.state != "active" {
+        // Do not keep a dead session around (and do not touch auth.bin).
+        let _ = grpc::clear_session().await;
+        return Err(if info.error.is_empty() {
+            "YouTube rejected the session".to_string()
+        } else {
+            info.error
+        });
+    }
+
+    secrets::save(&bundle)?;
+    set_session_status(app, &info);
+    Ok(info)
+}
+
 #[tauri::command]
-async fn start_yt_login(app: tauri::AppHandle) -> Result<(), String> {
+async fn yt_login_start(app: tauri::AppHandle) -> Result<(), String> {
     auth_window::open(&app)
+}
+
+/// Advanced fallback (3.5): paste request headers from a real browser. Parsed
+/// by the sidecar with the same normaliser the old flow used, then stored via
+/// the encrypted bundle — no cookie file anywhere.
+#[tauri::command]
+async fn yt_login_advanced(
+    auth_text: String,
+    app: tauri::AppHandle,
+) -> Result<SessionInfo, String> {
+    let fields = grpc::parse_auth_headers(&auth_text)
+        .await
+        .map_err(|e| e.to_string())?;
+    let bundle = secrets::AuthBundle::new(
+        fields.cookie,
+        fields.user_agent,
+        fields.x_goog_authuser,
+    );
+    install_session(&app, bundle).await
 }
 
 #[tauri::command]
 async fn logout(state: tauri::State<'_, AppState>) -> Result<(), String> {
-    let resp = grpc::clear_auth().await.map_err(|e| e.to_string())?;
-    if !resp.ok {
-        return Err(resp.error);
+    // Best effort: even with the sidecar down, the local secrets must go.
+    if let Err(e) = grpc::clear_session().await {
+        eprintln!("[auth] clear_session failed: {e}");
     }
+    secrets::clear()?;
     if let Ok(mut status) = state.api_status.write() {
         status.auth_ok = false;
+        status.session_state = "signed_out".to_string();
+        status.account_name.clear();
     }
     Ok(())
 }
@@ -887,7 +923,7 @@ async fn play_video_inner(id: &str, state: &AppState) -> Result<PlaylistInfo, St
             t
         } else {
             // file cached but metadata lost: resolve just for the title
-            let resolved = grpc::resolve(id, &quality)
+            let resolved = grpc::resolve(id, &quality, false)
                 .await
                 .map_err(|e| e.to_string())?;
             let track = resolved
@@ -896,7 +932,7 @@ async fn play_video_inner(id: &str, state: &AppState) -> Result<PlaylistInfo, St
             track.title.clone()
         }
     } else {
-        let resolved = grpc::resolve(id, &quality)
+        let resolved = grpc::resolve(id, &quality, false)
             .await
             .map_err(|e| e.to_string())?;
         if !resolved.ok {
@@ -1047,7 +1083,7 @@ async fn play_current_download(
         .store(0, std::sync::atomic::Ordering::Relaxed);
 
     let quality = current_quality(state);
-    let resolved = grpc::resolve(&item.id, &quality)
+    let resolved = grpc::resolve(&item.id, &quality, false)
         .await
         .map_err(|e| e.to_string())?;
     if !resolved.ok {
@@ -1066,7 +1102,7 @@ async fn play_current_download(
                 "[yt] download failed ({first_err}), re-resolving {}",
                 item.id
             );
-            let fresh = grpc::resolve_forced(&item.id, &quality)
+            let fresh = grpc::resolve_forced(&item.id, &quality, false)
                 .await
                 .map_err(|e| e.to_string())?;
             if !fresh.ok {
@@ -1100,7 +1136,7 @@ async fn prefetch_tracks(
     let quality = current_quality(&state);
     let ids: Vec<String> = items.iter().take(4).map(|i| i.id.clone()).collect();
     // Resolve in parallel on the sidecar; failures are non-fatal.
-    let _ = grpc::prefetch_resolve(&ids, &quality).await;
+    let _ = grpc::prefetch_resolve(&ids, &quality, false).await;
 
     // Download only the first track in the background (click = instant play).
     let first = items[0].clone();
@@ -1128,7 +1164,7 @@ async fn ensure_cached(
         }
     }
     let result = async {
-        let resolved = grpc::resolve(&item.id, quality)
+        let resolved = grpc::resolve(&item.id, quality, false)
             .await
             .map_err(|e| e.to_string())?;
         if !resolved.ok {
@@ -1137,7 +1173,7 @@ async fn ensure_cached(
         let handle = downloader::ProgressHandle::default();
         if let Err(first_err) = downloader::download(&resolved.stream_url, &dest, &handle).await {
             // Cached URL may have expired: force a fresh resolve and retry.
-            let fresh = grpc::resolve_forced(&item.id, quality)
+            let fresh = grpc::resolve_forced(&item.id, quality, false)
                 .await
                 .map_err(|e| e.to_string())?;
             if fresh.ok && fresh.stream_url != resolved.stream_url {
@@ -1756,6 +1792,8 @@ fn main() {
             state: "starting".to_string(),
             version: String::new(),
             auth_ok: false,
+            session_state: "signed_out".to_string(),
+            account_name: String::new(),
         })),
         download: ProgressHandle::default(),
         downloading: Mutex::new(false),
@@ -1835,10 +1873,8 @@ fn main() {
             get_user_playlists,
             get_playlist_tracks,
             get_liked_songs,
-            start_oauth,
-            poll_oauth,
-            set_browser_auth,
-            start_yt_login,
+            yt_login_start,
+            yt_login_advanced,
             logout,
             play_video,
             play_queue,

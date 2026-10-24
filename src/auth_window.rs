@@ -22,7 +22,11 @@ pub const AUTH_WINDOW: &str = "yt-auth";
 const AUTH_URL: &str = "https://music.youtube.com/";
 const EVENT: &str = "yt-auth-changed";
 const POLL_EVERY: Duration = Duration::from_secs(1);
-const TIMEOUT: Duration = Duration::from_secs(300);
+const TIMEOUT: Duration = Duration::from_secs(600);
+/// User agent of the sign-in window and of every later API call, so the
+/// captured cookies and the sidecar requests come from the same client.
+pub const SESSION_UA: &str =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36";
 
 /// Bumped on every `open`. A watcher whose generation is stale stops silently,
 /// so closing and reopening the window cannot leave two watchers racing.
@@ -34,6 +38,8 @@ pub struct AuthEvent {
     pub ok: bool,
     pub cancelled: bool,
     pub error: String,
+    pub state: String,
+    pub account_name: String,
 }
 
 /// Opens the isolated sign-in window (or focuses it when already open) and
@@ -52,6 +58,7 @@ pub fn open(app: &AppHandle) -> Result<(), String> {
         .title("Sign in to YouTube Music")
         .inner_size(520.0, 760.0)
         .min_inner_size(420.0, 560.0)
+        .user_agent(SESSION_UA)
         // InPrivate + a throwaway profile: session cookies die with the window
         // even on WebView2 versions that ignore the InPrivate flag.
         .incognito(true)
@@ -97,8 +104,9 @@ fn is_allowed(url: &Url) -> bool {
 }
 
 enum Outcome {
-    SignedIn,
+    SignedIn(crate::SessionInfo),
     Cancelled,
+    Blocked,
     Failed(String),
 }
 
@@ -120,8 +128,20 @@ async fn watch(app: AppHandle, generation: u64) {
             break;
         };
         if started.elapsed() > TIMEOUT {
-            outcome = Outcome::Failed("sign-in timed out".to_string());
+            outcome = Outcome::Failed(
+                "sign-in timed out after 10 minutes; try again or use Advanced".to_string(),
+            );
             break;
+        }
+
+        // Google refuses sign-in from some embedded browsers and lands on a
+        // "rejected" page instead of failing silently.
+        if let Ok(current) = win.url() {
+            let href = current.as_str().to_ascii_lowercase();
+            if href.contains("deniedsignin") || href.contains("signin/rejected") {
+                outcome = Outcome::Blocked;
+                break;
+            }
         }
 
         // `cookies_for_url` blocks on the event loop; this runs off the main
@@ -134,53 +154,78 @@ async fn watch(app: AppHandle, generation: u64) {
             }
         };
 
-        let Some(auth_text) = auth_text(&cookies) else {
+        let Some(cookie) = cookie_header(&cookies) else {
             continue; // still on the sign-in page
         };
 
-        outcome = match crate::grpc::set_browser_auth(&auth_text).await {
-            Ok(resp) if resp.ok => Outcome::SignedIn,
-            Ok(resp) => Outcome::Failed(resp.error),
-            Err(e) => Outcome::Failed(format!("sidecar error: {e}")),
+        let bundle = crate::secrets::AuthBundle::new(
+            cookie,
+            SESSION_UA.to_string(),
+            "0".to_string(),
+        );
+        outcome = match crate::install_session(&app, bundle).await {
+            Ok(info) if info.state == "active" => Outcome::SignedIn(info),
+            Ok(info) => Outcome::Failed(if info.error.is_empty() {
+                format!("session state: {}", info.state)
+            } else {
+                info.error
+            }),
+            Err(e) => Outcome::Failed(e),
         };
         break;
     }
 
+    // Wipe the browsing data before the window goes away: the throwaway
+    // profile is deleted right after too, but this stops a live YouTube
+    // session from rotating cookies we already captured.
     if let Some(win) = app.get_webview_window(AUTH_WINDOW) {
+        let _ = win.clear_all_browsing_data();
+        tokio::time::sleep(Duration::from_millis(500)).await;
         let _ = win.close();
     }
     cleanup_profile().await;
 
     let event = match outcome {
-        Outcome::SignedIn => {
-            // Make the next status poll show "Signed in" instead of waiting for
-            // the sidecar health check to notice.
-            mark_auth(&app, true);
-            AuthEvent {
-                ok: true,
-                cancelled: false,
-                error: String::new(),
-            }
-        }
+        Outcome::SignedIn(info) => AuthEvent {
+            ok: true,
+            cancelled: false,
+            error: String::new(),
+            state: info.state,
+            account_name: info.account_name,
+        },
         Outcome::Cancelled => AuthEvent {
             ok: false,
             cancelled: true,
             error: String::new(),
+            state: String::new(),
+            account_name: String::new(),
+        },
+        Outcome::Blocked => AuthEvent {
+            ok: false,
+            cancelled: false,
+            error: "Google refused the sign-in in the embedded browser \
+                    (\"This browser or app may not be secure\"). Open Advanced \
+                    and paste the request headers from a normal browser instead."
+                .to_string(),
+            state: String::new(),
+            account_name: String::new(),
         },
         Outcome::Failed(error) => AuthEvent {
             ok: false,
             cancelled: false,
             error,
+            state: String::new(),
+            account_name: String::new(),
         },
     };
     let _ = app.emit(EVENT, event);
 }
 
-/// Builds the header block the sidecar expects, or `None` while the session
-/// is not complete. The gate is `__Secure-3PAPISID`: it is only set on a
-/// signed-in youtube.com session and it is the value ytmusicapi hashes into
+/// Cookie pairs for the captured session, or `None` while the session is not
+/// complete. The gate is `__Secure-3PAPISID`: it is only set on a signed-in
+/// youtube.com session and it is the value ytmusicapi hashes into
 /// `Authorization`.
-fn auth_text(cookies: &[Cookie<'static>]) -> Option<String> {
+fn cookie_header(cookies: &[Cookie<'static>]) -> Option<String> {
     // The same name can exist for several domains; prefer the youtube.com one.
     let mut by_name: HashMap<&str, (u8, &str)> = HashMap::new();
     for cookie in cookies {
@@ -197,19 +242,13 @@ fn auth_text(cookies: &[Cookie<'static>]) -> Option<String> {
 
     let mut names: Vec<&str> = by_name.keys().copied().collect();
     names.sort_unstable();
-    let cookie_header = names
-        .iter()
-        .map(|n| format!("{n}={}", by_name[n].1))
-        .collect::<Vec<_>>()
-        .join("; ");
-
-    Some(format!(
-        "Cookie: {cookie_header}\n\
-         X-Goog-AuthUser: 0\n\
-         Origin: https://music.youtube.com\n\
-         X-Origin: https://music.youtube.com\n\
-         Referer: https://music.youtube.com/"
-    ))
+    Some(
+        names
+            .iter()
+            .map(|n| format!("{n}={}", by_name[n].1))
+            .collect::<Vec<_>>()
+            .join("; "),
+    )
 }
 
 fn domain_rank(domain: &str) -> u8 {
@@ -219,16 +258,6 @@ fn domain_rank(domain: &str) -> u8 {
         1
     } else {
         0
-    }
-}
-
-/// Keeps the shared status in step with a session change so the UI does not
-/// flip back to "Not signed in" until the next health poll.
-fn mark_auth(app: &AppHandle, ok: bool) {
-    if let Some(state) = app.try_state::<crate::AppState>()
-        && let Ok(mut status) = state.api_status.write()
-    {
-        status.auth_ok = ok;
     }
 }
 
@@ -258,23 +287,23 @@ mod tests {
     }
 
     #[test]
-    fn auth_text_requires_sapisid() {
+    fn cookie_header_requires_sapisid() {
         let cookies = vec![cookie("SID", "s", ".youtube.com")];
-        assert!(auth_text(&cookies).is_none());
+        assert!(cookie_header(&cookies).is_none());
     }
 
     #[test]
-    fn auth_text_prefers_youtube_domain_and_sorts_names() {
+    fn cookie_header_prefers_youtube_domain_and_sorts_names() {
         let cookies = vec![
             cookie("__Secure-3PAPISID", "yt-value", ".youtube.com"),
             cookie("__Secure-3PAPISID", "google-value", ".google.com"),
             cookie("SID", "sid", ".youtube.com"),
         ];
-        let text = auth_text(&cookies).expect("session");
+        let text = cookie_header(&cookies).expect("session");
         assert!(text.contains("__Secure-3PAPISID=yt-value"));
         assert!(text.contains("SID=sid"));
-        assert!(text.contains("X-Goog-AuthUser: 0"));
-        assert!(text.starts_with("Cookie: "));
+        assert!(!text.contains("google-value"));
+        assert_eq!(text.matches("; ").count(), 1, "one separator for two pairs");
     }
 
     #[test]

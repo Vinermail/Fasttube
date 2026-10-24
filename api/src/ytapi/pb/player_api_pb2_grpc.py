@@ -79,25 +79,25 @@ class PlayerApiStub:
                 request_serializer=player__api__pb2.LyricsRequest.SerializeToString,
                 response_deserializer=player__api__pb2.LyricsResponse.FromString,
                 _registered_method=True)
-        self.StartOAuth = channel.unary_unary(
-                '/player.PlayerApi/StartOAuth',
-                request_serializer=player__api__pb2.StartOAuthRequest.SerializeToString,
-                response_deserializer=player__api__pb2.StartOAuthResponse.FromString,
+        self.SetSession = channel.unary_unary(
+                '/player.PlayerApi/SetSession',
+                request_serializer=player__api__pb2.SetSessionRequest.SerializeToString,
+                response_deserializer=player__api__pb2.SessionStatus.FromString,
                 _registered_method=True)
-        self.PollOAuth = channel.unary_unary(
-                '/player.PlayerApi/PollOAuth',
+        self.ParseAuthHeaders = channel.unary_unary(
+                '/player.PlayerApi/ParseAuthHeaders',
+                request_serializer=player__api__pb2.ParseAuthHeadersRequest.SerializeToString,
+                response_deserializer=player__api__pb2.SetSessionRequest.FromString,
+                _registered_method=True)
+        self.ValidateSession = channel.unary_unary(
+                '/player.PlayerApi/ValidateSession',
                 request_serializer=player__api__pb2.Empty.SerializeToString,
-                response_deserializer=player__api__pb2.PollOAuthResponse.FromString,
+                response_deserializer=player__api__pb2.SessionStatus.FromString,
                 _registered_method=True)
-        self.SetBrowserAuth = channel.unary_unary(
-                '/player.PlayerApi/SetBrowserAuth',
-                request_serializer=player__api__pb2.SetBrowserAuthRequest.SerializeToString,
-                response_deserializer=player__api__pb2.SetBrowserAuthResponse.FromString,
-                _registered_method=True)
-        self.ClearAuth = channel.unary_unary(
-                '/player.PlayerApi/ClearAuth',
+        self.ClearSession = channel.unary_unary(
+                '/player.PlayerApi/ClearSession',
                 request_serializer=player__api__pb2.Empty.SerializeToString,
-                response_deserializer=player__api__pb2.ClearAuthResponse.FromString,
+                response_deserializer=player__api__pb2.SessionStatus.FromString,
                 _registered_method=True)
 
 
@@ -158,25 +158,25 @@ class PlayerApiServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
-    def StartOAuth(self, request, context):
+    def SetSession(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
-    def PollOAuth(self, request, context):
+    def ParseAuthHeaders(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
-    def SetBrowserAuth(self, request, context):
+    def ValidateSession(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
-    def ClearAuth(self, request, context):
+    def ClearSession(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -230,25 +230,25 @@ def add_PlayerApiServicer_to_server(servicer, server):
                     request_deserializer=player__api__pb2.LyricsRequest.FromString,
                     response_serializer=player__api__pb2.LyricsResponse.SerializeToString,
             ),
-            'StartOAuth': grpc.unary_unary_rpc_method_handler(
-                    servicer.StartOAuth,
-                    request_deserializer=player__api__pb2.StartOAuthRequest.FromString,
-                    response_serializer=player__api__pb2.StartOAuthResponse.SerializeToString,
+            'SetSession': grpc.unary_unary_rpc_method_handler(
+                    servicer.SetSession,
+                    request_deserializer=player__api__pb2.SetSessionRequest.FromString,
+                    response_serializer=player__api__pb2.SessionStatus.SerializeToString,
             ),
-            'PollOAuth': grpc.unary_unary_rpc_method_handler(
-                    servicer.PollOAuth,
+            'ParseAuthHeaders': grpc.unary_unary_rpc_method_handler(
+                    servicer.ParseAuthHeaders,
+                    request_deserializer=player__api__pb2.ParseAuthHeadersRequest.FromString,
+                    response_serializer=player__api__pb2.SetSessionRequest.SerializeToString,
+            ),
+            'ValidateSession': grpc.unary_unary_rpc_method_handler(
+                    servicer.ValidateSession,
                     request_deserializer=player__api__pb2.Empty.FromString,
-                    response_serializer=player__api__pb2.PollOAuthResponse.SerializeToString,
+                    response_serializer=player__api__pb2.SessionStatus.SerializeToString,
             ),
-            'SetBrowserAuth': grpc.unary_unary_rpc_method_handler(
-                    servicer.SetBrowserAuth,
-                    request_deserializer=player__api__pb2.SetBrowserAuthRequest.FromString,
-                    response_serializer=player__api__pb2.SetBrowserAuthResponse.SerializeToString,
-            ),
-            'ClearAuth': grpc.unary_unary_rpc_method_handler(
-                    servicer.ClearAuth,
+            'ClearSession': grpc.unary_unary_rpc_method_handler(
+                    servicer.ClearSession,
                     request_deserializer=player__api__pb2.Empty.FromString,
-                    response_serializer=player__api__pb2.ClearAuthResponse.SerializeToString,
+                    response_serializer=player__api__pb2.SessionStatus.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -505,7 +505,7 @@ class PlayerApi:
             _registered_method=True)
 
     @staticmethod
-    def StartOAuth(request,
+    def SetSession(request,
             target,
             options=(),
             channel_credentials=None,
@@ -518,9 +518,9 @@ class PlayerApi:
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/player.PlayerApi/StartOAuth',
-            player__api__pb2.StartOAuthRequest.SerializeToString,
-            player__api__pb2.StartOAuthResponse.FromString,
+            '/player.PlayerApi/SetSession',
+            player__api__pb2.SetSessionRequest.SerializeToString,
+            player__api__pb2.SessionStatus.FromString,
             options,
             channel_credentials,
             insecure,
@@ -532,7 +532,7 @@ class PlayerApi:
             _registered_method=True)
 
     @staticmethod
-    def PollOAuth(request,
+    def ParseAuthHeaders(request,
             target,
             options=(),
             channel_credentials=None,
@@ -545,9 +545,36 @@ class PlayerApi:
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/player.PlayerApi/PollOAuth',
+            '/player.PlayerApi/ParseAuthHeaders',
+            player__api__pb2.ParseAuthHeadersRequest.SerializeToString,
+            player__api__pb2.SetSessionRequest.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ValidateSession(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/player.PlayerApi/ValidateSession',
             player__api__pb2.Empty.SerializeToString,
-            player__api__pb2.PollOAuthResponse.FromString,
+            player__api__pb2.SessionStatus.FromString,
             options,
             channel_credentials,
             insecure,
@@ -559,7 +586,7 @@ class PlayerApi:
             _registered_method=True)
 
     @staticmethod
-    def SetBrowserAuth(request,
+    def ClearSession(request,
             target,
             options=(),
             channel_credentials=None,
@@ -572,36 +599,9 @@ class PlayerApi:
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/player.PlayerApi/SetBrowserAuth',
-            player__api__pb2.SetBrowserAuthRequest.SerializeToString,
-            player__api__pb2.SetBrowserAuthResponse.FromString,
-            options,
-            channel_credentials,
-            insecure,
-            call_credentials,
-            compression,
-            wait_for_ready,
-            timeout,
-            metadata,
-            _registered_method=True)
-
-    @staticmethod
-    def ClearAuth(request,
-            target,
-            options=(),
-            channel_credentials=None,
-            call_credentials=None,
-            insecure=False,
-            compression=None,
-            wait_for_ready=None,
-            timeout=None,
-            metadata=None):
-        return grpc.experimental.unary_unary(
-            request,
-            target,
-            '/player.PlayerApi/ClearAuth',
+            '/player.PlayerApi/ClearSession',
             player__api__pb2.Empty.SerializeToString,
-            player__api__pb2.ClearAuthResponse.FromString,
+            player__api__pb2.SessionStatus.FromString,
             options,
             channel_credentials,
             insecure,

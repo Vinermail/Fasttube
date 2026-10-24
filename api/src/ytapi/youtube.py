@@ -116,7 +116,7 @@ QUALITIES = (QUALITY_STANDARD, QUALITY_HIGH)
 
 def resolve_url(
     video_id: str,
-    cookies_file: str | None = None,
+    cookie_header: str | None = None,
     quality: str = QUALITY_STANDARD,
     force: bool = False,
 ) -> dict:
@@ -126,12 +126,15 @@ def resolve_url(
       "standard" - AAC 128 kbps (itag 140), the maximum without Premium
       "high"     - best available AAC (itag 141 / 256 / 258, up to 384 kbps
                    with YouTube Premium; falls back to 140 without it)
+
+    `cookie_header` is only passed when the user opted into streaming with the
+    account; the cookies then live in a yt-dlp cookiejar in memory.
     """
     if quality not in QUALITIES:
         quality = QUALITY_STANDARD
     if not _VIDEO_ID_RE.match(video_id):
         return {"ok": False, "error": "invalid video id"}
-    cache_key = f"{video_id}@{quality}"
+    cache_key = f"{video_id}@{quality}@{'account' if cookie_header else 'anon'}"
     if not force:
         with _resolve_lock:
             hit = _RESOLVE_CACHE.get(cache_key)
@@ -141,10 +144,9 @@ def resolve_url(
     import yt_dlp
 
     opts = dict(YT_DLP_OPTS)
-    if cookies_file:
-        opts["cookiefile"] = cookies_file
-
     with yt_dlp.YoutubeDL(opts) as ydl:
+        if cookie_header:
+            _attach_cookies(ydl, cookie_header)
         info = ydl.extract_info(video_id, download=False)
 
     if info is None:
@@ -401,7 +403,9 @@ def search(query: str, limit: int = 20, music: bool = False) -> list[dict]:
     return out
 
 
-def prefetch_resolve(video_ids: list[str], quality: str = QUALITY_STANDARD) -> int:
+def prefetch_resolve(
+    video_ids: list[str], quality: str = QUALITY_STANDARD, use_account: bool = False
+) -> int:
     """Resolves multiple ids in parallel (fills the cache). Returns the number
     of successfully resolved ids."""
     from concurrent.futures import ThreadPoolExecutor
@@ -409,19 +413,25 @@ def prefetch_resolve(video_ids: list[str], quality: str = QUALITY_STANDARD) -> i
     video_ids = [vid for vid in video_ids if _VIDEO_ID_RE.match(vid)]
     if not video_ids:
         return 0
+    cookies = session_cookie() if use_account else None
+    suffix = "account" if cookies else "anon"
+
+    def key(vid: str) -> str:
+        return f"{vid}@{quality}@{suffix}"
+
     with _resolve_lock:
         pending = [
             vid
             for vid in video_ids
-            if f"{vid}@{quality}" not in _RESOLVE_CACHE
-            or time.time() - _RESOLVE_CACHE[f"{vid}@{quality}"][0] >= _RESOLVE_TTL
+            if key(vid) not in _RESOLVE_CACHE
+            or time.time() - _RESOLVE_CACHE[key(vid)][0] >= _RESOLVE_TTL
         ]
     if not pending:
         return 0
 
     def work(vid: str) -> bool:
         try:
-            result = resolve_url(vid, quality=quality, force=True)
+            result = resolve_url(vid, cookies, quality=quality, force=True)
             return bool(result.get("ok"))
         except Exception:
             log.exception("prefetch resolve failed for %s", vid)
@@ -538,145 +548,255 @@ def related_tracks(video_id: str, limit: int = 20) -> dict:
         return {"tracks": [], "error": str(e)}
 
 
-OAUTH_FILE = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "oauth.json"
-)
-OAUTH_CREDS_FILE = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "oauth_creds.json"
-)
-BROWSER_FILE = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "browser.json"
-)
+
+# ---------------------------------------------------------------- session
+#
+# The YouTube session lives in memory only; this process never writes cookies
+# to disk. Rust owns the encrypted bundle (src/secrets.rs) and pushes the
+# fields here through SetSession after every start or sign-in.
+
+YTM_ORIGIN = "https://music.youtube.com"
+
+_session_lock = threading.RLock()
+# {"client": YTMusic, "cookie": str, "state": "active"|"expired",
+#  "account": str, "validated_at": float}
+_session: dict | None = None
 
 
-def _authed_ytm():
+def _browser_headers(cookie: str, user_agent: str, authuser: str) -> dict:
+    """Headers for YTMusic(auth=...) — the same shape setup_browser would
+    write, but built in memory. Raises KeyError without __Secure-3PAPISID."""
+    from ytmusicapi.helpers import get_authorization, initialize_headers, sapisid_from_cookie
+
+    cookie = (cookie or "").strip()
+    if not cookie:
+        raise ValueError("empty cookie")
+    sapisid = sapisid_from_cookie(cookie)
+    headers = dict(initialize_headers())
+    headers.update(
+        {
+            "authorization": get_authorization(f"{sapisid} {YTM_ORIGIN}"),
+            "cookie": cookie,
+            "origin": YTM_ORIGIN,
+            "x-origin": YTM_ORIGIN,
+            "x-goog-authuser": authuser or "0",
+        }
+    )
+    if user_agent:
+        headers["user-agent"] = user_agent
+    return headers
+
+
+def set_session(cookie: str, user_agent: str, x_goog_authuser: str) -> dict:
+    """Install a session from the app (memory only)."""
+    global _session
     from ytmusicapi import YTMusic
-    from ytmusicapi.auth.oauth import OAuthCredentials
 
-    # Browser (cookies) auth is the recommended workaround while ytmusicapi's
-    # OAuth is broken upstream (github.com/sigma67/ytmusicapi/issues/813).
-    if os.path.exists(BROWSER_FILE):
-        # Files written by older versions lack the `authorization` header that
-        # ytmusicapi >= 1.12 requires to recognise browser auth; add it from the
-        # stored cookie instead of forcing everyone to sign in again.
-        try:
-            _ensure_browser_authorization()
-        except Exception:
-            log.exception("stored browser auth is unusable, ignoring it")
+    try:
+        headers = _browser_headers(cookie, user_agent, x_goog_authuser)
+        client = YTMusic(auth=headers)
+    except KeyError:
+        return {
+            "state": "signed_out",
+            "account_name": "",
+            "error": "cookie has no __Secure-3PAPISID: sign-in did not complete",
+        }
+    except Exception as e:
+        log.exception("set_session failed")
+        return {"state": "signed_out", "account_name": "", "error": f"invalid session: {e}"}
+
+    with _session_lock:
+        _session = {
+            "client": client,
+            "cookie": cookie.strip(),
+            "state": "active",
+            "account": "",
+            "validated_at": 0.0,
+        }
+    invalidate_account_caches()
+    log.info("session installed (memory only)")
+    return {"state": "active", "account_name": "", "error": ""}
+
+
+def _find_active_account(node):
+    """Depth-first search for activeAccountHeaderRenderer in the account menu.
+
+    Tolerant on purpose: ytmusicapi's own get_account_info() walks a fixed path
+    and raises KeyError on any response reshuffle.
+    """
+    if isinstance(node, dict):
+        header = node.get("activeAccountHeaderRenderer")
+        if isinstance(header, dict):
+            return header
+        for value in node.values():
+            found = _find_active_account(value)
+            if found is not None:
+                return found
+    elif isinstance(node, list):
+        for value in node:
+            found = _find_active_account(value)
+            if found is not None:
+                return found
+    return None
+
+
+def _account_name(header: dict) -> str:
+    try:
+        return header["accountName"]["runs"][0]["text"]
+    except Exception:
+        return ""
+
+
+def _expire_session(reason: str) -> dict:
+    with _session_lock:
+        if _session is not None:
+            _session["state"] = "expired"
+            account = _session["account"]
         else:
-            return YTMusic(BROWSER_FILE)
+            account = ""
+    invalidate_account_caches()
+    log.warning("session expired: %s", reason)
+    return {"state": "expired", "account_name": account, "error": reason}
 
-    oauth_credentials = None
-    if os.path.exists(OAUTH_CREDS_FILE):
-        try:
-            with open(OAUTH_CREDS_FILE, encoding="utf8") as f:
-                creds = json.load(f)
-            oauth_credentials = OAuthCredentials(
-                creds.get("client_id"), creds.get("client_secret")
-            )
-        except Exception:
-            log.exception("failed to load oauth credentials")
 
-    if not os.path.exists(OAUTH_FILE):
-        raise RuntimeError(
-            "no usable YouTube auth: the stored browser session is invalid, sign in again"
-        )
+def validate_session() -> dict:
+    """One cheap authenticated request.
 
-    return YTMusic(OAUTH_FILE, oauth_credentials=oauth_credentials)
+    The account menu carries activeAccountHeaderRenderer only while the cookie
+    is still signed in: a 200 without it means the session went stale. HTTP
+    401/403 mean the same. Network errors and 5xx do NOT change the state.
+    """
+    from ytmusicapi.exceptions import YTMusicServerError
+
+    with _session_lock:
+        session = _session
+        state = session["state"] if session else "signed_out"
+        account = session["account"] if session else ""
+    if session is None:
+        return {"state": "signed_out", "account_name": "", "error": ""}
+    if state == "expired":
+        return {"state": "expired", "account_name": account, "error": ""}
+
+    try:
+        data = session["client"]._send_request("account/account_menu", {})
+    except YTMusicServerError as e:
+        message = str(e)
+        if "HTTP 401" in message or "HTTP 403" in message:
+            return _expire_session("YouTube rejected the session")
+        log.warning("session validation: server error: %s", message.splitlines()[0])
+        return {"state": state, "account_name": account, "error": message}
+    except Exception as e:
+        log.warning("session validation: network error: %s", e)
+        return {"state": state, "account_name": account, "error": str(e)}
+
+    header = _find_active_account(data)
+    if header is None:
+        return _expire_session("no active account in the account menu")
+
+    name = _account_name(header)
+    with _session_lock:
+        session["state"] = "active"
+        session["account"] = name
+        session["validated_at"] = time.time()
+    return {"state": "active", "account_name": name, "error": ""}
+
+
+def clear_session() -> dict:
+    global _session
+    with _session_lock:
+        had = _session is not None
+        _session = None
+    invalidate_account_caches()
+    log.info("session cleared (had session: %s)", had)
+    return {"state": "signed_out", "account_name": "", "error": ""}
 
 
 def has_auth() -> bool:
-    return os.path.exists(BROWSER_FILE) or os.path.exists(OAUTH_FILE)
+    """A session is in memory and the last validation did not fail.
 
-
-def clear_auth() -> dict:
-    """Delete all stored auth (browser cookies and OAuth) and invalidate
-    in-memory caches tied to the account."""
-    removed = []
-    for path in (BROWSER_FILE, OAUTH_FILE, OAUTH_CREDS_FILE):
-        try:
-            if os.path.exists(path):
-                os.remove(path)
-                removed.append(os.path.basename(path))
-        except Exception:
-            log.exception("failed to remove %s", path)
-            return {"ok": False, "error": f"failed to remove {os.path.basename(path)}"}
-    invalidate_account_caches()
-    with _resolve_lock:
-        _RESOLVE_CACHE.clear()
-        try:
-            if os.path.exists(_RESOLVE_CACHE_FILE):
-                os.remove(_RESOLVE_CACHE_FILE)
-        except Exception:
-            log.exception("failed to remove resolve cache")
-    log.info("auth cleared: %s", ", ".join(removed) if removed else "nothing to remove")
-    return {"ok": True, "error": ""}
-
-
-def _ensure_browser_authorization(path: str | None = None) -> None:
-    """Add the `authorization` header ytmusicapi needs to treat a header file
-    as browser auth.
-
-    ytmusicapi >= 1.12 no longer derives SAPISIDHASH from the cookie when
-    loading headers: `determine_auth_type()` only returns BROWSER if the file
-    already carries `authorization: SAPISIDHASH ...`, otherwise it assumes an
-    OAuth token and fails with "oauth_credentials not provided". setup_browser()
-    does not write that header, so we write it here from the session cookie.
-
-    Raises KeyError if the cookie has no __Secure-3PAPISID (not signed in).
+    (Not "a file exists": nothing about the session is read from disk here.)
     """
-    from ytmusicapi.helpers import get_authorization, sapisid_from_cookie
-
-    path = path or BROWSER_FILE
-    with open(path, encoding="utf8") as f:
-        headers = json.load(f)
-    if "SAPISIDHASH" in headers.get("authorization", ""):
-        return  # already usable
-    cookie = next((v for k, v in headers.items() if k.lower() == "cookie"), "")
-    sapisid = sapisid_from_cookie(cookie)
-    origin = next(
-        (v for k, v in headers.items() if k.lower() in ("origin", "x-origin")),
-        "https://music.youtube.com",
-    ).rstrip("/")
-    headers["authorization"] = get_authorization(f"{sapisid} {origin}")
-    with open(path, "w", encoding="utf8") as f:
-        json.dump(headers, f, ensure_ascii=True, indent=4, sort_keys=True)
+    with _session_lock:
+        return _session is not None and _session["state"] == "active"
 
 
-def set_browser_auth(auth_text: str) -> dict:
-    """Parse request headers pasted from the browser (DevTools copy) or built
-    from captured cookies and store them for browser-based auth."""
-    from ytmusicapi.auth.browser import setup_browser
+def session_state() -> dict:
+    with _session_lock:
+        if _session is None:
+            return {"state": "signed_out", "account_name": ""}
+        return {"state": _session["state"], "account_name": _session["account"]}
 
-    normalized = _normalize_auth_text(auth_text)
-    try:
-        setup_browser(BROWSER_FILE, headers_raw=normalized)
-    except Exception as e:
-        log.exception("set_browser_auth failed")
-        msg = str(e)
-        if "missing in your headers" in msg:
-            msg += (
-                " Pick the request https://music.youtube.com/youtubei/v1/browse "
-                "(DevTools -> Network -> refresh the page)."
-            )
-        return {"ok": False, "error": msg}
 
-    try:
-        _ensure_browser_authorization()
-    except Exception:
-        log.exception("captured session has no usable SAPISID cookie")
-        try:
-            os.remove(BROWSER_FILE)
-        except OSError:
-            pass
-        return {
-            "ok": False,
-            "error": "no __Secure-3PAPISID cookie in the captured session: "
-            "sign-in did not complete",
-        }
+def session_cookie() -> str | None:
+    """Cookie header for yt-dlp, only while the session is usable."""
+    with _session_lock:
+        if _session is None or _session["state"] == "expired":
+            return None
+        return _session["cookie"]
 
-    invalidate_account_caches()
-    return {"ok": True, "error": ""}
+
+def _session_client():
+    with _session_lock:
+        if _session is None or _session["state"] == "expired":
+            return None
+        return _session["client"]
+
+
+def _parse_cookie_header(cookie_header: str) -> list[tuple[str, str]]:
+    pairs = []
+    for part in cookie_header.split(";"):
+        name, sep, value = part.strip().partition("=")
+        if sep and name:
+            pairs.append((name.strip(), value.strip().strip('"')))
+    return pairs
+
+
+def _attach_cookies(ydl, cookie_header: str) -> None:
+    """Feed the session cookies to yt-dlp in memory (no cookiefile)."""
+    import http.cookiejar
+
+    for name, value in _parse_cookie_header(cookie_header):
+        cookie = http.cookiejar.Cookie(
+            version=0,
+            name=name,
+            value=value,
+            port=None,
+            port_specified=False,
+            domain=".youtube.com",
+            domain_specified=True,
+            domain_initial_dot=True,
+            path="/",
+            path_specified=True,
+            secure=True,
+            expires=None,
+            discard=True,
+            comment=None,
+            comment_url=None,
+            rest={},
+            rfc2109=False,
+        )
+        ydl.cookiejar.set_cookie(cookie)
+
+
+def parse_auth_headers(text: str) -> dict:
+    """Normalise pasted request headers (DevTools or cURL) into session fields.
+
+    Uses the same normaliser the old paste flow used; no files involved.
+    """
+    normalized = _normalize_auth_text(text or "")
+    headers = {}
+    for line in normalized.splitlines():
+        key, sep, value = line.partition(":")
+        if sep:
+            headers[key.strip().lower()] = value.strip()
+    cookie = headers.get("cookie", "")
+    if not cookie:
+        raise ValueError("no Cookie header found in the pasted text")
+    return {
+        "cookie": cookie,
+        "user_agent": headers.get("user-agent", ""),
+        "x_goog_authuser": headers.get("x-goog-authuser", "0") or "0",
+    }
 
 
 def _normalize_auth_text(text: str) -> str:
@@ -717,16 +837,18 @@ def _normalize_auth_text(text: str) -> str:
 
 
 def user_playlists() -> dict:
-    if not has_auth():
+    if _session_client() is None:
         return {
             "has_auth": False,
-            "hint": "run: uv run --project api ytmusicapi oauth --file api/oauth.json",
+            "hint": "sign in to YouTube in the app",
             "playlists": [],
         }
 
     def load() -> dict:
         try:
-            ytm = _authed_ytm()
+            ytm = _session_client()
+            if ytm is None:
+                return {"has_auth": False, "hint": "not signed in", "playlists": []}
             items = ytm.get_library_playlists(limit=None) or []
             playlists = [
                 {
@@ -747,15 +869,17 @@ def user_playlists() -> dict:
 
 
 def playlist_tracks(playlist_id: str) -> dict:
-    if not has_auth():
+    if _session_client() is None:
         return {
             "tracks": [],
-            "error": "run: uv run --project api ytmusicapi oauth --file api/oauth.json",
+            "error": "sign in to YouTube in the app",
         }
 
     def load() -> dict:
         try:
-            ytm = _authed_ytm()
+            ytm = _session_client()
+            if ytm is None:
+                return {"tracks": [], "error": "not signed in"}
             # limit=None fetches every track (paginated via continuations)
             data = ytm.get_playlist(playlist_id, limit=None) or {}
             tracks = []
@@ -783,15 +907,17 @@ def playlist_tracks(playlist_id: str) -> dict:
 
 
 def liked_songs() -> dict:
-    if not has_auth():
+    if _session_client() is None:
         return {
             "tracks": [],
-            "error": "run: uv run --project api ytmusicapi oauth --file api/oauth.json",
+            "error": "sign in to YouTube in the app",
         }
 
     def load() -> dict:
         try:
-            ytm = _authed_ytm()
+            ytm = _session_client()
+            if ytm is None:
+                return {"tracks": [], "error": "not signed in"}
             items = ytm.get_liked_songs(limit=None) or {}
             tracks = []
             for t in items.get("tracks") or []:
@@ -815,118 +941,3 @@ def liked_songs() -> dict:
             return {"tracks": [], "error": str(e)}
 
     return _cached_lib("liked_songs", 600, load)
-
-
-# ---- OAuth (in-app flow) ----
-
-_oauth_lock = threading.Lock()
-_oauth_credentials = None
-_oauth_device_code: str | None = None
-
-
-def start_oauth(client_id: str, client_secret: str) -> dict:
-    """Step 1: obtain a device code and return the consent URL."""
-    global _oauth_credentials, _oauth_device_code
-    import requests
-
-    from ytmusicapi.auth.oauth import OAuthCredentials
-
-    client_id = (client_id or "").strip()
-    client_secret = (client_secret or "").strip()
-    if not client_id or not client_secret:
-        return {"ok": False, "error": "client_id and client_secret are required", "url": ""}
-    if "apps.googleusercontent.com" not in client_id:
-        return {
-            "ok": False,
-            "error": "client_id must look like '1234-abc.apps.googleusercontent.com' "
-            "(OAuth 2.0 Client ID from Google Cloud Console)",
-            "url": "",
-        }
-
-    proxies = None
-    proxy = net.detect_proxy()
-    if proxy:
-        proxies = {"http": proxy, "https": proxy}
-    session = requests.Session()
-    if proxies:
-        session.proxies.update(proxies)
-
-    try:
-        creds = OAuthCredentials(client_id, client_secret, session, proxies)
-        code = creds.get_code()
-    except Exception as e:
-        msg = str(e)
-        log.exception("start_oauth failed")
-        if "Invalid client type" in msg or "client type" in msg.lower():
-            msg = (
-                "Invalid client type. In Google Cloud Console create a NEW OAuth client "
-                "with application type 'TVs and Limited Input devices' "
-                "(existing client type cannot be changed)."
-            )
-        elif "invalid_client" in msg or "client" in msg.lower():
-            msg = (
-                "Google rejected the OAuth client. Check: "
-                "1) YouTube Data API v3 is enabled for this project; "
-                "2) OAuth client type is 'TVs and Limited Input devices'; "
-                "3) client_id/secret copied without spaces or line breaks."
-            )
-        return {"ok": False, "error": msg, "url": ""}
-
-    with _oauth_lock:
-        _oauth_credentials = creds
-        _oauth_device_code = code["device_code"]
-
-    url = f"{code['verification_url']}?user_code={code['user_code']}"
-    return {"ok": True, "error": "", "url": url}
-
-
-def poll_oauth() -> dict:
-    """Step 2: poll Google until the user completes the flow (or fails)."""
-    global _oauth_credentials, _oauth_device_code
-    with _oauth_lock:
-        creds = _oauth_credentials
-        device_code = _oauth_device_code
-    if creds is None or device_code is None:
-        return {"done": False, "error": "no pending oauth flow"}
-
-    for _ in range(150):
-        try:
-            raw = creds.token_from_code(device_code)
-        except Exception as e:
-            msg = str(e)
-            if "authorization_pending" in msg or "slow_down" in msg:
-                time.sleep(2)
-                continue
-            return {"done": False, "error": msg}
-        if "access_token" in raw:
-            now = int(time.time())
-            token = {
-                "scope": raw.get("scope", "https://www.googleapis.com/auth/youtube"),
-                "token_type": raw.get("token_type", "Bearer"),
-                "access_token": raw["access_token"],
-                "refresh_token": raw.get("refresh_token", ""),
-                "expires_at": now + int(raw.get("expires_in", 3600)),
-                "expires_in": int(raw.get("expires_in", 3600)),
-            }
-            with open(OAUTH_FILE, "w", encoding="utf8") as f:
-                json.dump(token, f, indent=True)
-            try:
-                with open(OAUTH_CREDS_FILE, "w", encoding="utf8") as f:
-                    json.dump(
-                        {"client_id": creds.client_id, "client_secret": creds.client_secret},
-                        f,
-                        indent=True,
-                    )
-            except Exception:
-                log.exception("failed to store oauth credentials")
-            with _oauth_lock:
-                _oauth_credentials = None
-                _oauth_device_code = None
-            invalidate_account_caches()
-            return {"done": True, "error": ""}
-        if raw.get("error") not in ("authorization_pending", "slow_down"):
-            return {"done": False, "error": raw.get("error_description", raw.get("error", "oauth error"))}
-        time.sleep(2)
-    return {"done": False, "error": "timed out waiting for authorization"}
-
-

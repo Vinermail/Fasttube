@@ -19,11 +19,26 @@ const HEALTH_EVERY: Duration = Duration::from_secs(2);
 const STABLE_AFTER: Duration = Duration::from_secs(300);
 const MAX_RESTARTS: u32 = 3;
 
-#[derive(Serialize, Clone, Default)]
+#[derive(Serialize, Clone)]
 pub struct ApiStatus {
     pub state: String, // starting | ok | down
     pub version: String,
     pub auth_ok: bool,
+    /// signed_out | active | expired — driven by the session RPCs, not Health.
+    pub session_state: String,
+    pub account_name: String,
+}
+
+impl Default for ApiStatus {
+    fn default() -> Self {
+        Self {
+            state: String::new(),
+            version: String::new(),
+            auth_ok: false,
+            session_state: "signed_out".to_string(),
+            account_name: String::new(),
+        }
+    }
 }
 
 pub type SharedApiStatus = Arc<RwLock<ApiStatus>>;
