@@ -240,33 +240,50 @@
   <div id="yt-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="yt-modal-title">
     <div class="modal-card" role="document">
       <h2 id="yt-modal-title">Sign in to YouTube Music</h2>
-      <ol class="modal-steps">
-        <li>
-          Open <b>music.youtube.com</b> in your browser and log in with the
-          account you want the app to use.
-        </li>
-        <li>
-          In the browser press <kbd>F12</kbd> &rarr; <b>Network</b>, reload the
-          page, click the <code>browse</code> request (filter by
-          <code>youtubei/v1/browse</code> if the list is long).
-        </li>
-        <li>
-          Right-click it &rarr; <b>Copy</b> &rarr; <b>Copy request headers</b>,
-          then paste the whole block below.
-        </li>
-      </ol>
-      <div class="modal-actions">
-        <button id="yt-modal-open" class="btn primary">Open music.youtube.com</button>
-      </div>
-      <textarea id="yt-modal-paste" spellcheck="false" placeholder="Paste the request headers here — they carry your session cookies"></textarea>
-      <p id="yt-modal-error" class="modal-error hidden"></p>
       <p class="hint">
-        The headers are parsed by the local sidecar and stored only in the
-        encrypted bundle. Nothing is written to the repo or to this app's log.
+        The app opens its own sign-in window on music.youtube.com and reads the
+        session cookies itself — nothing to copy, nothing stored in plain text.
       </p>
       <div class="modal-actions">
-        <button id="yt-modal-connect" class="btn primary">Connect account</button>
-        <button id="yt-modal-close" class="btn">Cancel</button>
+        <button id="yt-modal-window" class="btn primary">Open sign-in window</button>
+      </div>
+      <p id="yt-modal-waiting" class="modal-waiting hidden">
+        Waiting for the sign-in in the app window…
+      </p>
+      <p id="yt-modal-error" class="modal-error hidden"></p>
+
+      <details id="yt-modal-fallback" class="modal-fallback">
+        <summary>Google blocks the built-in window? Use your browser</summary>
+        <ol class="modal-steps">
+          <li>
+            Open <b>music.youtube.com</b> in your browser and log in with the
+            account you want the app to use.
+          </li>
+          <li>
+            Press <kbd>F12</kbd> &rarr; <b>Network</b>, reload the page, click
+            the <code>browse</code> request (filter by
+            <code>youtubei/v1/browse</code> if the list is long).
+          </li>
+          <li>
+            Right-click it &rarr; <b>Copy</b> &rarr; <b>Copy request headers</b>,
+            then paste the whole block below.
+          </li>
+        </ol>
+        <div class="modal-actions">
+          <button id="yt-modal-open" class="btn">Open music.youtube.com</button>
+        </div>
+        <textarea id="yt-modal-paste" spellcheck="false" placeholder="Paste the request headers here — they carry your session cookies"></textarea>
+        <div class="modal-actions">
+          <button id="yt-modal-connect" class="btn">Connect with these headers</button>
+        </div>
+      </details>
+
+      <p class="hint">
+        The session is stored only in the encrypted bundle — no cookie file on
+        disk, nothing in the app's log.
+      </p>
+      <div class="modal-actions">
+        <button id="yt-modal-close" class="btn">Close</button>
       </div>
     </div>
   </div>

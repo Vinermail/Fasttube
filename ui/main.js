@@ -459,7 +459,9 @@ function openYtModal() {
   ytModalReturnFocus = document.activeElement;
   $("yt-modal-error").classList.add("hidden");
   $("yt-modal").classList.remove("hidden");
-  $("yt-modal-paste").focus();
+  // The paste field lives inside a closed <details>, so the primary action
+  // gets the focus instead.
+  $("yt-modal-window").focus();
 }
 
 function closeYtModal() {
@@ -467,12 +469,42 @@ function closeYtModal() {
   // The pasted headers are a secret: never leave them in the DOM.
   $("yt-modal-paste").value = "";
   $("yt-modal-error").classList.add("hidden");
+  ytModalSetWaiting(false);
   if (ytModalReturnFocus && ytModalReturnFocus.focus) ytModalReturnFocus.focus();
   ytModalReturnFocus = null;
 }
 
+/** While the capture window is open, the modal shows what is happening. */
+function ytModalSetWaiting(waiting) {
+  $("yt-modal-waiting").classList.toggle("hidden", !waiting);
+  $("yt-modal-window").disabled = waiting;
+  $("yt-modal-connect").disabled = waiting;
+  $("yt-modal-open").disabled = waiting;
+}
+
+function ytModalIsOpen() {
+  return !$("yt-modal").classList.contains("hidden");
+}
+
+$("yt-modal-window").onclick = async () => {
+  try {
+    ytModalError("");
+    $("yt-modal-error").classList.add("hidden");
+    await invoke("yt_login_start");
+    ytModalSetWaiting(true);
+  } catch (e) {
+    ytModalError(e);
+    ytModalSetWaiting(false);
+  }
+};
+
 function ytModalError(message) {
   const box = $("yt-modal-error");
+  if (message === "") {
+    box.textContent = "";
+    box.classList.add("hidden");
+    return;
+  }
   box.textContent = String(message || "Something went wrong");
   box.classList.remove("hidden");
 }
@@ -576,12 +608,18 @@ event.listen("auth-notice", (e) => {
 // The sign-in window reports here; the payload never contains cookies.
 event.listen("yt-auth-changed", (e) => {
   const p = e.payload || {};
+  ytModalSetWaiting(false);
   if (p.ok) {
     hideError();
     applySessionInfo({ state: p.state || "active", account_name: p.account_name || "" });
     refresh();
+    if (ytModalIsOpen()) closeYtModal();
   } else if (p.cancelled) {
-    refresh(); // status comes from the shared state, not from the cancel
+    refresh(); // the user closed the window: status comes from shared state
+  } else if (ytModalIsOpen()) {
+    // Show the refusal where the user started the flow.
+    ytModalError(p.error || "sign-in failed");
+    refresh();
   } else {
     showError(p.error || "sign-in failed");
     refresh();

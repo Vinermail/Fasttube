@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod auth_window;
 mod browser;
 mod downloader;
 mod engine;
@@ -973,6 +974,11 @@ async fn ensure_session_fresh(app: &tauri::AppHandle, state: &AppState) {
     if stale {
         validate_and_publish(app).await;
     }
+}
+
+#[tauri::command]
+async fn yt_login_start(app: tauri::AppHandle) -> Result<(), String> {
+    auth_window::open(&app)
 }
 
 /// Opens the YouTube Music sign-in page in the user's default browser.
@@ -2019,6 +2025,7 @@ fn main() {
             get_user_playlists,
             get_playlist_tracks,
             get_liked_songs,
+            yt_login_start,
             yt_open_login_page,
             yt_login_advanced,
             logout,
