@@ -7,12 +7,14 @@ mod fsutil;
 mod grpc;
 mod net;
 mod playlist;
+mod queue;
 mod secrets;
 mod sidecar;
 
 use downloader::ProgressHandle;
 use engine::{Cmd, EngineHandle, Snapshot};
 use playlist::{Playlist, Track};
+use queue::{Action, Queue, QueueItem, RepeatMode};
 use serde::{Deserialize, Serialize};
 use sidecar::{ApiStatus, SharedApiStatus};
 use parking_lot::{Mutex, RwLock};
@@ -40,16 +42,6 @@ struct UserPlaylistInfo {
     name: String,
     track_count: i32,
     thumbnail: String,
-}
-
-#[derive(Serialize, Deserialize, Clone)]
-struct QueueItem {
-    id: String,
-    title: String,
-    artist: String,
-    thumbnail: String,
-    #[serde(default)]
-    duration_secs: f64,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -435,34 +427,7 @@ fn record_history(state: &AppState, item: &HistoryItem) {
     save_json(&history_file(), &snapshot);
 }
 
-#[derive(Default)]
-struct QueueState {
-    items: Vec<QueueItem>,
-    current: usize,
-    active: bool,
-    manual_stop: bool,
-    prev_playing: bool,
-    version: u64,
-}
-
 type FetchGuard = Arc<Mutex<std::collections::HashSet<String>>>;
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum RepeatMode {
-    Off,
-    All,
-    One,
-}
-
-impl RepeatMode {
-    fn as_str(self) -> &'static str {
-        match self {
-            RepeatMode::Off => "off",
-            RepeatMode::All => "all",
-            RepeatMode::One => "one",
-        }
-    }
-}
 
 #[derive(Serialize, Deserialize, Clone)]
 struct HistoryItem {
@@ -489,7 +454,7 @@ struct AppState {
     api_status: SharedApiStatus,
     download: ProgressHandle,
     downloading: Mutex<bool>,
-    queue: Mutex<QueueState>,
+    queue: Mutex<Queue>,
     repeat: Mutex<RepeatMode>,
     fetching: FetchGuard,
     history: Mutex<Vec<HistoryItem>>,
@@ -597,7 +562,7 @@ fn open_playlist(
         .ok_or("playlist not found")?;
     let infos: Vec<engine::TrackInfo> = pl.tracks.iter().map(track_to_info).collect();
     *state.local_current.lock() = Some(infos.clone());
-    state.queue.lock().active = false;
+    state.queue.lock().deactivate();
     let mut pl = pl;
     let normalize = normalize_enabled(&state.settings.lock());
     apply_gains(&mut pl, &state.loudness, normalize);
@@ -618,9 +583,9 @@ fn play_track(index: usize, state: tauri::State<AppState>) {
     // watcher would hijack playback when the track ends.
     {
         let mut q = state.queue.lock();
-        if q.active {
-            q.active = false;
-            q.version += 1;
+        if q.active() {
+            q.deactivate();
+            q.bump_version();
         }
     }
     // Prioritize loudness scanning of the clicked track.
@@ -647,77 +612,45 @@ fn toggle_pause(state: tauri::State<AppState>) {
     state.engine.lock().send(Cmd::TogglePause);
 }
 
-enum QueueAction {
-    EngineCommand(Cmd),
-    PlayCurrent,
+#[tauri::command]
+async fn next_track(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let action = state.queue.lock().next();
+    match action {
+        // The queue is not driving playback: let the engine's own
+        // playlist handle it.
+        None => {
+            state.engine.lock().send(Cmd::Next);
+            Ok(())
+        }
+        Some(Action::Stop) => {
+            state.engine.lock().send(Cmd::Stop);
+            Ok(())
+        }
+        Some(_) => play_current(&state).await,
+    }
 }
 
-fn queue_next(state: &AppState) -> QueueAction {
-    let mut q = state.queue.lock();
-    if !q.active {
-        return QueueAction::EngineCommand(Cmd::Next);
-    }
-    if q.current + 1 >= q.items.len() {
-        q.manual_stop = true;
-        q.active = false;
-        q.version += 1;
-        return QueueAction::EngineCommand(Cmd::Stop);
-    }
-    q.current += 1;
-    q.manual_stop = false;
-    q.version += 1;
-    QueueAction::PlayCurrent
-}
-
-fn queue_prev(state: &AppState) -> QueueAction {
-    let mut q = state.queue.lock();
-    if !q.active {
-        return QueueAction::EngineCommand(Cmd::Prev);
-    }
+#[tauri::command]
+async fn prev_track(state: tauri::State<'_, AppState>) -> Result<(), String> {
     let elapsed = state
         .engine
         .lock()
         .snapshot()
         .map(|s| s.elapsed)
         .unwrap_or(0.0);
-    if elapsed > 3.0 && q.current > 0 {
-        q.current -= 1;
-        q.version += 1;
-    }
-    q.manual_stop = false;
-    QueueAction::PlayCurrent
-}
-
-#[tauri::command]
-async fn next_track(state: tauri::State<'_, AppState>) -> Result<(), String> {
-    match queue_next(&state) {
-        QueueAction::EngineCommand(cmd) => {
-            state.engine.lock().send(cmd);
+    let action = state.queue.lock().prev(elapsed);
+    match action {
+        None => {
+            state.engine.lock().send(Cmd::Prev);
             Ok(())
         }
-        QueueAction::PlayCurrent => play_current(&state).await,
-    }
-}
-
-#[tauri::command]
-async fn prev_track(state: tauri::State<'_, AppState>) -> Result<(), String> {
-    match queue_prev(&state) {
-        QueueAction::EngineCommand(cmd) => {
-            state.engine.lock().send(cmd);
-            Ok(())
-        }
-        QueueAction::PlayCurrent => play_current(&state).await,
+        Some(_) => play_current(&state).await,
     }
 }
 
 #[tauri::command]
 fn stop(state: tauri::State<AppState>) {
-    {
-        let mut q = state.queue.lock();
-        if q.active {
-            q.manual_stop = true;
-        }
-    }
+    state.queue.lock().mark_manual_stop();
     state.engine.lock().send(Cmd::Stop);
 }
 
@@ -1228,13 +1161,11 @@ fn read_cached_title(meta: &std::path::Path) -> Option<String> {
 }
 
 async fn play_current(state: &AppState) -> Result<(), String> {
-    let item = {
-        let q = state.queue.lock();
-        q.items
-            .get(q.current)
-            .cloned()
-            .ok_or_else(|| "queue is empty".to_string())?
-    };
+    let item = state
+        .queue
+        .lock()
+        .current_item()
+        .ok_or_else(|| "queue is empty".to_string())?;
 
     let quality = current_quality(state);
     let dest = downloader::cached_file(&item.id, &quality);
@@ -1455,11 +1386,11 @@ fn get_queue_info(state: tauri::State<AppState>) -> QueueInfo {
     let q = state.queue.lock();
     let repeat = state.repeat.lock().as_str().to_string();
     QueueInfo {
-        active: q.active,
-        current: q.current,
-        items: q.items.clone(),
+        active: q.active(),
+        current: q.current(),
+        items: q.items().to_vec(),
         repeat,
-        version: q.version,
+        version: q.version(),
     }
 }
 
@@ -1467,7 +1398,7 @@ fn get_queue_info(state: tauri::State<AppState>) -> QueueInfo {
 /// when it changed (avoids serializing thousands of items every 250 ms).
 #[tauri::command]
 fn get_queue_version(state: tauri::State<AppState>) -> u64 {
-    state.queue.lock().version
+    state.queue.lock().version()
 }
 
 #[tauri::command]
@@ -1548,8 +1479,8 @@ fn set_normalize_level(level: String, state: tauri::State<AppState>) -> Result<(
             .unwrap_or_default();
         {
             let q = state.queue.lock();
-            if q.active
-                && let Some(item) = q.items.get(q.current)
+            if q.active()
+                && let Some(item) = q.items().get(q.current())
             {
                 paths.push(downloader::cached_file(&item.id, &current_quality(&state)));
             }
@@ -1642,59 +1573,29 @@ async fn queue_add(
     if items.is_empty() {
         return Ok(());
     }
-    let start_fresh;
-    {
+    let start_fresh = {
         let q = state.queue.lock();
-        start_fresh = !q.active || q.items.is_empty();
-    }
+        !q.active() || q.is_empty()
+    };
     if start_fresh {
         return play_queue(items, 0, state).await;
     }
-    {
-        let mut q = state.queue.lock();
-        let at = if play_next.unwrap_or(false) {
-            (q.current + 1).min(q.items.len())
-        } else {
-            q.items.len()
-        };
-        for (i, item) in items.into_iter().enumerate() {
-            q.items.insert(at + i, item);
-        }
-        q.version += 1;
-    }
+    state.queue.lock().add(items, play_next.unwrap_or(false));
     Ok(())
 }
 
 #[tauri::command]
 fn queue_remove(index: usize, state: tauri::State<AppState>) -> Result<(), String> {
-    let mut q = state.queue.lock();
-    if index >= q.items.len() {
-        return Err("index out of range".to_string());
-    }
-    if q.items.len() == 1 {
-        q.active = false;
-        q.items.clear();
+    let action = state.queue.lock().remove(index).map_err(str::to_string)?;
+    if action == Action::Stop {
         state.engine.lock().send(Cmd::Stop);
-        return Ok(());
     }
-    q.items.remove(index);
-    if q.active && index < q.current {
-        q.current -= 1;
-    } else if q.active && q.current >= q.items.len() {
-        q.current = q.items.len() - 1;
-    }
-    q.version += 1;
     Ok(())
 }
 
 #[tauri::command]
 fn queue_clear(state: tauri::State<AppState>) {
-    let mut q = state.queue.lock();
-    q.active = false;
-    q.items.clear();
-    q.manual_stop = true;
-    q.version += 1;
-    drop(q);
+    state.queue.lock().clear();
     state.engine.lock().send(Cmd::Stop);
 }
 
@@ -1782,7 +1683,7 @@ fn open_favorites(state: tauri::State<AppState>) -> Result<Vec<engine::TrackInfo
     };
     let infos: Vec<engine::TrackInfo> = tracks.iter().map(track_to_info).collect();
     *state.local_current.lock() = Some(infos.clone());
-    state.queue.lock().active = false;
+    state.queue.lock().deactivate();
     let mut playlist = playlist;
     let normalize = normalize_enabled(&state.settings.lock());
     apply_gains(&mut playlist, &state.loudness, normalize);
@@ -1825,7 +1726,7 @@ fn set_sleep_timer(
                 _ => return, // timer was replaced or cancelled
             }
         }
-        app_state.queue.lock().manual_stop = true;
+        app_state.queue.lock().mark_manual_stop();
         app_state.engine.lock().send(Cmd::Stop);
     });
     Ok(())
@@ -1849,28 +1750,11 @@ async fn play_queue(
     if items.is_empty() {
         return Err("empty queue".to_string());
     }
-    let start = start.min(items.len() - 1);
-    {
-        let mut q = state.queue.lock();
-        q.items = items;
-        q.current = start;
-        q.active = true;
-        q.manual_stop = false;
-        q.prev_playing = false;
-        q.version += 1;
-    }
+    state.queue.lock().set_items(items, start);
     play_current(&state).await?;
 
     // Preload the next two tracks in the background so advancing is instant.
-    let next_items = {
-        let q = state.queue.lock();
-        q.items
-            .iter()
-            .skip(q.current + 1)
-            .take(2)
-            .cloned()
-            .collect::<Vec<_>>()
-    };
+    let next_items = state.queue.lock().upcoming(2);
     spawn_prefetch(
         next_items,
         state.fetching.clone(),
@@ -1905,6 +1789,7 @@ fn spawn_queue_watcher(handle: tauri::AppHandle) {
                 .expect("failed to build queue watcher runtime");
             rt.block_on(async move {
                 let mut prefetched_for: Option<usize> = None;
+                let mut prev_playing = false;
                 loop {
                     tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                     let state = handle.state::<AppState>();
@@ -1923,58 +1808,31 @@ fn spawn_queue_watcher(handle: tauri::AppHandle) {
                     let mut prefetch: Vec<QueueItem> = Vec::new();
                     {
                         let mut q = state.queue.lock();
-                        if !q.active || q.manual_stop {
-                            q.prev_playing = false;
+                        if !q.active() || q.manual_stop() {
+                            prev_playing = false;
                             prefetched_for = None;
                             continue;
                         }
-                        let should_advance = q.prev_playing && stopped_now;
-                        if should_advance {
+                        if prev_playing && stopped_now {
+                            // The track ended on its own: ask the queue
+                            // what to play next under the current repeat.
                             let repeat = *state.repeat.lock();
-                            match repeat {
-                                RepeatMode::One => {
-                                    q.prev_playing = false;
-                                    advance = true; // replay the same track
-                                }
-                                RepeatMode::All => {
-                                    q.current = (q.current + 1) % q.items.len();
-                                    q.prev_playing = false;
-                                    q.version += 1;
-                                    advance = true;
-                                }
-                                RepeatMode::Off => {
-                                    if q.current + 1 < q.items.len() {
-                                        q.current += 1;
-                                        q.prev_playing = false;
-                                        q.version += 1;
-                                        advance = true;
-                                    } else {
-                                        q.active = false;
-                                        q.prev_playing = false;
-                                        q.version += 1;
-                                    }
-                                }
-                            }
+                            let action = q.advance(repeat);
+                            advance = action == Action::PlayCurrent;
+                            prev_playing = false;
                             if advance {
                                 prefetched_for = None;
                             }
                         } else {
-                            q.prev_playing = playing_now;
+                            prev_playing = playing_now;
                         }
 
                         // Once the current track starts playing, prefetch the
                         // next two in the background.
-                        if playing_now && prefetched_for != Some(q.current) {
-                            prefetched_for = Some(q.current);
-                            let repeat = *state.repeat.lock();
-                            if repeat != RepeatMode::One {
-                                prefetch = q
-                                    .items
-                                    .iter()
-                                    .skip(q.current + 1)
-                                    .take(2)
-                                    .cloned()
-                                    .collect();
+                        if playing_now && prefetched_for != Some(q.current()) {
+                            prefetched_for = Some(q.current());
+                            if *state.repeat.lock() != RepeatMode::One {
+                                prefetch = q.upcoming(2);
                             }
                         }
                     }
@@ -2067,7 +1925,7 @@ fn main() {
         })),
         download: ProgressHandle::default(),
         downloading: Mutex::new(false),
-        queue: Mutex::new(QueueState::default()),
+        queue: Mutex::new(Queue::default()),
         repeat: Mutex::new(RepeatMode::Off),
         fetching: Arc::new(Mutex::new(std::collections::HashSet::new())),
         history: Mutex::new(load_json(&history_file())),
