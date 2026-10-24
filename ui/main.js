@@ -483,7 +483,9 @@ function applySessionInfo(info) {
   if (info.state === "active") {
     setAuthStatus(info.account_name ? "Signed in as " + info.account_name : "Signed in", true);
     authBannerDismissed = false;
-    hideAuthBanner();
+    // Only the expiry banner belongs to the session; a one-off notice must stay
+    // readable until dismissed.
+    if (authBannerKind === "expired") hideAuthBanner();
     $("yt-logout-note").classList.add("hidden");
   } else if (info.state === "expired") {
     setAuthStatus("Session expired", false);
@@ -495,15 +497,18 @@ function applySessionInfo(info) {
 const AUTH_EXPIRED_TEXT =
   "Your YouTube session expired. Sign in again to load your library.";
 let authBannerDismissed = false;
+let authBannerKind = "";
 
-function showAuthBanner(text, withLogin) {
+function showAuthBanner(text, withLogin, kind) {
   $("auth-banner-text").textContent = text;
   $("auth-banner-login").classList.toggle("hidden", !withLogin);
   $("auth-banner").classList.remove("hidden");
+  authBannerKind = kind || "";
 }
 
 function hideAuthBanner() {
   $("auth-banner").classList.add("hidden");
+  authBannerKind = "";
 }
 
 $("auth-banner-login").onclick = () => {
@@ -511,16 +516,16 @@ $("auth-banner-login").onclick = () => {
 };
 
 $("auth-banner-close").onclick = () => {
-  authBannerDismissed = true;
+  if (authBannerKind === "expired") authBannerDismissed = true;
   hideAuthBanner();
 };
 
 event.listen("auth-expired", () => {
-  if (!authBannerDismissed) showAuthBanner(AUTH_EXPIRED_TEXT, true);
+  if (!authBannerDismissed) showAuthBanner(AUTH_EXPIRED_TEXT, true, "expired");
 });
 
 event.listen("auth-notice", (e) => {
-  showAuthBanner(String(e.payload || ""), false);
+  showAuthBanner(String(e.payload || ""), false, "notice");
 });
 
 // The sign-in window reports here; the payload never contains cookies.
@@ -938,7 +943,7 @@ function renderApiStatus(s) {
       account_name: s.account_name || "",
     });
     if (s.session_state === "expired" && !authBannerDismissed) {
-      showAuthBanner(AUTH_EXPIRED_TEXT, true);
+      showAuthBanner(AUTH_EXPIRED_TEXT, true, "expired");
     }
   }
 }
