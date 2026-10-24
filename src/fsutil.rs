@@ -48,13 +48,15 @@ pub fn write_json_atomic<T: serde::Serialize>(
 }
 
 /// Temp file next to the destination: `rename` cannot cross volumes, and a
-/// per-process name keeps two instances from colliding.
+/// per-process, per-call name keeps two concurrent saves from colliding.
 fn temp_path(path: &Path) -> PathBuf {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "data".to_string());
-    path.with_file_name(format!(".{name}.{}.tmp", std::process::id()))
+    path.with_file_name(format!(".{name}.{}.{seq}.tmp", std::process::id()))
 }
 
 fn replace(tmp: &Path, path: &Path) -> io::Result<()> {
@@ -125,16 +127,44 @@ mod tests {
     }
 
     #[test]
-    fn failed_write_does_not_touch_the_destination() {
+    fn failed_write_leaves_the_destination_alone_and_cleans_up() {
         let dir = Dir::new("fail");
-        let path = dir.0.join("keep.json");
-        std::fs::write(&path, "keep").unwrap();
-        // A directory where the temp file should go makes the write fail.
-        std::fs::create_dir_all(temp_path(&path)).unwrap();
+        let path = dir.0.join("blocked");
+        // A directory at the destination makes the final rename fail on every
+        // platform (a file cannot replace a folder).
+        std::fs::create_dir_all(&path).unwrap();
 
         assert!(write_atomic(&path, b"lost").is_err());
 
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "keep");
+        assert!(path.is_dir(), "the destination must not be touched");
+        let entries: Vec<String> = std::fs::read_dir(&dir.0)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(entries, vec!["blocked".to_string()], "temp file left behind");
+    }
+
+    #[test]
+    fn concurrent_saves_to_one_path_do_not_share_a_temp_file() {
+        let dir = Dir::new("concurrent");
+        let path = dir.0.join("history.json");
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                let path = path.clone();
+                std::thread::spawn(move || write_atomic(&path, format!("v{i}").as_bytes()))
+            })
+            .collect();
+        for handle in handles {
+            assert!(handle.join().unwrap().is_ok());
+        }
+        // Whichever write won, the file holds one complete value.
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.starts_with('v') && text.len() <= 3, "got {text:?}");
+        let entries: Vec<String> = std::fs::read_dir(&dir.0)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(entries, vec!["history.json".to_string()]);
     }
 
     #[test]
