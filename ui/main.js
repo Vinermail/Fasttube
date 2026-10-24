@@ -482,12 +482,46 @@ function applySessionInfo(info) {
   if (!info) return;
   if (info.state === "active") {
     setAuthStatus(info.account_name ? "Signed in as " + info.account_name : "Signed in", true);
+    authBannerDismissed = false;
+    hideAuthBanner();
+    $("yt-logout-note").classList.add("hidden");
   } else if (info.state === "expired") {
     setAuthStatus("Session expired", false);
   } else {
     setAuthStatus("Not signed in", false);
   }
 }
+
+const AUTH_EXPIRED_TEXT =
+  "Your YouTube session expired. Sign in again to load your library.";
+let authBannerDismissed = false;
+
+function showAuthBanner(text, withLogin) {
+  $("auth-banner-text").textContent = text;
+  $("auth-banner-login").classList.toggle("hidden", !withLogin);
+  $("auth-banner").classList.remove("hidden");
+}
+
+function hideAuthBanner() {
+  $("auth-banner").classList.add("hidden");
+}
+
+$("auth-banner-login").onclick = () => {
+  invoke("yt_login_start").catch(showError);
+};
+
+$("auth-banner-close").onclick = () => {
+  authBannerDismissed = true;
+  hideAuthBanner();
+};
+
+event.listen("auth-expired", () => {
+  if (!authBannerDismissed) showAuthBanner(AUTH_EXPIRED_TEXT, true);
+});
+
+event.listen("auth-notice", (e) => {
+  showAuthBanner(String(e.payload || ""), false);
+});
 
 // The sign-in window reports here; the payload never contains cookies.
 event.listen("yt-auth-changed", (e) => {
@@ -509,6 +543,8 @@ $("yt-logout-btn").onclick = async () => {
     await invoke("logout");
     hideError();
     setAuthStatus("Not signed in", false);
+    hideAuthBanner();
+    $("yt-logout-note").classList.remove("hidden");
     currentYtTracks = [];
     $("yt-user-playlists").innerHTML = "";
   } catch (e) {
@@ -527,10 +563,16 @@ async function loadSettings() {
     if (norm) norm.checked = true;
     const curve = $("opt-volume-curve");
     if (curve) curve.checked = !!s.volume_curve;
+    const streaming = $("opt-streaming-account");
+    if (streaming) streaming.checked = !!s.streaming_account;
   } catch (e) {
     showError(e);
   }
 }
+
+$("opt-streaming-account").addEventListener("change", (e) => {
+  invoke("set_streaming_account", { enabled: e.target.checked }).catch((err) => showError(err));
+});
 
 $("opt-volume-curve").addEventListener("change", (e) => {
   invoke("set_volume_curve", { enabled: e.target.checked }).catch((err) => showError(err));
@@ -891,7 +933,13 @@ function renderApiStatus(s) {
   el.className = "badge api-side " + cls;
 
   if (s.state === "ok") {
-    setAuthStatus(s.auth_ok ? "Signed in" : "Not signed in", s.auth_ok);
+    applySessionInfo({
+      state: s.session_state || "signed_out",
+      account_name: s.account_name || "",
+    });
+    if (s.session_state === "expired" && !authBannerDismissed) {
+      showAuthBanner(AUTH_EXPIRED_TEXT, true);
+    }
   }
 }
 

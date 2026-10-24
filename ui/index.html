@@ -43,6 +43,11 @@
   <div id="splitter" class="splitter"></div>
 
   <main id="main">
+    <div id="auth-banner" class="auth-banner hidden">
+      <span id="auth-banner-text"></span>
+      <button id="auth-banner-login" class="btn primary">Sign in</button>
+      <button id="auth-banner-close" class="btn">Dismiss</button>
+    </div>
     <div id="topbar">
       <button id="btn-back" class="tbtn nav-arrow disabled" title="Назад (Alt+←)">←</button>
       <button id="btn-forward" class="tbtn nav-arrow disabled" title="Вперёд (Alt+→)">→</button>
@@ -126,6 +131,14 @@
             <input id="opt-volume-curve" type="checkbox" />
             Экспоненциальная громкость (v³) — ползунок меняет громкость по кривой восприятия
           </label>
+          <label class="quality-opt">
+            <input id="opt-streaming-account" type="checkbox" />
+            Use the account for streaming (Premium bitrate, age-gated tracks)
+          </label>
+          <p class="hint">
+            Off by default. Streaming with your cookies lets yt-dlp act as your
+            account; YouTube may then rate-limit or flag it.
+          </p>
         </section>
 
         <section class="settings-section">
@@ -148,6 +161,10 @@
             Opens a separate window on music.youtube.com. The app reads the
             session cookies itself and keeps them encrypted; no plain-text
             cookie file is written.
+          </p>
+          <p id="yt-logout-note" class="hint hidden">
+            Signed out locally. To revoke the session on Google's side:
+            Account &rarr; Security &rarr; Your devices.
           </p>
           <details id="yt-advanced">
             <summary class="hint">Advanced: paste request headers</summary>

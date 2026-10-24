@@ -58,6 +58,9 @@ struct Settings {
     normalize_level: String,
     #[serde(default = "default_true")]
     volume_curve: bool,
+    /// Off by default: using the account with yt-dlp can get it rate-limited.
+    #[serde(default)]
+    streaming_account: bool,
 }
 
 fn default_quality() -> String {
@@ -78,6 +81,7 @@ impl Default for Settings {
             audio_quality: default_quality(),
             normalize_level: default_normalize_level(),
             volume_curve: true,
+            streaming_account: false,
         }
     }
 }
@@ -115,6 +119,11 @@ fn save_settings(settings: &Settings) {
 
 fn current_quality(state: &AppState) -> String {
     state.settings.lock().unwrap().audio_quality.clone()
+}
+
+/// Whether stream resolution may use the signed-in account (opt-in).
+fn streaming_account(state: &AppState) -> bool {
+    state.settings.lock().unwrap().streaming_account
 }
 
 fn history_file() -> std::path::PathBuf {
@@ -441,6 +450,9 @@ struct AppState {
     favorites: Mutex<Vec<FavoriteTrack>>,
     sleep_until: Mutex<Option<std::time::Instant>>,
     loudness: LoudnessCache,
+    /// When the session was last validated (for the "check before loading"
+    /// rule). `None` = never checked in this process.
+    session_checked: Mutex<Option<std::time::Instant>>,
 }
 
 fn track_to_info(t: &Track) -> engine::TrackInfo {
@@ -715,7 +727,11 @@ async fn search_youtube(
 }
 
 #[tauri::command]
-async fn get_liked_songs(_state: tauri::State<'_, AppState>) -> Result<Vec<SearchTrack>, String> {
+async fn get_liked_songs(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<SearchTrack>, String> {
+    ensure_session_fresh(&app, &state).await;
     let resp = grpc::get_liked_songs().await.map_err(|e| e.to_string())?;
     if !resp.error.is_empty() {
         return Err(resp.error);
@@ -762,6 +778,7 @@ fn set_session_status(app: &tauri::AppHandle, info: &SessionInfo) {
         status.session_state = info.state.clone();
         status.account_name = info.account_name.clone();
         status.auth_ok = info.state == "active";
+        *state.session_checked.lock().unwrap() = Some(std::time::Instant::now());
     }
 }
 
@@ -799,6 +816,195 @@ pub(crate) async fn install_session(
     secrets::save(&bundle)?;
     set_session_status(app, &info);
     Ok(info)
+}
+
+const SESSION_CHECK_EVERY: std::time::Duration = std::time::Duration::from_secs(120);
+const SESSION_BACKGROUND_EVERY: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+fn signed_out() -> SessionInfo {
+    SessionInfo {
+        state: "signed_out".to_string(),
+        account_name: String::new(),
+        error: String::new(),
+    }
+}
+
+/// One validation round: updates the shared status, announces an expiry once.
+async fn validate_and_publish(app: &tauri::AppHandle) -> Option<SessionInfo> {
+    let status = match grpc::validate_session().await {
+        Ok(status) => status,
+        Err(e) => {
+            // Sidecar down or network error: keep whatever state we have.
+            eprintln!("[auth] session validation failed: {e}");
+            return None;
+        }
+    };
+    let info = SessionInfo::from_status(&status);
+    let was_expired = app
+        .try_state::<AppState>()
+        .map(|s| {
+            s.api_status
+                .read()
+                .map(|st| st.session_state == "expired")
+                .unwrap_or(false)
+        })
+        .unwrap_or(false);
+    set_session_status(app, &info);
+    if info.state == "expired" && !was_expired {
+        eprintln!("[auth] session expired");
+        let _ = app.emit("auth-expired", &info);
+    }
+    Some(info)
+}
+
+/// Loads the encrypted bundle (or the legacy plain-text one) and installs the
+/// session in a freshly started sidecar.
+async fn restore_session(app: &tauri::AppHandle) {
+    let mut bundle = secrets::load();
+    if bundle.is_none()
+        && let Some(imported) = import_legacy_browser_json(app).await
+    {
+        let _ = imported; // import already installed and validated the session
+        return;
+    }
+    let Some(bundle) = bundle.take() else {
+        set_session_status(app, &signed_out());
+        return;
+    };
+
+    match grpc::set_session(&bundle.cookie, &bundle.user_agent, &bundle.x_goog_authuser).await {
+        Ok(status) => {
+            let info = SessionInfo::from_status(&status);
+            set_session_status(app, &info);
+            match info.state.as_str() {
+                "active" => {
+                    eprintln!("[auth] restored the session from auth.bin");
+                    validate_and_publish(app).await;
+                }
+                "expired" => {
+                    let _ = app.emit("auth-expired", &info);
+                }
+                _ => {}
+            }
+        }
+        Err(e) => eprintln!("[auth] cannot restore the session: {e}"),
+    }
+}
+
+/// One-time import of the pre-3.x `api/browser.json` (plain-text cookies).
+/// The file is deleted once its fate is known: imported when the session still
+/// works, dropped when it is already dead (a plain-text cookie file must not
+/// survive on disk either way). A network failure keeps it for the next start.
+async fn import_legacy_browser_json(app: &tauri::AppHandle) -> Option<secrets::AuthBundle> {
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("api")
+        .join("browser.json");
+    let raw = std::fs::read_to_string(&path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let field = |name: &str| -> String {
+        value
+            .get(name)
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
+    let cookie = field("cookie");
+    if cookie.is_empty() {
+        let _ = std::fs::remove_file(&path);
+        return None;
+    }
+    let bundle = secrets::AuthBundle::new(
+        cookie,
+        field("user-agent"),
+        field("x-goog-authuser"),
+    );
+
+    let status = match grpc::set_session(&bundle.cookie, &bundle.user_agent, &bundle.x_goog_authuser)
+        .await
+    {
+        Ok(status) => status,
+        Err(e) => {
+            eprintln!("[auth] legacy import skipped (sidecar unavailable): {e}");
+            return None;
+        }
+    };
+    if SessionInfo::from_status(&status).state != "active" {
+        drop_legacy_browser_file(app, &path, "the stored cookie is unusable");
+        return None;
+    }
+
+    let validated = match grpc::validate_session().await {
+        Ok(validated) => validated,
+        Err(e) => {
+            // Cannot judge the session right now; keep the file for next start.
+            eprintln!("[auth] legacy import deferred (validation failed): {e}");
+            return None;
+        }
+    };
+    let info = SessionInfo::from_status(&validated);
+    if info.state != "active" {
+        drop_legacy_browser_file(app, &path, "the session had expired");
+        return None;
+    }
+    if secrets::save(&bundle).is_err() {
+        return None;
+    }
+    match std::fs::remove_file(&path) {
+        Ok(()) => eprintln!("[auth] imported api/browser.json into auth.bin and deleted it"),
+        Err(e) => eprintln!("[auth] imported api/browser.json but could not delete it: {e}"),
+    }
+    set_session_status(app, &info);
+    let _ = app.emit(
+        "auth-notice",
+        "Your previous YouTube session was imported from api/browser.json. \
+         The plain-text file has been deleted.",
+    );
+    Some(bundle)
+}
+
+/// The old file cannot be imported; make sure no plain-text cookies stay on
+/// disk and tell the user why they have to sign in again.
+fn drop_legacy_browser_file(app: &tauri::AppHandle, path: &std::path::Path, reason: &str) {
+    let _ = std::fs::remove_file(path);
+    eprintln!("[auth] deleted legacy api/browser.json: {reason}");
+    let _ = app.emit(
+        "auth-notice",
+        format!(
+            "The old plain-text YouTube session (api/browser.json) was removed because {reason}. \
+             Sign in again."
+        ),
+    );
+}
+
+/// Restores the session once the sidecar is up, then re-validates every 15 min.
+fn spawn_session_bootstrap(app: tauri::AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        for _ in 0..60 {
+            if grpc::health().await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+        restore_session(&app).await;
+        loop {
+            tokio::time::sleep(SESSION_BACKGROUND_EVERY).await;
+            validate_and_publish(&app).await;
+        }
+    });
+}
+
+/// "Check before loading the library/playlists": at most one network round
+/// per [`SESSION_CHECK_EVERY`], so opening a playlist does not add latency.
+async fn ensure_session_fresh(app: &tauri::AppHandle, state: &AppState) {
+    let stale = {
+        let checked = state.session_checked.lock().unwrap();
+        checked
+            .map(|at| at.elapsed() >= SESSION_CHECK_EVERY)
+            .unwrap_or(true)
+    };
+    if stale {
+        validate_and_publish(app).await;
+    }
 }
 
 #[tauri::command]
@@ -842,8 +1048,10 @@ async fn logout(state: tauri::State<'_, AppState>) -> Result<(), String> {
 
 #[tauri::command]
 async fn get_user_playlists(
-    _state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
 ) -> Result<Vec<UserPlaylistInfo>, String> {
+    ensure_session_fresh(&app, &state).await;
     let resp = grpc::get_user_playlists()
         .await
         .map_err(|e| e.to_string())?;
@@ -872,8 +1080,10 @@ async fn get_user_playlists(
 #[tauri::command]
 async fn get_playlist_tracks(
     playlist_id: String,
-    _state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
 ) -> Result<Vec<SearchTrack>, String> {
+    ensure_session_fresh(&app, &state).await;
     let resp = grpc::get_playlist_tracks(&playlist_id)
         .await
         .map_err(|e| e.to_string())?;
@@ -923,7 +1133,7 @@ async fn play_video_inner(id: &str, state: &AppState) -> Result<PlaylistInfo, St
             t
         } else {
             // file cached but metadata lost: resolve just for the title
-            let resolved = grpc::resolve(id, &quality, false)
+            let resolved = grpc::resolve(id, &quality, streaming_account(state))
                 .await
                 .map_err(|e| e.to_string())?;
             let track = resolved
@@ -932,7 +1142,7 @@ async fn play_video_inner(id: &str, state: &AppState) -> Result<PlaylistInfo, St
             track.title.clone()
         }
     } else {
-        let resolved = grpc::resolve(id, &quality, false)
+        let resolved = grpc::resolve(id, &quality, streaming_account(state))
             .await
             .map_err(|e| e.to_string())?;
         if !resolved.ok {
@@ -1083,7 +1293,7 @@ async fn play_current_download(
         .store(0, std::sync::atomic::Ordering::Relaxed);
 
     let quality = current_quality(state);
-    let resolved = grpc::resolve(&item.id, &quality, false)
+    let resolved = grpc::resolve(&item.id, &quality, streaming_account(state))
         .await
         .map_err(|e| e.to_string())?;
     if !resolved.ok {
@@ -1102,7 +1312,7 @@ async fn play_current_download(
                 "[yt] download failed ({first_err}), re-resolving {}",
                 item.id
             );
-            let fresh = grpc::resolve_forced(&item.id, &quality, false)
+            let fresh = grpc::resolve_forced(&item.id, &quality, streaming_account(state))
                 .await
                 .map_err(|e| e.to_string())?;
             if !fresh.ok {
@@ -1134,15 +1344,16 @@ async fn prefetch_tracks(
         return Ok(());
     }
     let quality = current_quality(&state);
+    let use_account = streaming_account(&state);
     let ids: Vec<String> = items.iter().take(4).map(|i| i.id.clone()).collect();
     // Resolve in parallel on the sidecar; failures are non-fatal.
-    let _ = grpc::prefetch_resolve(&ids, &quality, false).await;
+    let _ = grpc::prefetch_resolve(&ids, &quality, use_account).await;
 
     // Download only the first track in the background (click = instant play).
     let first = items[0].clone();
     let fetching = state.fetching.clone();
     tauri::async_runtime::spawn(async move {
-        let _ = ensure_cached(&first, &fetching, &quality).await;
+        let _ = ensure_cached(&first, &fetching, &quality, use_account).await;
     });
     Ok(())
 }
@@ -1151,6 +1362,7 @@ async fn ensure_cached(
     item: &QueueItem,
     fetching: &FetchGuard,
     quality: &str,
+    use_account: bool,
 ) -> Result<(), String> {
     let dest = downloader::cached_file(&item.id, quality);
     if dest.exists() {
@@ -1164,7 +1376,7 @@ async fn ensure_cached(
         }
     }
     let result = async {
-        let resolved = grpc::resolve(&item.id, quality, false)
+        let resolved = grpc::resolve(&item.id, quality, use_account)
             .await
             .map_err(|e| e.to_string())?;
         if !resolved.ok {
@@ -1173,7 +1385,7 @@ async fn ensure_cached(
         let handle = downloader::ProgressHandle::default();
         if let Err(first_err) = downloader::download(&resolved.stream_url, &dest, &handle).await {
             // Cached URL may have expired: force a fresh resolve and retry.
-            let fresh = grpc::resolve_forced(&item.id, quality, false)
+            let fresh = grpc::resolve_forced(&item.id, quality, use_account)
                 .await
                 .map_err(|e| e.to_string())?;
             if fresh.ok && fresh.stream_url != resolved.stream_url {
@@ -1236,6 +1448,13 @@ fn set_audio_quality(quality: String, state: tauri::State<AppState>) -> Result<(
     settings.audio_quality = quality;
     save_settings(&settings);
     Ok(())
+}
+
+#[tauri::command]
+fn set_streaming_account(enabled: bool, state: tauri::State<AppState>) {
+    let mut settings = state.settings.lock().unwrap();
+    settings.streaming_account = enabled;
+    save_settings(&settings);
 }
 
 #[tauri::command]
@@ -1611,19 +1830,24 @@ async fn play_queue(
             .cloned()
             .collect::<Vec<_>>()
     };
-    spawn_prefetch(next_items, state.fetching.clone(), current_quality(&state));
+    spawn_prefetch(
+        next_items,
+        state.fetching.clone(),
+        current_quality(&state),
+        streaming_account(&state),
+    );
     Ok(())
 }
 
 /// Downloads the given queue items in the background (silently, without
 /// touching the visible download progress).
-fn spawn_prefetch(items: Vec<QueueItem>, fetching: FetchGuard, quality: String) {
+fn spawn_prefetch(items: Vec<QueueItem>, fetching: FetchGuard, quality: String, use_account: bool) {
     if items.is_empty() {
         return;
     }
     tauri::async_runtime::spawn(async move {
         for item in items {
-            if ensure_cached(&item, &fetching, &quality).await.is_err() {
+            if ensure_cached(&item, &fetching, &quality, use_account).await.is_err() {
                 break;
             }
         }
@@ -1718,7 +1942,12 @@ fn spawn_queue_watcher(handle: tauri::AppHandle) {
                         eprintln!("[queue] play_current failed: {e}");
                     }
                     if !prefetch.is_empty() {
-                        spawn_prefetch(prefetch, state.fetching.clone(), current_quality(&state));
+                        spawn_prefetch(
+                            prefetch,
+                            state.fetching.clone(),
+                            current_quality(&state),
+                            streaming_account(&state),
+                        );
                     }
                 }
             });
@@ -1804,6 +2033,7 @@ fn main() {
         favorites: Mutex::new(load_json(&favorites_file())),
         sleep_until: Mutex::new(None),
         loudness: load_loudness(),
+        session_checked: Mutex::new(None),
     };
     let api_status = app_state.api_status.clone();
     {
@@ -1823,6 +2053,7 @@ fn main() {
         .manage(app_state)
         .setup(move |app| {
             spawn_queue_watcher(app.handle().clone());
+            spawn_session_bootstrap(app.handle().clone());
             if let Some(dir) = initial_dir {
                 let handle = app.handle().clone();
                 std::thread::Builder::new()
@@ -1883,6 +2114,7 @@ fn main() {
             get_queue_version,
             get_settings,
             set_audio_quality,
+            set_streaming_account,
             set_normalize_level,
             set_volume_curve,
             clear_cache,
