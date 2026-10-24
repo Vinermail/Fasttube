@@ -3,6 +3,7 @@
 mod auth_window;
 mod downloader;
 mod engine;
+mod fsutil;
 mod grpc;
 mod net;
 mod playlist;
@@ -108,12 +109,8 @@ fn load_settings() -> Settings {
 }
 
 fn save_settings(settings: &Settings) {
-    let path = downloader::settings_file();
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if let Ok(s) = serde_json::to_string_pretty(settings) {
-        let _ = std::fs::write(&path, s);
+    if let Err(e) = fsutil::write_json_atomic(&downloader::settings_file(), settings, true) {
+        eprintln!("[store] cannot save settings: {e}");
     }
 }
 
@@ -371,11 +368,8 @@ fn load_json<T: for<'de> Deserialize<'de> + Default>(path: &std::path::Path) -> 
 }
 
 fn save_json<T: Serialize>(path: &std::path::Path, value: &T) {
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if let Ok(s) = serde_json::to_string(value) {
-        let _ = std::fs::write(path, s);
+    if let Err(e) = fsutil::write_json_atomic(path, value, false) {
+        eprintln!("[store] cannot save {}: {e}", path.display());
     }
 }
 
