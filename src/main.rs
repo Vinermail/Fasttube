@@ -63,6 +63,13 @@ struct Settings {
     /// Off by default: using the account with yt-dlp can get it rate-limited.
     #[serde(default)]
     streaming_account: bool,
+    /// Audio cache budget in MiB; 0 disables eviction.
+    #[serde(default = "default_cache_limit_mb")]
+    cache_limit_mb: u64,
+}
+
+fn default_cache_limit_mb() -> u64 {
+    2048
 }
 
 fn default_quality() -> String {
@@ -84,6 +91,7 @@ impl Default for Settings {
             normalize_level: default_normalize_level(),
             volume_curve: true,
             streaming_account: false,
+            cache_limit_mb: default_cache_limit_mb(),
         }
     }
 }
@@ -372,6 +380,49 @@ fn save_json<T: Serialize>(path: &std::path::Path, value: &T) {
     if let Err(e) = fsutil::write_json_atomic(path, value, false) {
         eprintln!("[store] cannot save {}: {e}", path.display());
     }
+}
+
+/// Deletes the least recently used cached tracks until the cache fits the
+/// configured budget. The playing file and anything being downloaded now are
+/// never candidates.
+fn run_cache_eviction(state: &AppState) {
+    let limit_mb = state.settings.lock().cache_limit_mb;
+    let quality = current_quality(state);
+    let mut keep: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(track) = state.engine.lock().snapshot().and_then(|s| s.track)
+        && let Some(path) = track.path
+    {
+        keep.push(std::path::PathBuf::from(path));
+    }
+    let fetching: Vec<String> = state.fetching.lock().iter().cloned().collect();
+    for id in fetching {
+        keep.push(downloader::cached_file(&id, &quality));
+    }
+    let (removed, freed) = downloader::evict_cache(limit_mb.saturating_mul(1024 * 1024), &keep);
+    if removed > 0 {
+        eprintln!(
+            "[cache] evicted {removed} track(s), freed {:.0} MiB; cache is now {:.0} MiB",
+            freed as f64 / (1024.0 * 1024.0),
+            downloader::cache_size() as f64 / (1024.0 * 1024.0)
+        );
+    }
+}
+
+/// Sweeps once at startup and then every five minutes.
+fn spawn_cache_sweeper(app: tauri::AppHandle) {
+    std::thread::Builder::new()
+        .name("cache-sweeper".to_string())
+        .spawn(move || {
+            let mut first = true;
+            loop {
+                if !first {
+                    std::thread::sleep(std::time::Duration::from_secs(300));
+                }
+                first = false;
+                run_cache_eviction(&app.state::<AppState>());
+            }
+        })
+        .expect("failed to spawn cache sweeper");
 }
 
 fn record_history(state: &AppState, item: &HistoryItem) {
@@ -1211,6 +1262,9 @@ async fn play_current(state: &AppState) -> Result<(), String> {
         }
     }
 
+    // Playback is the strongest "last used" signal for the eviction.
+    downloader::touch(&dest);
+
     let playlist = Playlist {
         name: item.title.clone(),
         tracks: vec![Track {
@@ -1430,6 +1484,17 @@ fn set_audio_quality(quality: String, state: tauri::State<AppState>) -> Result<(
     settings.audio_quality = quality;
     save_settings(&settings);
     Ok(())
+}
+
+#[tauri::command]
+fn set_cache_limit(limit_mb: u64, state: tauri::State<AppState>) {
+    {
+        let mut settings = state.settings.lock();
+        settings.cache_limit_mb = limit_mb;
+        save_settings(&settings);
+    }
+    // Free the space right away instead of waiting for the next sweep.
+    run_cache_eviction(&state);
 }
 
 #[tauri::command]
@@ -2029,6 +2094,7 @@ fn main() {
         .setup(move |app| {
             spawn_queue_watcher(app.handle().clone());
             spawn_session_bootstrap(app.handle().clone());
+            spawn_cache_sweeper(app.handle().clone());
             if let Some(dir) = initial_dir {
                 let handle = app.handle().clone();
                 std::thread::Builder::new()
@@ -2090,6 +2156,7 @@ fn main() {
             get_settings,
             set_audio_quality,
             set_streaming_account,
+            set_cache_limit,
             set_normalize_level,
             set_volume_curve,
             clear_cache,

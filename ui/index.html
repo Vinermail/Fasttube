@@ -139,6 +139,20 @@
             Off by default. Streaming with your cookies lets yt-dlp act as your
             account; YouTube may then rate-limit or flag it.
           </p>
+          <label class="quality-opt">
+            Download cache limit
+            <select id="opt-cache-limit">
+              <option value="1024">1 GB</option>
+              <option value="2048">2 GB</option>
+              <option value="5120">5 GB</option>
+              <option value="10240">10 GB</option>
+              <option value="0">Unlimited</option>
+            </select>
+          </label>
+          <p class="hint">
+            When the cache grows past the limit, the least recently played
+            tracks are deleted first. The current track is never removed.
+          </p>
         </section>
 
         <section class="settings-section">

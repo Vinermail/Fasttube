@@ -149,6 +149,106 @@ pub fn cached_meta(video_id: &str, quality: &str) -> PathBuf {
     cache_dir().join(format!("{}.{quality}.json", safe_id(video_id)))
 }
 
+// ------------------------------------------------------------ cache eviction
+
+/// One cached audio file as the eviction sees it.
+#[derive(Debug)]
+pub struct CacheEntry {
+    pub path: PathBuf,
+    pub size: u64,
+    /// Last use: the mtime, which [`touch`] refreshes whenever a track starts
+    /// playing. Windows does not update atime reliably, so mtime is the clock.
+    pub used: std::time::SystemTime,
+}
+
+/// Marks a cached track as just used, so eviction treats it as the newest.
+pub fn touch(path: &Path) {
+    // A read handle cannot update the timestamp on Windows (SetFileTime needs
+    // FILE_WRITE_ATTRIBUTES), so the file is opened for writing.
+    if let Ok(file) = std::fs::OpenOptions::new().write(true).open(path) {
+        let _ = file.set_modified(std::time::SystemTime::now());
+    }
+}
+
+/// All audio files in the cache (covers and in-flight `.part` files excluded).
+fn cache_entries() -> Vec<CacheEntry> {
+    cache_entries_in(&cache_dir())
+}
+
+fn cache_entries_in(dir: &Path) -> Vec<CacheEntry> {
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut entries = Vec::new();
+    for item in read.flatten() {
+        let path = item.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("m4a") {
+            continue;
+        }
+        let Ok(meta) = item.metadata() else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        entries.push(CacheEntry {
+            path,
+            size: meta.len(),
+            used: meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+        });
+    }
+    entries
+}
+
+/// Total audio size of the download cache.
+pub fn cache_size() -> u64 {
+    cache_entries().iter().map(|e| e.size).sum()
+}
+
+/// Deletes the least recently used tracks until the cache fits `limit_bytes`
+/// (`0` = no limit). Paths in `keep` (playing right now, being downloaded) are
+/// never touched. Returns how many files went and how many bytes were freed.
+pub fn evict_cache(limit_bytes: u64, keep: &[PathBuf]) -> (usize, u64) {
+    evict_cache_in(&cache_dir(), limit_bytes, keep)
+}
+
+fn evict_cache_in(dir: &Path, limit_bytes: u64, keep: &[PathBuf]) -> (usize, u64) {
+    if limit_bytes == 0 {
+        return (0, 0);
+    }
+    let mut entries = cache_entries_in(dir);
+    let mut total: u64 = entries.iter().map(|e| e.size).sum();
+    if total <= limit_bytes {
+        return (0, 0);
+    }
+    entries.sort_by_key(|e| e.used);
+
+    let mut removed = 0;
+    let mut freed = 0;
+    for entry in entries {
+        if total <= limit_bytes {
+            break;
+        }
+        if keep.iter().any(|k| k == &entry.path) {
+            continue;
+        }
+        // The title sidecar belongs to this file; drop it together so it does
+        // not resurrect as an orphan.
+        let meta = entry.path.with_extension("json");
+        match std::fs::remove_file(&entry.path) {
+            Ok(()) => {
+                let _ = std::fs::remove_file(&meta);
+                total = total.saturating_sub(entry.size);
+                removed += 1;
+                freed += entry.size;
+            }
+            // Locked by a reader (or already gone): leave it for the next sweep.
+            Err(_) => continue,
+        }
+    }
+    (removed, freed)
+}
+
 /// Downloads `url` to `dest`, publishing progress via `handle`.
 /// Requires the caller to hold a tokio runtime context.
 ///
@@ -358,6 +458,88 @@ mod tests {
         assert_eq!(got, current);
         assert_eq!(std::fs::read(&got).unwrap(), b"new");
         assert!(legacy.exists(), "legacy file must not be deleted");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn write_cached(dir: &Path, name: &str, size: usize, age_secs: u64) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, vec![b'x'; size]).unwrap();
+        let when = std::time::SystemTime::now() - std::time::Duration::from_secs(age_secs);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(when)
+            .unwrap();
+        path
+    }
+
+    #[test]
+    fn eviction_drops_the_least_recently_used_first() {
+        let dir = temp_dir("evict-order");
+        let old = write_cached(&dir, "aaaaaaaaaaa.standard.m4a", 1000, 300);
+        let mid = write_cached(&dir, "bbbbbbbbbbb.standard.m4a", 1000, 200);
+        let fresh = write_cached(&dir, "ccccccccccc.standard.m4a", 1000, 10);
+
+        let (removed, freed) = evict_cache_in(&dir, 2000, &[]);
+
+        assert_eq!((removed, freed), (1, 1000));
+        assert!(!old.exists(), "oldest entry must go");
+        assert!(mid.exists() && fresh.exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn eviction_keeps_the_playing_track_even_if_it_is_the_oldest() {
+        let dir = temp_dir("evict-keep");
+        let playing = write_cached(&dir, "ddddddddddd.standard.m4a", 1000, 500);
+        let old = write_cached(&dir, "eeeeeeeeeee.standard.m4a", 1000, 400);
+        let fresh = write_cached(&dir, "fffffffffff.standard.m4a", 1000, 5);
+
+        let (removed, _) = evict_cache_in(&dir, 1000, std::slice::from_ref(&playing));
+
+        assert_eq!(removed, 2);
+        assert!(playing.exists(), "the playing file must survive");
+        assert!(!old.exists() && !fresh.exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn eviction_removes_the_title_sidecar_with_the_audio() {
+        let dir = temp_dir("evict-meta");
+        let audio = write_cached(&dir, "ggggggggggg.standard.m4a", 1000, 100);
+        let meta = dir.join("ggggggggggg.standard.json");
+        std::fs::write(&meta, b"{}").unwrap();
+
+        let (removed, _) = evict_cache_in(&dir, 500, &[]);
+
+        assert_eq!(removed, 1);
+        assert!(!audio.exists() && !meta.exists(), "both files must go");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn zero_limit_means_unlimited() {
+        let dir = temp_dir("evict-unlimited");
+        let a = write_cached(&dir, "hhhhhhhhhhh.standard.m4a", 5000, 100);
+
+        assert_eq!(evict_cache_in(&dir, 0, &[]), (0, 0));
+        assert!(a.exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn entries_skip_covers_and_partial_downloads() {
+        let dir = temp_dir("evict-scan");
+        write_cached(&dir, "iiiiiiiiiii.standard.m4a", 10, 5);
+        std::fs::write(dir.join("iiiiiiiiiii.standard.m4a.part"), b"partial").unwrap();
+        std::fs::create_dir_all(dir.join("covers")).unwrap();
+        std::fs::write(dir.join("covers").join("iiiiiiiiiii.jpg"), b"jpg").unwrap();
+
+        let entries = cache_entries_in(&dir);
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].size, 10);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

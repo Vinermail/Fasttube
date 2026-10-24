@@ -570,10 +570,18 @@ async function loadSettings() {
     if (curve) curve.checked = !!s.volume_curve;
     const streaming = $("opt-streaming-account");
     if (streaming) streaming.checked = !!s.streaming_account;
+    const limit = $("opt-cache-limit");
+    if (limit) limit.value = String(s.cache_limit_mb ?? 2048);
   } catch (e) {
     showError(e);
   }
 }
+
+$("opt-cache-limit").addEventListener("change", (e) => {
+  invoke("set_cache_limit", { limitMb: Number(e.target.value) }).catch((err) =>
+    showError(err),
+  );
+});
 
 $("opt-streaming-account").addEventListener("change", (e) => {
   invoke("set_streaming_account", { enabled: e.target.checked }).catch((err) => showError(err));
