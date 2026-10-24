@@ -112,6 +112,11 @@ message SetBrowserAuthResponse {
   string error = 2;
 }
 
+message ClearAuthResponse {
+  bool ok = 1;
+  string error = 2;
+}
+
 message LyricsRequest {
   string artist = 1;
   string title = 2;
@@ -138,4 +143,5 @@ service PlayerApi {
   rpc StartOAuth(StartOAuthRequest) returns (StartOAuthResponse);
   rpc PollOAuth(Empty) returns (PollOAuthResponse);
   rpc SetBrowserAuth(SetBrowserAuthRequest) returns (SetBrowserAuthResponse);
+  rpc ClearAuth(Empty) returns (ClearAuthResponse);
 }

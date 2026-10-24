@@ -94,6 +94,11 @@ class PlayerApiStub:
                 request_serializer=player__api__pb2.SetBrowserAuthRequest.SerializeToString,
                 response_deserializer=player__api__pb2.SetBrowserAuthResponse.FromString,
                 _registered_method=True)
+        self.ClearAuth = channel.unary_unary(
+                '/player.PlayerApi/ClearAuth',
+                request_serializer=player__api__pb2.Empty.SerializeToString,
+                response_deserializer=player__api__pb2.ClearAuthResponse.FromString,
+                _registered_method=True)
 
 
 class PlayerApiServicer:
@@ -171,6 +176,12 @@ class PlayerApiServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def ClearAuth(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_PlayerApiServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -233,6 +244,11 @@ def add_PlayerApiServicer_to_server(servicer, server):
                     servicer.SetBrowserAuth,
                     request_deserializer=player__api__pb2.SetBrowserAuthRequest.FromString,
                     response_serializer=player__api__pb2.SetBrowserAuthResponse.SerializeToString,
+            ),
+            'ClearAuth': grpc.unary_unary_rpc_method_handler(
+                    servicer.ClearAuth,
+                    request_deserializer=player__api__pb2.Empty.FromString,
+                    response_serializer=player__api__pb2.ClearAuthResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -569,3 +585,29 @@ class PlayerApi:
             metadata,
             _registered_method=True)
 
+    @staticmethod
+    def ClearAuth(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/player.PlayerApi/ClearAuth',
+            player__api__pb2.Empty.SerializeToString,
+            player__api__pb2.ClearAuthResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)

@@ -504,6 +504,18 @@ $("yt-browser-auth-btn").onclick = async () => {
   }
 };
 
+$("yt-logout-btn").onclick = async () => {
+  try {
+    await invoke("logout");
+    hideError();
+    setAuthStatus("Not signed in", false);
+    currentYtTracks = [];
+    $("yt-user-playlists").innerHTML = "";
+  } catch (e) {
+    showError(e);
+  }
+};
+
 /* ---------- audio quality ---------- */
 
 async function loadSettings() {
@@ -1019,7 +1031,7 @@ async function loadLyricsForCurrent() {
       });
     } else {
       lyricsLines = [];
-      body.innerHTML = `<div class="lyrics-empty">${r.error || "No lyrics found for this track"}</div>`;
+      body.innerHTML = `<div class="lyrics-empty">${escapeHtml(r.error || "No lyrics found for this track")}</div>`;
     }
   } catch (e) {
     lyricsLines = [];

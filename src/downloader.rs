@@ -95,12 +95,55 @@ fn safe_id(video_id: &str) -> String {
         .collect()
 }
 
-pub fn cached_file(video_id: &str) -> PathBuf {
-    cache_dir().join(format!("{}.m4a", safe_id(video_id)))
+/// Quality tag used by the on-disk cache layout.
+pub const QUALITY_STANDARD: &str = "standard";
+pub const QUALITY_HIGH: &str = "high";
+
+/// Cache keys are baked into file names, so only known qualities are allowed;
+/// anything else falls back to `standard` instead of escaping the directory.
+fn safe_quality(quality: &str) -> &str {
+    match quality {
+        QUALITY_HIGH => QUALITY_HIGH,
+        _ => QUALITY_STANDARD,
+    }
 }
 
-pub fn cached_meta(video_id: &str) -> PathBuf {
-    cache_dir().join(format!("{}.json", safe_id(video_id)))
+/// Renames a pre-quality cache file (`<id>.<ext>`) to its `standard` form.
+/// Those files were always downloaded at standard quality, so they belong to
+/// that bucket. Best-effort: a failed rename just means a re-download.
+fn migrate_legacy_cache_file(video_id: &str, ext: &str) -> PathBuf {
+    let id = safe_id(video_id);
+    let dir = cache_dir();
+    let current = dir.join(format!("{id}.{QUALITY_STANDARD}.{ext}"));
+    if current.exists() {
+        return current;
+    }
+    let legacy = dir.join(format!("{id}.{ext}"));
+    if legacy.exists() {
+        match std::fs::rename(&legacy, &current) {
+            Ok(()) => eprintln!("[cache] migrated {} -> {}", legacy.display(), current.display()),
+            Err(e) => eprintln!("[cache] failed to migrate {}: {e}", legacy.display()),
+        }
+    }
+    current
+}
+
+/// Audio file for one video at one quality: `<id>.<quality>.m4a`.
+pub fn cached_file(video_id: &str, quality: &str) -> PathBuf {
+    let quality = safe_quality(quality);
+    if quality == QUALITY_STANDARD {
+        return migrate_legacy_cache_file(video_id, "m4a");
+    }
+    cache_dir().join(format!("{}.{quality}.m4a", safe_id(video_id)))
+}
+
+/// Title sidecar matching [`cached_file`]: `<id>.<quality>.json`.
+pub fn cached_meta(video_id: &str, quality: &str) -> PathBuf {
+    let quality = safe_quality(quality);
+    if quality == QUALITY_STANDARD {
+        return migrate_legacy_cache_file(video_id, "json");
+    }
+    cache_dir().join(format!("{}.{quality}.json", safe_id(video_id)))
 }
 
 /// Downloads `url` to `dest`, publishing progress via `handle`.
@@ -233,6 +276,43 @@ async fn parallel_download(
 struct CountingSink {
     inner: tokio::fs::File,
     bytes: Arc<AtomicU64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Fake id, never a real video: keeps the test away from user cache files.
+    const ID: &str = "testVid0001";
+
+    #[test]
+    fn cache_paths_are_quality_scoped() {
+        let high = cached_file(ID, "high");
+        assert_eq!(
+            high.file_name().unwrap().to_string_lossy(),
+            "testVid0001.high.m4a"
+        );
+        let meta = cached_meta(ID, "high");
+        assert_eq!(
+            meta.file_name().unwrap().to_string_lossy(),
+            "testVid0001.high.json"
+        );
+        let standard = cached_file(ID, QUALITY_STANDARD);
+        assert_eq!(
+            standard.file_name().unwrap().to_string_lossy(),
+            "testVid0001.standard.m4a"
+        );
+    }
+
+    #[test]
+    fn unknown_quality_falls_back_and_cannot_escape_cache_dir() {
+        let path = cached_file(ID, "../../evil");
+        assert_eq!(
+            path.file_name().unwrap().to_string_lossy(),
+            "testVid0001.standard.m4a"
+        );
+        assert_eq!(path.parent().unwrap(), cache_dir());
+    }
 }
 
 impl tokio::io::AsyncWrite for CountingSink {

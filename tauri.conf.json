@@ -20,10 +20,10 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' asset: https: data:; connect-src ipc: http://ipc.localhost; font-src 'self'",
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' asset: http://asset.localhost https: data:; connect-src ipc: http://ipc.localhost; font-src 'self'",
       "assetProtocol": {
         "enable": true,
-        "scope": ["$LOCALAPPDATA/fasttube/**"]
+        "scope": ["$LOCALDATA/fasttube/cache/**"]
       }
     }
   },

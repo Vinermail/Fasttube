@@ -10,7 +10,7 @@ pub mod proto {
 }
 
 pub use proto::{
-    Empty, HealthResponse, LyricsRequest, LyricsResponse, PlaylistTracksRequest,
+    ClearAuthResponse, Empty, HealthResponse, LyricsRequest, LyricsResponse, PlaylistTracksRequest,
     PlaylistTracksResponse, PollOAuthResponse, PrefetchResolveRequest, RecommendRequest,
     ResolveRequest, ResolveResponse, SearchRequest, SetBrowserAuthRequest, SetBrowserAuthResponse,
     StartOAuthRequest, StartOAuthResponse, Track, UserPlaylistsResponse,
@@ -140,6 +140,12 @@ pub async fn set_browser_auth(auth_text: &str) -> Result<SetBrowserAuthResponse>
             auth_text: auth_text.to_string(),
         }))
         .await?;
+    Ok(resp.into_inner())
+}
+
+pub async fn clear_auth() -> Result<ClearAuthResponse> {
+    let mut client = connect().await?;
+    let resp = client.clear_auth(tonic::Request::new(Empty {})).await?;
     Ok(resp.into_inner())
 }
 

@@ -187,6 +187,13 @@ class PlayerApiServicer(player_api_pb2_grpc.PlayerApiServicer):
             error=result.get("error", ""),
         )
 
+    def ClearAuth(self, request, context):
+        result = youtube.clear_auth()
+        return player_api_pb2.ClearAuthResponse(
+            ok=result.get("ok", False),
+            error=result.get("error", ""),
+        )
+
 
 def serve():
     logging.basicConfig(level=logging.INFO)

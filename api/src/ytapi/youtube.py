@@ -87,9 +87,23 @@ def _cached_lib(key: str, ttl: int, loader):
     if hit and time.time() - hit[0] < ttl:
         return hit[1]
     data = loader()
+    # Never cache a failure: a transient error (network blip, expired cookies)
+    # would otherwise be served for the whole TTL, long after it recovered.
+    if isinstance(data, dict) and data.get("error"):
+        return data
     with _lib_lock:
         _LIB_CACHE[key] = (time.time(), data)
     return data
+
+
+def invalidate_account_caches() -> None:
+    """Drop per-account library data (playlists, likes) after a session change.
+
+    Must be called on login and logout: cached lists belong to the account
+    that was signed in when they were fetched.
+    """
+    with _lib_lock:
+        _LIB_CACHE.clear()
 
 
 _load_resolve_cache()
@@ -562,6 +576,30 @@ def has_auth() -> bool:
     return os.path.exists(BROWSER_FILE) or os.path.exists(OAUTH_FILE)
 
 
+def clear_auth() -> dict:
+    """Delete all stored auth (browser cookies and OAuth) and invalidate
+    in-memory caches tied to the account."""
+    removed = []
+    for path in (BROWSER_FILE, OAUTH_FILE, OAUTH_CREDS_FILE):
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+                removed.append(os.path.basename(path))
+        except Exception:
+            log.exception("failed to remove %s", path)
+            return {"ok": False, "error": f"failed to remove {os.path.basename(path)}"}
+    invalidate_account_caches()
+    with _resolve_lock:
+        _RESOLVE_CACHE.clear()
+        try:
+            if os.path.exists(_RESOLVE_CACHE_FILE):
+                os.remove(_RESOLVE_CACHE_FILE)
+        except Exception:
+            log.exception("failed to remove resolve cache")
+    log.info("auth cleared: %s", ", ".join(removed) if removed else "nothing to remove")
+    return {"ok": True, "error": ""}
+
+
 def set_browser_auth(auth_text: str) -> dict:
     """Parse request headers pasted from the browser (DevTools copy) and
     store them for browser-based auth."""
@@ -570,6 +608,7 @@ def set_browser_auth(auth_text: str) -> dict:
     normalized = _normalize_auth_text(auth_text)
     try:
         setup_browser(BROWSER_FILE, headers_raw=normalized)
+        invalidate_account_caches()
         return {"ok": True, "error": ""}
     except Exception as e:
         log.exception("set_browser_auth failed")
@@ -825,6 +864,7 @@ def poll_oauth() -> dict:
             with _oauth_lock:
                 _oauth_credentials = None
                 _oauth_device_code = None
+            invalidate_account_caches()
             return {"done": True, "error": ""}
         if raw.get("error") not in ("authorization_pending", "slow_down"):
             return {"done": False, "error": raw.get("error_description", raw.get("error", "oauth error"))}

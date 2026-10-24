@@ -744,6 +744,15 @@ async fn set_browser_auth(
 }
 
 #[tauri::command]
+async fn logout(_state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let resp = grpc::clear_auth().await.map_err(|e| e.to_string())?;
+    if !resp.ok {
+        return Err(resp.error);
+    }
+    Ok(())
+}
+
+#[tauri::command]
 async fn get_user_playlists(
     _state: tauri::State<'_, AppState>,
 ) -> Result<Vec<UserPlaylistInfo>, String> {
@@ -817,9 +826,9 @@ async fn play_video(
 }
 
 async fn play_video_inner(id: &str, state: &AppState) -> Result<PlaylistInfo, String> {
-    let dest = downloader::cached_file(id);
-    let meta = downloader::cached_meta(id);
     let quality = current_quality(state);
+    let dest = downloader::cached_file(id, &quality);
+    let meta = downloader::cached_meta(id, &quality);
 
     let title = if dest.exists() {
         if let Some(t) = read_cached_title(&meta) {
@@ -894,7 +903,8 @@ async fn play_current(state: &AppState) -> Result<(), String> {
             .ok_or_else(|| "queue is empty".to_string())?
     };
 
-    let dest = downloader::cached_file(&item.id);
+    let quality = current_quality(state);
+    let dest = downloader::cached_file(&item.id, &quality);
     if !dest.exists() {
         // Claim this id so a concurrent prefetch cannot write the same file.
         let claimed = {
@@ -1019,7 +1029,7 @@ async fn play_current_download(
         }
     }
 
-    let meta = downloader::cached_meta(&item.id);
+    let meta = downloader::cached_meta(&item.id, &quality);
     let _ = std::fs::write(&meta, &item.title);
     Ok(())
 }
@@ -1054,7 +1064,7 @@ async fn ensure_cached(
     fetching: &FetchGuard,
     quality: &str,
 ) -> Result<(), String> {
-    let dest = downloader::cached_file(&item.id);
+    let dest = downloader::cached_file(&item.id, quality);
     if dest.exists() {
         return Ok(());
     }
@@ -1086,7 +1096,7 @@ async fn ensure_cached(
                 return Err(first_err.to_string());
             }
         }
-        let meta = downloader::cached_meta(&item.id);
+        let meta = downloader::cached_meta(&item.id, quality);
         let _ = std::fs::write(&meta, &item.title);
         Ok(())
     }
@@ -1188,7 +1198,7 @@ fn set_normalize_level(level: String, state: tauri::State<AppState>) -> Result<(
             && q.active
             && let Some(item) = q.items.get(q.current)
         {
-            paths.push(downloader::cached_file(&item.id));
+            paths.push(downloader::cached_file(&item.id, &current_quality(&state)));
         }
         spawn_loudness_scan(
             paths,
@@ -1794,6 +1804,7 @@ fn main() {
             start_oauth,
             poll_oauth,
             set_browser_auth,
+            logout,
             play_video,
             play_queue,
             prefetch_tracks,
