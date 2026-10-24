@@ -1,6 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod auth_window;
+mod browser;
 mod downloader;
 mod engine;
 mod fsutil;
@@ -975,14 +975,19 @@ async fn ensure_session_fresh(app: &tauri::AppHandle, state: &AppState) {
     }
 }
 
+/// Opens the YouTube Music sign-in page in the user's default browser.
+///
+/// The app cannot read cookies out of a browser profile it does not
+/// control, so this only starts the human part of the flow; the session
+/// arrives through `yt_login_advanced` below, pasted from DevTools.
 #[tauri::command]
-async fn yt_login_start(app: tauri::AppHandle) -> Result<(), String> {
-    auth_window::open(&app)
+fn yt_open_login_page() -> Result<(), String> {
+    browser::open("https://accounts.google.com/ServiceLogin?service=youtube&continue=https%3A%2F%2Fmusic.youtube.com%2F")
 }
 
-/// Advanced fallback (3.5): paste request headers from a real browser. Parsed
-/// by the sidecar with the same normaliser the old flow used, then stored via
-/// the encrypted bundle — no cookie file anywhere.
+/// Takes the request headers copied from the browser, normalises them on the
+/// sidecar and installs the session. The headers go straight into
+/// `secrets::AuthBundle` — no cookie file anywhere.
 #[tauri::command]
 async fn yt_login_advanced(
     auth_text: String,
@@ -2014,7 +2019,7 @@ fn main() {
             get_user_playlists,
             get_playlist_tracks,
             get_liked_songs,
-            yt_login_start,
+            yt_open_login_page,
             yt_login_advanced,
             logout,
             play_video,

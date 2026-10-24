@@ -33,4 +33,4 @@ tonic-prost-build = "0.14"
 
 [target.'cfg(windows)'.dependencies]
 # DPAPI for the encrypted auth bundle (src/secrets.rs).
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }

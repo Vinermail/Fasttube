@@ -172,24 +172,15 @@
           <button id="yt-signin-btn" class="btn primary">Sign in</button>
           <button id="yt-logout-btn" class="btn">Sign out</button>
           <p class="hint">
-            Opens a separate window on music.youtube.com. The app reads the
-            session cookies itself and keeps them encrypted; no plain-text
-            cookie file is written.
+            Signing in opens music.youtube.com in your default browser. You log
+            in there; the app then asks once for the request headers and keeps
+            the session encrypted with Windows DPAPI. Your password never
+            reaches the app and no cookie file is written.
           </p>
           <p id="yt-logout-note" class="hint hidden">
             Signed out locally. To revoke the session on Google's side:
             Account &rarr; Security &rarr; Your devices.
           </p>
-          <details id="yt-advanced">
-            <summary class="hint">Advanced: paste request headers</summary>
-            <textarea id="yt-auth-headers" placeholder="Paste request headers (or cURL) for https://music.youtube.com/youtubei/v1/browse"></textarea>
-            <button id="yt-advanced-btn" class="btn">Use these headers</button>
-            <p class="hint">
-              Fallback if Google refuses the embedded sign-in window.
-              DevTools &rarr; Network &rarr; the <code>browse</code> request &rarr;
-              Copy request headers.
-            </p>
-          </details>
         </section>
       </div>
     </div>
@@ -244,6 +235,40 @@
       <button id="queue-close" class="tbtn small-t">✕</button>
     </div>
     <div id="queue-list" class="queue-list"></div>
+  </div>
+
+  <div id="yt-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="yt-modal-title">
+    <div class="modal-card" role="document">
+      <h2 id="yt-modal-title">Sign in to YouTube Music</h2>
+      <ol class="modal-steps">
+        <li>
+          Open <b>music.youtube.com</b> in your browser and log in with the
+          account you want the app to use.
+        </li>
+        <li>
+          In the browser press <kbd>F12</kbd> &rarr; <b>Network</b>, reload the
+          page, click the <code>browse</code> request (filter by
+          <code>youtubei/v1/browse</code> if the list is long).
+        </li>
+        <li>
+          Right-click it &rarr; <b>Copy</b> &rarr; <b>Copy request headers</b>,
+          then paste the whole block below.
+        </li>
+      </ol>
+      <div class="modal-actions">
+        <button id="yt-modal-open" class="btn primary">Open music.youtube.com</button>
+      </div>
+      <textarea id="yt-modal-paste" spellcheck="false" placeholder="Paste the request headers here — they carry your session cookies"></textarea>
+      <p id="yt-modal-error" class="modal-error hidden"></p>
+      <p class="hint">
+        The headers are parsed by the local sidecar and stored only in the
+        encrypted bundle. Nothing is written to the repo or to this app's log.
+      </p>
+      <div class="modal-actions">
+        <button id="yt-modal-connect" class="btn primary">Connect account</button>
+        <button id="yt-modal-close" class="btn">Cancel</button>
+      </div>
+    </div>
   </div>
 
   <script src="main.js"></script>

@@ -451,30 +451,75 @@ function setAuthStatus(text, ok) {
   el.className = "auth-status" + (ok === true ? " ok" : ok === false ? " no" : "");
 }
 
-$("yt-signin-btn").onclick = async () => {
+/* ---------- sign-in modal: browser for the login, headers to connect ---------- */
+
+let ytModalReturnFocus = null;
+
+function openYtModal() {
+  ytModalReturnFocus = document.activeElement;
+  $("yt-modal-error").classList.add("hidden");
+  $("yt-modal").classList.remove("hidden");
+  $("yt-modal-paste").focus();
+}
+
+function closeYtModal() {
+  $("yt-modal").classList.add("hidden");
+  // The pasted headers are a secret: never leave them in the DOM.
+  $("yt-modal-paste").value = "";
+  $("yt-modal-error").classList.add("hidden");
+  if (ytModalReturnFocus && ytModalReturnFocus.focus) ytModalReturnFocus.focus();
+  ytModalReturnFocus = null;
+}
+
+function ytModalError(message) {
+  const box = $("yt-modal-error");
+  box.textContent = String(message || "Something went wrong");
+  box.classList.remove("hidden");
+}
+
+$("yt-signin-btn").onclick = () => {
+  hideError();
+  openYtModal();
+};
+
+$("yt-modal-close").onclick = () => closeYtModal();
+
+$("yt-modal").addEventListener("click", (e) => {
+  // Click on the dimmed backdrop (not inside the card) closes the dialog.
+  if (e.target === $("yt-modal")) closeYtModal();
+});
+
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && !$("yt-modal").classList.contains("hidden")) {
+    closeYtModal();
+  }
+});
+
+$("yt-modal-open").onclick = async () => {
   try {
-    hideError();
-    await invoke("yt_login_start");
-    setAuthStatus("Waiting for sign-in in the window...", null);
+    await invoke("yt_open_login_page");
   } catch (e) {
-    showError(e);
+    ytModalError(e);
   }
 };
 
-$("yt-advanced-btn").onclick = async () => {
-  const text = $("yt-auth-headers").value.trim();
+$("yt-modal-connect").onclick = async () => {
+  const text = $("yt-modal-paste").value.trim();
   if (!text) {
-    showError("Paste the request headers first");
+    ytModalError("Paste the request headers first");
     return;
   }
   try {
-    hideError();
     const info = await invoke("yt_login_advanced", { authText: text });
-    $("yt-auth-headers").value = "";
+    // Drop the secret from the field before anything else can touch it.
+    $("yt-modal-paste").value = "";
+    closeYtModal();
     applySessionInfo(info);
     refresh();
   } catch (e) {
-    showError(e);
+    // The sidecar's rejection is the useful part, so show it inside the modal.
+    $("yt-modal-paste").value = "";
+    ytModalError(e);
   }
 };
 
@@ -512,7 +557,7 @@ function hideAuthBanner() {
 }
 
 $("auth-banner-login").onclick = () => {
-  invoke("yt_login_start").catch(showError);
+  openYtModal();
 };
 
 $("auth-banner-close").onclick = () => {
