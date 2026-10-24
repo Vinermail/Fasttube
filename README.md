@@ -26,7 +26,7 @@
 **Прочее**
 - Синхронизированные тексты песен (lrclib.net) с подсветкой
 - Панель очереди (переход, удаление, очистка)
-- Два источника YouTube: OAuth (device flow) и browser-auth (куки)
+- Два источника YouTube: вход через изолированное окно и ручная вставка заголовков (Advanced)
 
 ## Архитектура
 
@@ -85,25 +85,37 @@ sed -i 's/^import player_api_pb2 as player__api__pb2$/from . import player_api_p
 
 ## Авторизация YouTube
 
-**Browser-auth (рекомендуется, работает сейчас):**
-1. Открой `music.youtube.com` в браузере, залогинься
-2. F12 → Network → обнови страницу → найди запрос `https://music.youtube.com/youtubei/v1/browse`
-3. ПКМ → Copy → Copy request headers (или Copy as cURL)
-4. В приложении: ⚙ Settings → YouTube account → вставь → Use browser auth
+**Вход через отдельное окно (основной путь):**
+1. ⚙ Settings → YouTube account → **Sign in**
+2. Откроется изолированное окно на `music.youtube.com` (incognito, временный
+   профиль, без Tauri-команд) — войди в Google как обычно
+3. Приложение само прочитает куки окна (нужен непустой `__Secure-3PAPISID`),
+   закроет окно и сотрёт его профиль
+4. Куки шифруются Windows DPAPI в `%LOCALAPPDATA%\fasttube\auth.bin`; сайдкар
+   получает их по gRPC `SetSession` и держит **только в памяти**
 
-Куки живут пару недель, потом повторить.
+Сессия проверяется при старте, каждые 15 минут и перед загрузкой библиотеки.
+Если YouTube её отозвал — баннер «Your YouTube session expired» с кнопкой входа,
+библиотека не выдаётся за актуальную.
 
-**OAuth (device flow):**
-1. Google Cloud Console → проект → включи YouTube Data API v3
-2. Credentials → OAuth client ID → тип **«TVs and Limited Input devices»**
-3. В приложении вставь Client ID/Secret → Start Google login → открой ссылку → подтверди
+**Advanced (если Google не пускает вход во встроенном webview):**
+F12 → Network → обнови `https://music.youtube.com/youtubei/v1/browse` →
+Copy request headers → вставь в Settings → **Use these headers**. Это тот же путь
+(parse → `AuthBundle` → `SetSession`), на Python-стороне ничего не пишется в файл.
 
-> ⚠️ OAuth-эндпоинты ytmusicapi сейчас частично сломаны на стороне Google
-> ([issue #813](https://github.com/sigma67/ytmusicapi/issues/813)) — потому и нужен browser-auth.
+**Выход:** *Sign out* завершает сессию в сайдкаре и удаляет `auth.bin`.
+Полностью отозвать сессию можно только на стороне Google:
+Account → Security → Your devices.
+
+**Стриминг с аккаунтом:** Settings → *Use the account for streaming*
+(по умолчанию **выкл**). Включает подстановку куков из памяти в `ydl.cookiejar`:
+Premium-битрейт и контент с возрастными ограничениями, но yt-dlp действует как
+твой аккаунт — есть риск ограничений. Когда выключено, резолв анонимный.
 
 ## Настройки
 
 - **Audio quality**: Standard (AAC 128kbps) / High (до 256+ kbps с Premium)
+- **Use the account for streaming**: куки для yt-dlp (по умолчанию выкл)
 - **Normalization level**: Off / Light / Medium / Strong (целевая громкость)
 - **Sleep timer**, **Clear download cache**
 
@@ -120,11 +132,14 @@ sed -i 's/^import player_api_pb2 as player__api__pb2$/from . import player_api_p
 
 Всё хранится в `%LOCALAPPDATA%\fasttube\`:
 
-- `cache/` — скачанные треки (`<video_id>.m4a`) и обложки
+- `cache/` — скачанные треки (`<video_id>.<quality>.m4a`, старые `<video_id>.m4a`
+  считаются `standard` и переименовываются при первом обращении) и обложки
 - `settings.json`, `history.json`, `favorites.json`, `loudness.json`
 - При первом запуске данные из `player_llm\` (прежнее имя) мигрируют автоматически
 
-Секреты авторизации (`api/oauth.json`, `api/browser.json`, `api/oauth_creds.json`) **не коммитятся** (см. `.gitignore`).
+Секреты авторизации в репозитории не хранятся: куки лежат только в
+`auth.bin` (DPAPI, вне репозитория). Старый `api/browser.json` при первом
+запуске импортируется и удаляется; если его сессия уже протухла — просто удаляется.
 
 ## Сеть и прокси
 
