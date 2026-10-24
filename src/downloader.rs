@@ -18,7 +18,7 @@ pub struct ProgressHandle {
     pub bytes: Arc<AtomicU64>,
     pub total: Arc<AtomicU64>,
     pub done: Arc<std::sync::atomic::AtomicBool>,
-    pub title: Arc<std::sync::Mutex<String>>,
+    pub title: Arc<parking_lot::Mutex<String>>,
 }
 
 impl ProgressHandle {
@@ -27,7 +27,7 @@ impl ProgressHandle {
             bytes: self.bytes.load(Ordering::Relaxed),
             total: self.total.load(Ordering::Relaxed),
             done: self.done.load(Ordering::Relaxed),
-            title: self.title.lock().unwrap().clone(),
+            title: self.title.lock().clone(),
         }
     }
 }

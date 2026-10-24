@@ -2,7 +2,8 @@ use crate::playlist::Playlist;
 use rodio::{Decoder, DeviceSinkBuilder, Player, Source, source::Zero};
 use serde::Serialize;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
-use std::sync::{Arc, RwLock};
+use parking_lot::RwLock;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const BUFFER_FRAMES: u32 = 2048;
@@ -85,7 +86,7 @@ impl EngineHandle {
     }
 
     pub fn snapshot(&self) -> Option<Snapshot> {
-        self.snapshot.read().ok().and_then(|s| s.clone())
+        self.snapshot.read().clone()
     }
 }
 
@@ -523,9 +524,7 @@ fn run(rx: Receiver<Cmd>, snapshot: Arc<RwLock<Option<Snapshot>>>) {
         if let Some(e) = engine.as_ref() {
             let due = e.dirty || last_publish.elapsed() >= Duration::from_millis(100);
             if due {
-                if let Ok(mut w) = snapshot.write() {
-                    *w = Some(e.snapshot());
-                }
+                *snapshot.write() = Some(e.snapshot());
                 last_publish = Instant::now();
             }
         }

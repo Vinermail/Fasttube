@@ -15,7 +15,8 @@ use engine::{Cmd, EngineHandle, Snapshot};
 use playlist::{Playlist, Track};
 use serde::{Deserialize, Serialize};
 use sidecar::{ApiStatus, SharedApiStatus};
-use std::sync::{Arc, Mutex, RwLock};
+use parking_lot::{Mutex, RwLock};
+use std::sync::Arc;
 use tauri::{Emitter, Manager};
 
 #[derive(Serialize, Clone)]
@@ -115,12 +116,12 @@ fn save_settings(settings: &Settings) {
 }
 
 fn current_quality(state: &AppState) -> String {
-    state.settings.lock().unwrap().audio_quality.clone()
+    state.settings.lock().audio_quality.clone()
 }
 
 /// Whether stream resolution may use the signed-in account (opt-in).
 fn streaming_account(state: &AppState) -> bool {
-    state.settings.lock().unwrap().streaming_account
+    state.settings.lock().streaming_account
 }
 
 fn history_file() -> std::path::PathBuf {
@@ -191,7 +192,7 @@ fn migrate_loudness_keys(map: &mut std::collections::HashMap<String, f32>) -> bo
 }
 
 fn save_loudness(cache: &LoudnessCache) {
-    let snapshot = cache.lock().unwrap().clone();
+    let snapshot = cache.lock().clone();
     save_json(&loudness_file(), &snapshot);
 }
 
@@ -297,7 +298,7 @@ fn full_replaygain(path: &std::path::Path) -> Option<f32> {
 
 /// Fills `Track.gain` from the loudness cache (when normalization is on).
 fn apply_gains(playlist: &mut Playlist, cache: &LoudnessCache, normalize: bool) {
-    let map = cache.lock().unwrap();
+    let map = cache.lock();
     for track in playlist.tracks.iter_mut() {
         if !normalize {
             track.gain = None;
@@ -336,12 +337,12 @@ fn spawn_loudness_scan(
             .name("loudness-scan".to_string())
             .spawn(move || {
                 loop {
-                    let path = queue.lock().unwrap().pop_front();
+                    let path = queue.lock().pop_front();
                     let Some(path) = path else { break };
                     let key = path.to_string_lossy().into_owned();
                     {
-                        let mut set = in_progress.lock().unwrap();
-                        if cache.lock().unwrap().contains_key(&key) || !set.insert(key.clone()) {
+                        let mut set = in_progress.lock();
+                        if cache.lock().contains_key(&key) || !set.insert(key.clone()) {
                             continue;
                         }
                     }
@@ -349,11 +350,11 @@ fn spawn_loudness_scan(
                         engine.send(Cmd::SetGain(key.clone(), gain));
                     }
                     if let Some(gain) = full_replaygain(&path) {
-                        cache.lock().unwrap().insert(key.clone(), gain);
+                        cache.lock().insert(key.clone(), gain);
                         save_loudness(&cache);
                         engine.send(Cmd::SetGain(key.clone(), gain));
                     }
-                    in_progress.lock().unwrap().remove(&key);
+                    in_progress.lock().remove(&key);
                 }
             })
             .expect("failed to spawn loudness scan");
@@ -374,7 +375,7 @@ fn save_json<T: Serialize>(path: &std::path::Path, value: &T) {
 }
 
 fn record_history(state: &AppState, item: &HistoryItem) {
-    let mut history = state.history.lock().unwrap();
+    let mut history = state.history.lock();
     history.retain(|h| h.id != item.id);
     history.insert(0, item.clone());
     history.truncate(100);
@@ -468,7 +469,7 @@ fn to_playlist_info(pl: &Playlist) -> PlaylistInfo {
 
 #[tauri::command]
 fn get_state(state: tauri::State<AppState>) -> Option<Snapshot> {
-    state.engine.lock().unwrap().snapshot()
+    state.engine.lock().snapshot()
 }
 
 #[tauri::command]
@@ -476,7 +477,6 @@ fn get_track_list(state: tauri::State<AppState>) -> Vec<engine::TrackInfo> {
     state
         .local_current
         .lock()
-        .unwrap()
         .clone()
         .unwrap_or_default()
 }
@@ -486,7 +486,6 @@ fn get_library(state: tauri::State<AppState>) -> Vec<PlaylistInfo> {
     state
         .library
         .lock()
-        .unwrap()
         .iter()
         .map(to_playlist_info)
         .collect()
@@ -510,23 +509,23 @@ async fn open_folder(
     let infos: Vec<PlaylistInfo> = library.iter().map(to_playlist_info).collect();
     let first = library.first().cloned();
     {
-        let mut lib = state.library.lock().unwrap();
+        let mut lib = state.library.lock();
         *lib = library;
     }
     if let Some(pl) = first {
         let track_infos: Vec<engine::TrackInfo> = pl.tracks.iter().map(track_to_info).collect();
-        *state.local_current.lock().unwrap() = Some(track_infos);
+        *state.local_current.lock() = Some(track_infos);
         let mut pl = pl;
-        let normalize = normalize_enabled(&state.settings.lock().unwrap());
+        let normalize = normalize_enabled(&state.settings.lock());
         apply_gains(&mut pl, &state.loudness, normalize);
         let scan_paths: Vec<std::path::PathBuf> =
             pl.tracks.iter().map(|t| t.path.clone()).collect();
-        state.engine.lock().unwrap().send(Cmd::SetPlaylist(pl));
+        state.engine.lock().send(Cmd::SetPlaylist(pl));
         spawn_loudness_scan(
             scan_paths,
             state.loudness.clone(),
-            state.engine.lock().unwrap().clone(),
-            target_rms(&state.settings.lock().unwrap().normalize_level).unwrap_or(0.12),
+            state.engine.lock().clone(),
+            target_rms(&state.settings.lock().normalize_level).unwrap_or(0.12),
         );
     }
     Ok(infos)
@@ -542,25 +541,22 @@ fn open_playlist(
     let pl = state
         .library
         .lock()
-        .unwrap()
         .get(index)
         .cloned()
         .ok_or("playlist not found")?;
     let infos: Vec<engine::TrackInfo> = pl.tracks.iter().map(track_to_info).collect();
-    *state.local_current.lock().unwrap() = Some(infos.clone());
-    if let Ok(mut q) = state.queue.lock() {
-        q.active = false;
-    }
+    *state.local_current.lock() = Some(infos.clone());
+    state.queue.lock().active = false;
     let mut pl = pl;
-    let normalize = normalize_enabled(&state.settings.lock().unwrap());
+    let normalize = normalize_enabled(&state.settings.lock());
     apply_gains(&mut pl, &state.loudness, normalize);
     let scan_paths: Vec<std::path::PathBuf> = pl.tracks.iter().map(|t| t.path.clone()).collect();
-    state.engine.lock().unwrap().send(Cmd::OpenPlaylist(pl));
+    state.engine.lock().send(Cmd::OpenPlaylist(pl));
     spawn_loudness_scan(
         scan_paths,
         state.loudness.clone(),
-        state.engine.lock().unwrap().clone(),
-        target_rms(&state.settings.lock().unwrap().normalize_level).unwrap_or(0.12),
+        state.engine.lock().clone(),
+        target_rms(&state.settings.lock().normalize_level).unwrap_or(0.12),
     );
     Ok(infos)
 }
@@ -569,18 +565,18 @@ fn open_playlist(
 fn play_track(index: usize, state: tauri::State<AppState>) {
     // A local track replaces any active YouTube queue: otherwise the queue
     // watcher would hijack playback when the track ends.
-    if let Ok(mut q) = state.queue.lock()
-        && q.active
     {
-        q.active = false;
-        q.version += 1;
+        let mut q = state.queue.lock();
+        if q.active {
+            q.active = false;
+            q.version += 1;
+        }
     }
     // Prioritize loudness scanning of the clicked track.
-    if normalize_enabled(&state.settings.lock().unwrap())
+    if normalize_enabled(&state.settings.lock())
         && let Some(track) = state
             .local_current
             .lock()
-            .unwrap()
             .as_ref()
             .and_then(|tracks| tracks.get(index))
         && let Some(path) = track.path.as_ref()
@@ -588,16 +584,16 @@ fn play_track(index: usize, state: tauri::State<AppState>) {
         spawn_loudness_scan(
             vec![std::path::PathBuf::from(path)],
             state.loudness.clone(),
-            state.engine.lock().unwrap().clone(),
-            target_rms(&state.settings.lock().unwrap().normalize_level).unwrap_or(0.12),
+            state.engine.lock().clone(),
+            target_rms(&state.settings.lock().normalize_level).unwrap_or(0.12),
         );
     }
-    state.engine.lock().unwrap().send(Cmd::PlayTrack(index));
+    state.engine.lock().send(Cmd::PlayTrack(index));
 }
 
 #[tauri::command]
 fn toggle_pause(state: tauri::State<AppState>) {
-    state.engine.lock().unwrap().send(Cmd::TogglePause);
+    state.engine.lock().send(Cmd::TogglePause);
 }
 
 enum QueueAction {
@@ -606,7 +602,7 @@ enum QueueAction {
 }
 
 fn queue_next(state: &AppState) -> QueueAction {
-    let mut q = state.queue.lock().unwrap();
+    let mut q = state.queue.lock();
     if !q.active {
         return QueueAction::EngineCommand(Cmd::Next);
     }
@@ -623,14 +619,13 @@ fn queue_next(state: &AppState) -> QueueAction {
 }
 
 fn queue_prev(state: &AppState) -> QueueAction {
-    let mut q = state.queue.lock().unwrap();
+    let mut q = state.queue.lock();
     if !q.active {
         return QueueAction::EngineCommand(Cmd::Prev);
     }
     let elapsed = state
         .engine
         .lock()
-        .unwrap()
         .snapshot()
         .map(|s| s.elapsed)
         .unwrap_or(0.0);
@@ -646,7 +641,7 @@ fn queue_prev(state: &AppState) -> QueueAction {
 async fn next_track(state: tauri::State<'_, AppState>) -> Result<(), String> {
     match queue_next(&state) {
         QueueAction::EngineCommand(cmd) => {
-            state.engine.lock().unwrap().send(cmd);
+            state.engine.lock().send(cmd);
             Ok(())
         }
         QueueAction::PlayCurrent => play_current(&state).await,
@@ -657,7 +652,7 @@ async fn next_track(state: tauri::State<'_, AppState>) -> Result<(), String> {
 async fn prev_track(state: tauri::State<'_, AppState>) -> Result<(), String> {
     match queue_prev(&state) {
         QueueAction::EngineCommand(cmd) => {
-            state.engine.lock().unwrap().send(cmd);
+            state.engine.lock().send(cmd);
             Ok(())
         }
         QueueAction::PlayCurrent => play_current(&state).await,
@@ -666,27 +661,28 @@ async fn prev_track(state: tauri::State<'_, AppState>) -> Result<(), String> {
 
 #[tauri::command]
 fn stop(state: tauri::State<AppState>) {
-    if let Ok(mut q) = state.queue.lock()
-        && q.active
     {
-        q.manual_stop = true;
+        let mut q = state.queue.lock();
+        if q.active {
+            q.manual_stop = true;
+        }
     }
-    state.engine.lock().unwrap().send(Cmd::Stop);
+    state.engine.lock().send(Cmd::Stop);
 }
 
 #[tauri::command]
 fn seek(secs: f64, state: tauri::State<AppState>) {
-    state.engine.lock().unwrap().send(Cmd::Seek(secs));
+    state.engine.lock().send(Cmd::Seek(secs));
 }
 
 #[tauri::command]
 fn set_volume(volume: f32, state: tauri::State<AppState>) {
-    state.engine.lock().unwrap().send(Cmd::SetVolume(volume));
+    state.engine.lock().send(Cmd::SetVolume(volume));
 }
 
 #[tauri::command]
 fn get_api_status(state: tauri::State<AppState>) -> ApiStatus {
-    state.api_status.read().unwrap().clone()
+    state.api_status.read().clone()
 }
 
 #[tauri::command]
@@ -766,13 +762,12 @@ impl SessionInfo {
 }
 
 fn set_session_status(app: &tauri::AppHandle, info: &SessionInfo) {
-    if let Some(state) = app.try_state::<AppState>()
-        && let Ok(mut status) = state.api_status.write()
-    {
+    if let Some(state) = app.try_state::<AppState>() {
+        let mut status = state.api_status.write();
         status.session_state = info.state.clone();
         status.account_name = info.account_name.clone();
         status.auth_ok = info.state == "active";
-        *state.session_checked.lock().unwrap() = Some(std::time::Instant::now());
+        *state.session_checked.lock() = Some(std::time::Instant::now());
     }
 }
 
@@ -836,12 +831,7 @@ async fn validate_and_publish(app: &tauri::AppHandle) -> Option<SessionInfo> {
     let info = SessionInfo::from_status(&status);
     let was_expired = app
         .try_state::<AppState>()
-        .map(|s| {
-            s.api_status
-                .read()
-                .map(|st| st.session_state == "expired")
-                .unwrap_or(false)
-        })
+        .map(|s| s.api_status.read().session_state == "expired")
         .unwrap_or(false);
     set_session_status(app, &info);
     if info.state == "expired" && !was_expired {
@@ -991,7 +981,7 @@ fn spawn_session_bootstrap(app: tauri::AppHandle) {
 /// per [`SESSION_CHECK_EVERY`], so opening a playlist does not add latency.
 async fn ensure_session_fresh(app: &tauri::AppHandle, state: &AppState) {
     let stale = {
-        let checked = state.session_checked.lock().unwrap();
+        let checked = state.session_checked.lock();
         checked
             .map(|at| at.elapsed() >= SESSION_CHECK_EVERY)
             .unwrap_or(true)
@@ -1032,7 +1022,8 @@ async fn logout(state: tauri::State<'_, AppState>) -> Result<(), String> {
         eprintln!("[auth] clear_session failed: {e}");
     }
     secrets::clear()?;
-    if let Ok(mut status) = state.api_status.write() {
+    {
+        let mut status = state.api_status.write();
         status.auth_ok = false;
         status.session_state = "signed_out".to_string();
         status.account_name.clear();
@@ -1105,7 +1096,7 @@ async fn play_video(
     let id = extract_video_id(&video_id).ok_or("invalid video id or url")?;
 
     {
-        let mut busy = state.downloading.lock().unwrap();
+        let mut busy = state.downloading.lock();
         if *busy {
             return Err("download already in progress".to_string());
         }
@@ -1113,7 +1104,7 @@ async fn play_video(
     }
 
     let result = play_video_inner(&id, &state).await;
-    *state.downloading.lock().unwrap() = false;
+    *state.downloading.lock() = false;
     result
 }
 
@@ -1150,7 +1141,7 @@ async fn play_video_inner(id: &str, state: &AppState) -> Result<PlaylistInfo, St
             .track
             .ok_or_else(|| "no track metadata in response".to_string())?;
         let title = track.title.clone();
-        state.download.title.lock().unwrap().clone_from(&title);
+        state.download.title.lock().clone_from(&title);
         downloader::download(&resolved.stream_url, &dest, &state.download)
             .await
             .map_err(|e| e.to_string())?;
@@ -1167,7 +1158,6 @@ async fn play_video_inner(id: &str, state: &AppState) -> Result<PlaylistInfo, St
     state
         .engine
         .lock()
-        .unwrap()
         .send(Cmd::SetPlaylist(playlist));
 
     Ok(PlaylistInfo {
@@ -1188,7 +1178,7 @@ fn read_cached_title(meta: &std::path::Path) -> Option<String> {
 
 async fn play_current(state: &AppState) -> Result<(), String> {
     let item = {
-        let q = state.queue.lock().unwrap();
+        let q = state.queue.lock();
         q.items
             .get(q.current)
             .cloned()
@@ -1200,12 +1190,12 @@ async fn play_current(state: &AppState) -> Result<(), String> {
     if !dest.exists() {
         // Claim this id so a concurrent prefetch cannot write the same file.
         let claimed = {
-            let mut set = state.fetching.lock().unwrap();
+            let mut set = state.fetching.lock();
             set.insert(item.id.clone())
         };
         if claimed {
             let result = play_current_download(state, &item, &dest).await;
-            state.fetching.lock().unwrap().remove(&item.id);
+            state.fetching.lock().remove(&item.id);
             result?;
         } else {
             // Another task is downloading this track; wait until it finishes.
@@ -1233,11 +1223,10 @@ async fn play_current(state: &AppState) -> Result<(), String> {
                 None
             },
             cover: None,
-            gain: if normalize_enabled(&state.settings.lock().unwrap()) {
+            gain: if normalize_enabled(&state.settings.lock()) {
                 state
                     .loudness
                     .lock()
-                    .unwrap()
                     .get(&dest.to_string_lossy().into_owned())
                     .copied()
             } else {
@@ -1248,7 +1237,6 @@ async fn play_current(state: &AppState) -> Result<(), String> {
     state
         .engine
         .lock()
-        .unwrap()
         .send(Cmd::SetPlaylist(playlist));
     record_history(
         state,
@@ -1259,12 +1247,12 @@ async fn play_current(state: &AppState) -> Result<(), String> {
             thumbnail: item.thumbnail.clone(),
         },
     );
-    if normalize_enabled(&state.settings.lock().unwrap()) {
+    if normalize_enabled(&state.settings.lock()) {
         spawn_loudness_scan(
             vec![dest],
             state.loudness.clone(),
-            state.engine.lock().unwrap().clone(),
-            target_rms(&state.settings.lock().unwrap().normalize_level).unwrap_or(0.12),
+            state.engine.lock().clone(),
+            target_rms(&state.settings.lock().normalize_level).unwrap_or(0.12),
         );
     }
     Ok(())
@@ -1276,7 +1264,7 @@ async fn play_current_download(
     dest: &std::path::Path,
 ) -> Result<(), String> {
     // Immediate feedback in the UI while resolving + downloading.
-    state.download.title.lock().unwrap().clone_from(&item.title);
+    state.download.title.lock().clone_from(&item.title);
     state
         .download
         .done
@@ -1363,7 +1351,7 @@ async fn ensure_cached(
         return Ok(());
     }
     {
-        let mut set = fetching.lock().unwrap();
+        let mut set = fetching.lock();
         if !set.insert(item.id.clone()) {
             // another task is already downloading this item
             return Ok(());
@@ -1395,7 +1383,7 @@ async fn ensure_cached(
         Ok(())
     }
     .await;
-    fetching.lock().unwrap().remove(&item.id);
+    fetching.lock().remove(&item.id);
     result
 }
 
@@ -1410,8 +1398,8 @@ struct QueueInfo {
 
 #[tauri::command]
 fn get_queue_info(state: tauri::State<AppState>) -> QueueInfo {
-    let q = state.queue.lock().unwrap();
-    let repeat = state.repeat.lock().unwrap().as_str().to_string();
+    let q = state.queue.lock();
+    let repeat = state.repeat.lock().as_str().to_string();
     QueueInfo {
         active: q.active,
         current: q.current,
@@ -1425,12 +1413,12 @@ fn get_queue_info(state: tauri::State<AppState>) -> QueueInfo {
 /// when it changed (avoids serializing thousands of items every 250 ms).
 #[tauri::command]
 fn get_queue_version(state: tauri::State<AppState>) -> u64 {
-    state.queue.lock().unwrap().version
+    state.queue.lock().version
 }
 
 #[tauri::command]
 fn get_settings(state: tauri::State<AppState>) -> Settings {
-    state.settings.lock().unwrap().clone()
+    state.settings.lock().clone()
 }
 
 #[tauri::command]
@@ -1438,7 +1426,7 @@ fn set_audio_quality(quality: String, state: tauri::State<AppState>) -> Result<(
     if quality != "standard" && quality != "high" {
         return Err("unknown audio quality".to_string());
     }
-    let mut settings = state.settings.lock().unwrap();
+    let mut settings = state.settings.lock();
     settings.audio_quality = quality;
     save_settings(&settings);
     Ok(())
@@ -1446,7 +1434,7 @@ fn set_audio_quality(quality: String, state: tauri::State<AppState>) -> Result<(
 
 #[tauri::command]
 fn set_streaming_account(enabled: bool, state: tauri::State<AppState>) {
-    let mut settings = state.settings.lock().unwrap();
+    let mut settings = state.settings.lock();
     settings.streaming_account = enabled;
     save_settings(&settings);
 }
@@ -1454,14 +1442,13 @@ fn set_streaming_account(enabled: bool, state: tauri::State<AppState>) {
 #[tauri::command]
 fn set_volume_curve(enabled: bool, state: tauri::State<AppState>) {
     {
-        let mut settings = state.settings.lock().unwrap();
+        let mut settings = state.settings.lock();
         settings.volume_curve = enabled;
         save_settings(&settings);
     }
     state
         .engine
         .lock()
-        .unwrap()
         .send(Cmd::SetVolumeCurve(enabled));
 }
 
@@ -1471,14 +1458,14 @@ fn set_normalize_level(level: String, state: tauri::State<AppState>) -> Result<(
         return Err("unknown normalize level".to_string());
     }
     {
-        let mut settings = state.settings.lock().unwrap();
+        let mut settings = state.settings.lock();
         settings.normalize_level = level.clone();
         save_settings(&settings);
     }
     // Gains depend on the target level: drop the old cache and re-scan.
-    state.loudness.lock().unwrap().clear();
+    state.loudness.lock().clear();
     let _ = std::fs::remove_file(loudness_file());
-    state.engine.lock().unwrap().send(Cmd::ClearGains);
+    state.engine.lock().send(Cmd::ClearGains);
 
     // Rescan the visible library and the current queue track immediately,
     // so the new level is audible right away.
@@ -1486,7 +1473,6 @@ fn set_normalize_level(level: String, state: tauri::State<AppState>) -> Result<(
         let mut paths: Vec<std::path::PathBuf> = state
             .local_current
             .lock()
-            .unwrap()
             .as_ref()
             .map(|tracks| {
                 tracks
@@ -1495,16 +1481,18 @@ fn set_normalize_level(level: String, state: tauri::State<AppState>) -> Result<(
                     .collect()
             })
             .unwrap_or_default();
-        if let Ok(q) = state.queue.lock()
-            && q.active
-            && let Some(item) = q.items.get(q.current)
         {
-            paths.push(downloader::cached_file(&item.id, &current_quality(&state)));
+            let q = state.queue.lock();
+            if q.active
+                && let Some(item) = q.items.get(q.current)
+            {
+                paths.push(downloader::cached_file(&item.id, &current_quality(&state)));
+            }
         }
         spawn_loudness_scan(
             paths,
             state.loudness.clone(),
-            state.engine.lock().unwrap().clone(),
+            state.engine.lock().clone(),
             target,
         );
     }
@@ -1518,7 +1506,7 @@ fn clear_cache() -> Result<(), String> {
 
 #[tauri::command]
 fn cycle_repeat(state: tauri::State<AppState>) -> String {
-    let mut r = state.repeat.lock().unwrap();
+    let mut r = state.repeat.lock();
     *r = match *r {
         RepeatMode::Off => RepeatMode::All,
         RepeatMode::All => RepeatMode::One,
@@ -1529,7 +1517,7 @@ fn cycle_repeat(state: tauri::State<AppState>) -> String {
 
 #[tauri::command]
 fn set_speed(speed: f32, state: tauri::State<AppState>) {
-    state.engine.lock().unwrap().send(Cmd::SetSpeed(speed));
+    state.engine.lock().send(Cmd::SetSpeed(speed));
 }
 
 #[derive(Serialize, Clone)]
@@ -1591,14 +1579,14 @@ async fn queue_add(
     }
     let start_fresh;
     {
-        let q = state.queue.lock().unwrap();
+        let q = state.queue.lock();
         start_fresh = !q.active || q.items.is_empty();
     }
     if start_fresh {
         return play_queue(items, 0, state).await;
     }
     {
-        let mut q = state.queue.lock().unwrap();
+        let mut q = state.queue.lock();
         let at = if play_next.unwrap_or(false) {
             (q.current + 1).min(q.items.len())
         } else {
@@ -1614,14 +1602,14 @@ async fn queue_add(
 
 #[tauri::command]
 fn queue_remove(index: usize, state: tauri::State<AppState>) -> Result<(), String> {
-    let mut q = state.queue.lock().unwrap();
+    let mut q = state.queue.lock();
     if index >= q.items.len() {
         return Err("index out of range".to_string());
     }
     if q.items.len() == 1 {
         q.active = false;
         q.items.clear();
-        state.engine.lock().unwrap().send(Cmd::Stop);
+        state.engine.lock().send(Cmd::Stop);
         return Ok(());
     }
     q.items.remove(index);
@@ -1636,24 +1624,24 @@ fn queue_remove(index: usize, state: tauri::State<AppState>) -> Result<(), Strin
 
 #[tauri::command]
 fn queue_clear(state: tauri::State<AppState>) {
-    let mut q = state.queue.lock().unwrap();
+    let mut q = state.queue.lock();
     q.active = false;
     q.items.clear();
     q.manual_stop = true;
     q.version += 1;
     drop(q);
-    state.engine.lock().unwrap().send(Cmd::Stop);
+    state.engine.lock().send(Cmd::Stop);
 }
 
 #[tauri::command]
 fn get_history(state: tauri::State<AppState>) -> Vec<HistoryItem> {
-    state.history.lock().unwrap().clone()
+    state.history.lock().clone()
 }
 
 #[tauri::command]
 fn toggle_favorite(state: tauri::State<AppState>) -> Result<bool, String> {
     let track = {
-        let snap = state.engine.lock().unwrap().snapshot();
+        let snap = state.engine.lock().snapshot();
         snap.and_then(|s| s.track)
     };
     let Some(track) = track else {
@@ -1662,7 +1650,7 @@ fn toggle_favorite(state: tauri::State<AppState>) -> Result<bool, String> {
     let Some(path) = track.path.clone() else {
         return Err("not a local track".to_string());
     };
-    let mut favorites = state.favorites.lock().unwrap();
+    let mut favorites = state.favorites.lock();
     if let Some(pos) = favorites.iter().position(|f| f.path == path) {
         favorites.remove(pos);
         let snapshot = favorites.clone();
@@ -1686,7 +1674,7 @@ fn toggle_favorite(state: tauri::State<AppState>) -> Result<bool, String> {
 
 #[tauri::command]
 fn is_favorite(state: tauri::State<AppState>) -> bool {
-    let Some(snap) = state.engine.lock().unwrap().snapshot() else {
+    let Some(snap) = state.engine.lock().snapshot() else {
         return false;
     };
     let Some(track) = snap.track else {
@@ -1698,14 +1686,13 @@ fn is_favorite(state: tauri::State<AppState>) -> bool {
     state
         .favorites
         .lock()
-        .unwrap()
         .iter()
         .any(|f| f.path == path)
 }
 
 #[tauri::command]
 fn open_favorites(state: tauri::State<AppState>) -> Result<Vec<engine::TrackInfo>, String> {
-    let favorites = state.favorites.lock().unwrap().clone();
+    let favorites = state.favorites.lock().clone();
     let tracks: Vec<Track> = favorites
         .into_iter()
         .map(|f| Track {
@@ -1729,25 +1716,22 @@ fn open_favorites(state: tauri::State<AppState>) -> Result<Vec<engine::TrackInfo
         tracks: tracks.clone(),
     };
     let infos: Vec<engine::TrackInfo> = tracks.iter().map(track_to_info).collect();
-    *state.local_current.lock().unwrap() = Some(infos.clone());
-    if let Ok(mut q) = state.queue.lock() {
-        q.active = false;
-    }
+    *state.local_current.lock() = Some(infos.clone());
+    state.queue.lock().active = false;
     let mut playlist = playlist;
-    let normalize = normalize_enabled(&state.settings.lock().unwrap());
+    let normalize = normalize_enabled(&state.settings.lock());
     apply_gains(&mut playlist, &state.loudness, normalize);
     let scan_paths: Vec<std::path::PathBuf> =
         playlist.tracks.iter().map(|t| t.path.clone()).collect();
     state
         .engine
         .lock()
-        .unwrap()
         .send(Cmd::OpenPlaylist(playlist));
     spawn_loudness_scan(
         scan_paths,
         state.loudness.clone(),
-        state.engine.lock().unwrap().clone(),
-        target_rms(&state.settings.lock().unwrap().normalize_level).unwrap_or(0.12),
+        state.engine.lock().clone(),
+        target_rms(&state.settings.lock().normalize_level).unwrap_or(0.12),
     );
     Ok(infos)
 }
@@ -1759,16 +1743,16 @@ fn set_sleep_timer(
     state: tauri::State<AppState>,
 ) -> Result<(), String> {
     if minutes <= 0.0 {
-        *state.sleep_until.lock().unwrap() = None;
+        *state.sleep_until.lock() = None;
         return Ok(());
     }
     let until = std::time::Instant::now() + std::time::Duration::from_secs_f64(minutes * 60.0);
-    *state.sleep_until.lock().unwrap() = Some(until);
+    *state.sleep_until.lock() = Some(until);
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs_f64(minutes * 60.0)).await;
         let app_state = app.state::<AppState>();
         {
-            let mut su = app_state.sleep_until.lock().unwrap();
+            let mut su = app_state.sleep_until.lock();
             match *su {
                 Some(t) if t <= std::time::Instant::now() => {
                     *su = None;
@@ -1776,17 +1760,15 @@ fn set_sleep_timer(
                 _ => return, // timer was replaced or cancelled
             }
         }
-        if let Ok(mut q) = app_state.queue.lock() {
-            q.manual_stop = true;
-        }
-        app_state.engine.lock().unwrap().send(Cmd::Stop);
+        app_state.queue.lock().manual_stop = true;
+        app_state.engine.lock().send(Cmd::Stop);
     });
     Ok(())
 }
 
 #[tauri::command]
 fn get_sleep_timer(state: tauri::State<AppState>) -> Option<f64> {
-    state.sleep_until.lock().unwrap().map(|t| {
+    state.sleep_until.lock().map(|t| {
         t.saturating_duration_since(std::time::Instant::now())
             .as_secs_f64()
     })
@@ -1804,7 +1786,7 @@ async fn play_queue(
     }
     let start = start.min(items.len() - 1);
     {
-        let mut q = state.queue.lock().unwrap();
+        let mut q = state.queue.lock();
         q.items = items;
         q.current = start;
         q.active = true;
@@ -1816,7 +1798,7 @@ async fn play_queue(
 
     // Preload the next two tracks in the background so advancing is instant.
     let next_items = {
-        let q = state.queue.lock().unwrap();
+        let q = state.queue.lock();
         q.items
             .iter()
             .skip(q.current + 1)
@@ -1862,7 +1844,7 @@ fn spawn_queue_watcher(handle: tauri::AppHandle) {
                     tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                     let state = handle.state::<AppState>();
 
-                    let snapshot = state.engine.lock().unwrap().snapshot();
+                    let snapshot = state.engine.lock().snapshot();
                     let playing_now = snapshot
                         .as_ref()
                         .map(|s| s.status == "playing")
@@ -1875,7 +1857,7 @@ fn spawn_queue_watcher(handle: tauri::AppHandle) {
                     let mut advance = false;
                     let mut prefetch: Vec<QueueItem> = Vec::new();
                     {
-                        let mut q = state.queue.lock().unwrap();
+                        let mut q = state.queue.lock();
                         if !q.active || q.manual_stop {
                             q.prev_playing = false;
                             prefetched_for = None;
@@ -1883,7 +1865,7 @@ fn spawn_queue_watcher(handle: tauri::AppHandle) {
                         }
                         let should_advance = q.prev_playing && stopped_now;
                         if should_advance {
-                            let repeat = *state.repeat.lock().unwrap();
+                            let repeat = *state.repeat.lock();
                             match repeat {
                                 RepeatMode::One => {
                                     q.prev_playing = false;
@@ -1919,7 +1901,7 @@ fn spawn_queue_watcher(handle: tauri::AppHandle) {
                         // next two in the background.
                         if playing_now && prefetched_for != Some(q.current) {
                             prefetched_for = Some(q.current);
-                            let repeat = *state.repeat.lock().unwrap();
+                            let repeat = *state.repeat.lock();
                             if repeat != RepeatMode::One {
                                 prefetch = q
                                     .items
@@ -2031,11 +2013,10 @@ fn main() {
     };
     let api_status = app_state.api_status.clone();
     {
-        let curve = app_state.settings.lock().unwrap().volume_curve;
+        let curve = app_state.settings.lock().volume_curve;
         app_state
             .engine
             .lock()
-            .unwrap()
             .send(Cmd::SetVolumeCurve(curve));
     }
     let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -2058,23 +2039,23 @@ fn main() {
                             Ok(library) if !library.is_empty() => {
                                 let first = library.first().cloned();
                                 let state = handle.state::<AppState>();
-                                *state.library.lock().unwrap() = library;
+                                *state.library.lock() = library;
                                 if let Some(pl) = first {
                                     let track_infos: Vec<engine::TrackInfo> =
                                         pl.tracks.iter().map(track_to_info).collect();
-                                    *state.local_current.lock().unwrap() = Some(track_infos);
+                                    *state.local_current.lock() = Some(track_infos);
                                     let mut pl = pl;
                                     let normalize =
-                                        normalize_enabled(&state.settings.lock().unwrap());
+                                        normalize_enabled(&state.settings.lock());
                                     apply_gains(&mut pl, &state.loudness, normalize);
                                     let scan_paths: Vec<std::path::PathBuf> =
                                         pl.tracks.iter().map(|t| t.path.clone()).collect();
-                                    state.engine.lock().unwrap().send(Cmd::SetPlaylist(pl));
+                                    state.engine.lock().send(Cmd::SetPlaylist(pl));
                                     spawn_loudness_scan(
                                         scan_paths,
                                         state.loudness.clone(),
-                                        state.engine.lock().unwrap().clone(),
-                                        target_rms(&state.settings.lock().unwrap().normalize_level)
+                                        state.engine.lock().clone(),
+                                        target_rms(&state.settings.lock().normalize_level)
                                             .unwrap_or(0.12),
                                     );
                                 }

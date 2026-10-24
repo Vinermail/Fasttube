@@ -4,7 +4,8 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use parking_lot::{Mutex, RwLock};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 #[cfg(windows)]
@@ -121,9 +122,7 @@ impl LogSink {
 fn log_line(stream: &str, line: &str) {
     static SINK: OnceLock<Mutex<LogSink>> = OnceLock::new();
     let sink = SINK.get_or_init(|| Mutex::new(LogSink::open()));
-    if let Ok(mut sink) = sink.lock() {
-        sink.write_line(stream, line);
-    }
+    sink.lock().write_line(stream, line);
 }
 
 // ------------------------------------------------------------ child process
@@ -251,13 +250,13 @@ fn kill_child(child: &mut Child) {
 }
 
 fn stop_child(slot: &Arc<Mutex<Option<Child>>>) {
-    if let Some(mut child) = slot.lock().unwrap().take() {
+    if let Some(mut child) = slot.lock().take() {
         kill_child(&mut child);
     }
 }
 
 fn child_exited(slot: &Arc<Mutex<Option<Child>>>) -> bool {
-    let mut guard = slot.lock().unwrap();
+    let mut guard = slot.lock();
     match guard.as_mut() {
         Some(child) => child.try_wait().map(|s| s.is_some()).unwrap_or(true),
         None => true,
@@ -338,7 +337,7 @@ async fn supervise_loop(
             eprintln!("[ytapi] invalid sidecar endpoint: {e}");
         }
         let started = Instant::now();
-        *slot.lock().unwrap() = Some(child);
+        *slot.lock() = Some(child);
         eprintln!("[ytapi] sidecar listening on 127.0.0.1:{port}");
 
         loop {
@@ -354,7 +353,7 @@ async fn supervise_loop(
 
             match tokio::time::timeout(Duration::from_secs(3), crate::grpc::health()).await {
                 Ok(Ok(h)) => {
-                    let prev = status.read().map(|s| s.state.clone()).unwrap_or_default();
+                    let prev = status.read().state.clone();
                     set_status(&status, "ok", &h.version, h.auth_ok);
                     if prev != "ok" {
                         eprintln!("[ytapi] health ok, version {}", h.version);
@@ -389,9 +388,8 @@ async fn supervise_loop(
 }
 
 fn set_status(shared: &SharedApiStatus, state: &str, version: &str, auth_ok: bool) {
-    if let Ok(mut s) = shared.write()
-        && (s.state != state || s.version != version || s.auth_ok != auth_ok)
-    {
+    let mut s = shared.write();
+    if s.state != state || s.version != version || s.auth_ok != auth_ok {
         s.state = state.to_string();
         s.version = version.to_string();
         s.auth_ok = auth_ok;
