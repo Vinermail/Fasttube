@@ -140,7 +140,47 @@ fn loudness_file() -> std::path::PathBuf {
 type LoudnessCache = Arc<Mutex<std::collections::HashMap<String, f32>>>;
 
 fn load_loudness() -> LoudnessCache {
-    Arc::new(Mutex::new(load_json(&loudness_file())))
+    let mut map: std::collections::HashMap<String, f32> = load_json(&loudness_file());
+    // Cache files gained a quality segment; keep the gains already computed.
+    if migrate_loudness_keys(&mut map) {
+        save_json(&loudness_file(), &map);
+    }
+    Arc::new(Mutex::new(map))
+}
+
+/// ReplayGain entries are keyed by cache file path. Cache names changed from
+/// `<id>.m4a` to `<id>.<quality>.m4a`, so rewrite the affected keys to
+/// `standard` (the only quality the old files could have been downloaded at)
+/// instead of silently re-scanning every cached track.
+fn migrate_loudness_keys(map: &mut std::collections::HashMap<String, f32>) -> bool {
+    let dir = downloader::cache_dir();
+    let mut renames = Vec::new();
+    for key in map.keys() {
+        let path = std::path::Path::new(key);
+        if path.parent() != Some(dir.as_path()) {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let Some((stem, ext)) = name.rsplit_once('.') else {
+            continue;
+        };
+        if ext != "m4a" || stem.ends_with(".standard") || stem.ends_with(".high") {
+            continue;
+        }
+        let new = dir
+            .join(format!("{stem}.{}.m4a", downloader::QUALITY_STANDARD))
+            .to_string_lossy()
+            .into_owned();
+        renames.push((key.clone(), new));
+    }
+    for (old, new) in &renames {
+        if let Some(value) = map.remove(old) {
+            map.insert(new.clone(), value);
+        }
+    }
+    !renames.is_empty()
 }
 
 fn save_loudness(cache: &LoudnessCache) {
@@ -1862,4 +1902,35 @@ fn main() {
             shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::migrate_loudness_keys;
+
+    #[test]
+    fn loudness_keys_follow_cache_layout() {
+        let dir = crate::downloader::cache_dir();
+        let legacy = dir.join("abc12345678.m4a").to_string_lossy().into_owned();
+        let already = dir.join("abc12345678.high.m4a").to_string_lossy().into_owned();
+        let outside = std::path::Path::new("C:/tmp/song.m4a")
+            .to_string_lossy()
+            .into_owned();
+        let mut map = std::collections::HashMap::from([
+            (legacy.clone(), 1.0f32),
+            (already.clone(), 2.0f32),
+            (outside.clone(), 3.0f32),
+        ]);
+
+        assert!(migrate_loudness_keys(&mut map));
+
+        let migrated = dir
+            .join("abc12345678.standard.m4a")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(map.get(&migrated), Some(&1.0));
+        assert!(!map.contains_key(&legacy));
+        assert_eq!(map.get(&already), Some(&2.0));
+        assert_eq!(map.get(&outside), Some(&3.0));
+    }
 }

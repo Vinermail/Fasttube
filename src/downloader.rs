@@ -112,8 +112,11 @@ fn safe_quality(quality: &str) -> &str {
 /// Those files were always downloaded at standard quality, so they belong to
 /// that bucket. Best-effort: a failed rename just means a re-download.
 fn migrate_legacy_cache_file(video_id: &str, ext: &str) -> PathBuf {
+    migrate_legacy_cache_file_in(&cache_dir(), video_id, ext)
+}
+
+fn migrate_legacy_cache_file_in(dir: &Path, video_id: &str, ext: &str) -> PathBuf {
     let id = safe_id(video_id);
-    let dir = cache_dir();
     let current = dir.join(format!("{id}.{QUALITY_STANDARD}.{ext}"));
     if current.exists() {
         return current;
@@ -312,6 +315,50 @@ mod tests {
             "testVid0001.standard.m4a"
         );
         assert_eq!(path.parent().unwrap(), cache_dir());
+    }
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "fasttube-test-{}-{tag}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn legacy_cache_file_is_renamed_to_standard() {
+        let dir = temp_dir("migrate");
+        let legacy = dir.join("abc12345678.m4a");
+        std::fs::write(&legacy, b"old track").unwrap();
+
+        let got = migrate_legacy_cache_file_in(&dir, "abc12345678", "m4a");
+
+        assert_eq!(got, dir.join("abc12345678.standard.m4a"));
+        assert!(got.exists(), "renamed file must exist");
+        assert_eq!(std::fs::read(&got).unwrap(), b"old track");
+        assert!(!legacy.exists(), "legacy name must be gone");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn legacy_file_is_left_alone_when_standard_already_exists() {
+        let dir = temp_dir("keep");
+        let legacy = dir.join("abc12345678.m4a");
+        let current = dir.join("abc12345678.standard.m4a");
+        std::fs::write(&legacy, b"old").unwrap();
+        std::fs::write(&current, b"new").unwrap();
+
+        let got = migrate_legacy_cache_file_in(&dir, "abc12345678", "m4a");
+
+        assert_eq!(got, current);
+        assert_eq!(std::fs::read(&got).unwrap(), b"new");
+        assert!(legacy.exists(), "legacy file must not be deleted");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
 
