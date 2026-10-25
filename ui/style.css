@@ -42,6 +42,43 @@ body:has(#player-bar:not(.hidden)) {
   display: none !important;
 }
 
+/* ---------- scrollbars ---------- */
+/* WebView2 paints the light Windows bar, which is a bright stripe on a dark
+   player. Only the ::-webkit-* pseudo-elements are used: setting the newer
+   `scrollbar-width`/`scrollbar-color` makes Chromium ignore them again. */
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--bg4);
+  border: 2px solid transparent;
+  border-radius: 999px;
+  background-clip: content-box;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #2f3747;
+  background-clip: content-box;
+}
+
+::-webkit-scrollbar-thumb:active {
+  background: var(--accent);
+  background-clip: content-box;
+}
+
+::-webkit-scrollbar-button,
+::-webkit-scrollbar-corner {
+  display: none;
+  background: transparent;
+}
+
 /* ---------- sidebar ---------- */
 
 #sidebar {
@@ -1839,7 +1876,6 @@ input[type="range"]::-moz-range-thumb {
   scroll-snap-type: x mandatory;
   scroll-behavior: smooth;
   padding: 2px 26px 8px;
-  scrollbar-width: thin;
 }
 
 .h-card {
