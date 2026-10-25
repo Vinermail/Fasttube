@@ -51,7 +51,10 @@
     <div id="topbar">
       <button id="btn-back" class="tbtn nav-arrow disabled" title="Назад (Alt+←)">←</button>
       <button id="btn-forward" class="tbtn nav-arrow disabled" title="Вперёд (Alt+→)">→</button>
-      <input id="yt-query" type="text" placeholder="Поиск" autocomplete="off" />
+      <div class="search-wrap">
+        <input id="yt-query" type="text" placeholder="Поиск" autocomplete="off" />
+        <div id="search-suggest" class="suggest hidden" role="listbox"></div>
+      </div>
       <button id="mode-settings" class="tbtn pb-settings" title="Settings">⚙</button>
     </div>
     <div id="view-player" class="view">
@@ -96,9 +99,16 @@
     </div>
 
     <div id="view-search" class="view hidden">
+      <div id="search-chips" class="search-chips">
+        <button class="chip" data-filter="">Все</button>
+        <button class="chip active" data-filter="songs">Песни</button>
+        <button class="chip" data-filter="videos">Видео</button>
+        <button class="chip" data-filter="albums">Альбомы</button>
+        <button class="chip" data-filter="artists">Исполнители</button>
+        <button class="chip" data-filter="playlists">Плейлисты</button>
+      </div>
       <div id="search-empty" class="search-empty">Начни вводить запрос и нажми Enter</div>
-      <div id="search-results" class="tracks hidden"></div>
-      <button id="search-more" class="btn load-more hidden">Load more</button>
+      <div id="search-body" class="search-body hidden"></div>
     </div>
 
     <div id="view-settings" class="view hidden">

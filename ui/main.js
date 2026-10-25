@@ -320,55 +320,367 @@ function setYtTracks(tracks, append, meta) {
   refresh();
 }
 
-let searchQuery = "";
-let searchLimit = 20;
+/* ---------- music search: chips, suggestions, sections ---------- */
 
-async function doSearch(append) {
-  const query = $("yt-query").value.trim();
-  if (!query) return;
-  if (!append) {
-    searchQuery = query;
-    searchLimit = 20;
-  }
-  try {
-    const tracks = await invoke("search_youtube", {
-      query: searchQuery,
-      limit: searchLimit,
-      music: false,
-    });
-    setYtTracks(tracks, append, null);
-    renderSearchResults();
-    $("search-more").classList.remove("hidden");
-    if (append) searchLimit += 20;
-  } catch (e) {
-    showError(e);
-  }
+const SEARCH_FILTERS = ["", "songs", "videos", "albums", "artists", "playlists"];
+let searchFilter = "songs";
+// Bumped for every query: a late answer whose seq is stale is thrown away,
+// which is what keeps fast typing from rendering older results on top.
+let searchSeq = 0;
+let suggestSeq = 0;
+let suggestTimer = null;
+let suggestItems = [];
+let suggestIndex = -1;
+let lastSearchQuery = "";
+
+function setSearchFilter(filter, persist) {
+  searchFilter = SEARCH_FILTERS.includes(filter) ? filter : "songs";
+  document.querySelectorAll("#search-chips .chip").forEach((chip) => {
+    chip.classList.toggle("active", chip.dataset.filter === searchFilter);
+  });
+  if (persist) invoke("set_search_filter", { filter: searchFilter }).catch(() => {});
 }
 
-function renderSearchResults() {
-  const empty = $("search-empty");
-  const list = $("search-results");
-  if (!currentYtTracks.length) {
-    empty.classList.remove("hidden");
-    list.classList.add("hidden");
+$("search-chips").addEventListener("click", (e) => {
+  const chip = e.target.closest(".chip");
+  if (!chip) return;
+  setSearchFilter(chip.dataset.filter, true);
+  if (lastSearchQuery) runSearch(lastSearchQuery);
+});
+
+function hideSuggest() {
+  suggestItems = [];
+  suggestIndex = -1;
+  $("search-suggest").classList.add("hidden");
+}
+
+function renderSuggest() {
+  const box = $("search-suggest");
+  box.textContent = "";
+  if (!suggestItems.length) {
+    box.classList.add("hidden");
     return;
   }
-  empty.classList.add("hidden");
-  list.classList.remove("hidden");
-  activeListIsSearch = true;
-  const rows = currentYtTracks.map((t) => ({
-    title: t.title,
-    artist: t.artist,
-    duration: t.duration_secs,
-  }));
-  renderTracks(list, applyFilterSort(rows), -1, "s:" + ytListVersion + ":" + filterText + ":" + sortMode);
-  activeListIsSearch = false;
+  suggestItems.forEach((text, i) => {
+    const row = document.createElement("div");
+    row.className = "suggest-item" + (i === suggestIndex ? " active" : "");
+    row.textContent = text;
+    row.onmousedown = (ev) => {
+      // mousedown, not click: the input would blur first and hide the list
+      ev.preventDefault();
+      $("yt-query").value = text;
+      hideSuggest();
+      runSearch(text);
+    };
+    box.appendChild(row);
+  });
+  box.classList.remove("hidden");
 }
 
-$("search-more").onclick = () => doSearch(true);
+async function loadSuggestions(query) {
+  const seq = ++suggestSeq;
+  let items = [];
+  try {
+    items = await invoke("search_suggestions", { query });
+  } catch {
+    items = [];
+  }
+  if (seq !== suggestSeq) return;
+  suggestItems = items.slice(0, 8);
+  suggestIndex = -1;
+  if (document.activeElement === $("yt-query")) renderSuggest();
+}
+
+$("yt-query").addEventListener("input", () => {
+  const query = $("yt-query").value.trim();
+  clearTimeout(suggestTimer);
+  suggestSeq++; // any in-flight answer is stale now
+  hideSuggest();
+  if (query.length < 2) return;
+  suggestTimer = setTimeout(() => loadSuggestions(query), 200);
+});
+
+function renderSearchStatus(text, retry) {
+  const body = $("search-body");
+  body.textContent = "";
+  body.classList.remove("hidden");
+  $("search-empty").classList.add("hidden");
+  if (retry) {
+    const box = document.createElement("div");
+    box.className = "s-error";
+    box.textContent = text;
+    const again = document.createElement("button");
+    again.className = "btn small";
+    again.textContent = "Повторить";
+    again.onclick = () => runSearch(lastSearchQuery);
+    box.appendChild(again);
+    body.appendChild(box);
+  } else {
+    const box = document.createElement("div");
+    box.className = "s-status";
+    box.textContent = text;
+    body.appendChild(box);
+  }
+}
+
+function renderSearchSkeleton() {
+  const body = $("search-body");
+  body.textContent = "";
+  body.classList.remove("hidden");
+  $("search-empty").classList.add("hidden");
+  const section = document.createElement("div");
+  section.className = "s-section";
+  const head = document.createElement("div");
+  head.className = "s-section-head";
+  head.textContent = "Поиск…";
+  section.appendChild(head);
+  for (let i = 0; i < 6; i++) {
+    const row = document.createElement("div");
+    row.className = "s-row skeleton";
+    row.innerHTML =
+      '<div class="s-art"></div><div class="s-lines"><i></i><i></i></div><div class="s-dur"></div><div></div>';
+    section.appendChild(row);
+  }
+  body.appendChild(section);
+}
+
+function thumbSrc(item) {
+  if (!item.thumbnail) return "";
+  // Local library covers live outside the asset scope as plain paths.
+  return item.path ? convertFileSrc(item.thumbnail) : item.thumbnail;
+}
+
+function playSectionItem(section, index) {
+  const item = section.items[index];
+  if (item.path) {
+    invoke("play_local_path", { path: item.path })
+      .then(() => setMode("local"))
+      .catch((e) => showError(e));
+    return;
+  }
+  const playable = section.items.filter(
+    (it) => !it.path && (it.kind === "song" || it.kind === "video"),
+  );
+  const from = playable.findIndex((it) => it.id === item.id);
+  if (from < 0) return;
+  // The clicked track plus everything after it in this section.
+  const items = playable.slice(from).map((it) => ({
+    id: it.id,
+    title: it.title,
+    artist: it.subtitle || "",
+    thumbnail: it.thumbnail || "",
+    durationSecs: it.duration_secs || 0,
+  }));
+  setMode("youtube");
+  invoke("play_queue", { items, start: 0 }).catch((e) => showError(e));
+}
+
+function queueSearchItem(item, playNext) {
+  if (item.path) return; // the YouTube queue cannot hold local files
+  const payload = {
+    id: item.id,
+    title: item.title,
+    artist: item.subtitle || "",
+    thumbnail: item.thumbnail || "",
+    durationSecs: item.duration_secs || 0,
+  };
+  invoke("queue_add", { items: [payload], playNext })
+    .then(() => refresh())
+    .catch((e) => showError(e));
+}
+
+function buildSearchRow(section, index) {
+  const item = section.items[index];
+  const row = document.createElement("div");
+  row.className = "s-row";
+
+  const art = document.createElement("div");
+  art.className = "s-art";
+  const src = thumbSrc(item);
+  if (src) {
+    const img = document.createElement("img");
+    img.loading = "lazy";
+    img.alt = "";
+    img.src = src;
+    art.appendChild(img);
+  } else {
+    art.textContent = "♪";
+  }
+
+  const lines = document.createElement("div");
+  lines.className = "s-lines";
+  const title = document.createElement("div");
+  title.className = "s-title";
+  title.textContent = item.title;
+  const sub = document.createElement("div");
+  sub.className = "s-sub";
+  sub.textContent = item.subtitle || "";
+  lines.append(title, sub);
+
+  const dur = document.createElement("div");
+  dur.className = "s-dur";
+  dur.textContent = item.duration_secs > 0 ? fmt(item.duration_secs) : "";
+
+  const actions = document.createElement("div");
+  actions.className = "s-actions";
+  if (!item.path) {
+    const addBtn = (glyph, label, handler) => {
+      const btn = document.createElement("button");
+      btn.className = "s-act";
+      btn.textContent = glyph;
+      btn.title = label;
+      btn.onclick = (ev) => {
+        ev.stopPropagation();
+        handler();
+      };
+      actions.appendChild(btn);
+    };
+    addBtn("▶", "Играть", () => playSectionItem(section, index));
+    addBtn("+", "В очередь", () => queueSearchItem(item, false));
+    addBtn("⏭", "Следующим", () => queueSearchItem(item, true));
+  }
+
+  row.append(art, lines, dur, actions);
+  row.onclick = () => playSectionItem(section, index);
+  return row;
+}
+
+function openSearchPlaylist(item) {
+  invoke("get_playlist_tracks", { playlistId: item.playlist_id || item.id })
+    .then((tracks) => {
+      setMode("youtube");
+      setYtTracks(tracks, false, {
+        title: item.title,
+        subtitle: `${tracks.length} tracks`,
+        cover: item.thumbnail || (tracks[0] ? tracks[0].thumbnail || "" : ""),
+      });
+    })
+    .catch((e) => showError(e));
+}
+
+function buildSearchCard(item) {
+  const card = document.createElement("div");
+  card.className = "s-card";
+  const src = thumbSrc(item);
+  if (src) {
+    const img = document.createElement("img");
+    img.className = "s-card-cover";
+    img.loading = "lazy";
+    img.alt = "";
+    img.src = src;
+    card.appendChild(img);
+  } else {
+    const placeholder = document.createElement("div");
+    placeholder.className = "s-card-cover";
+    card.appendChild(placeholder);
+  }
+  const title = document.createElement("div");
+  title.className = "s-card-title";
+  title.textContent = item.title;
+  const sub = document.createElement("div");
+  sub.className = "s-card-sub";
+  sub.textContent = item.subtitle || "";
+  card.append(title, sub);
+
+  if (item.kind === "playlist") {
+    card.onclick = () => openSearchPlaylist(item);
+  } else if (item.kind === "album" && window.openAlbumPage) {
+    card.onclick = () => window.openAlbumPage(item);
+  } else if (item.kind === "artist" && window.openArtistPage) {
+    card.onclick = () => window.openArtistPage(item);
+  } else {
+    card.classList.add("static");
+  }
+  return card;
+}
+
+function renderSearchSections(sections, error) {
+  const body = $("search-body");
+  body.textContent = "";
+  body.classList.remove("hidden");
+  $("search-empty").classList.add("hidden");
+
+  for (const section of sections) {
+    if (!section.items.length) continue;
+    const wrap = document.createElement("div");
+    wrap.className = "s-section";
+    const head = document.createElement("div");
+    head.className = "s-section-head";
+    head.textContent = section.title || "";
+    wrap.appendChild(head);
+
+    const rowsKind = section.kind === "song" || section.kind === "video";
+    if (rowsKind) {
+      section.items.forEach((_, i) => wrap.appendChild(buildSearchRow(section, i)));
+    } else {
+      const grid = document.createElement("div");
+      grid.className = "s-cards";
+      section.items.forEach((item) => grid.appendChild(buildSearchCard(item)));
+      wrap.appendChild(grid);
+    }
+    body.appendChild(wrap);
+  }
+
+  if (!body.childElementCount) {
+    renderSearchStatus("Ничего не найдено");
+    return;
+  }
+  if (error) {
+    // Partial answer: the sidecar failed, but something is already shown.
+    const note = document.createElement("div");
+    note.className = "s-status";
+    note.textContent = `Часть результатов недоступна: ${error}`;
+    body.appendChild(note);
+  }
+}
+
+async function runSearch(query) {
+  const seq = ++searchSeq;
+  lastSearchQuery = query;
+  hideSuggest();
+  showMainView("search");
+  renderSearchSkeleton();
+  let payload;
+  try {
+    payload = await invoke("search_music", { query, filter: searchFilter });
+  } catch (e) {
+    if (seq !== searchSeq) return;
+    renderSearchStatus(String(e), true);
+    return;
+  }
+  if (seq !== searchSeq) return;
+  if (payload.error && !payload.sections.length) {
+    renderSearchStatus(payload.error, true);
+    return;
+  }
+  renderSearchSections(payload.sections, payload.error);
+}
+
 $("yt-query").addEventListener("focus", () => showMainView("search"));
+$("yt-query").addEventListener("blur", () => setTimeout(hideSuggest, 120));
+
 $("yt-query").addEventListener("keydown", (e) => {
-  if (e.key === "Enter") doSearch(false);
+  if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+    if (!suggestItems.length) return;
+    e.preventDefault();
+    const delta = e.key === "ArrowDown" ? 1 : -1;
+    suggestIndex = (suggestIndex + delta + suggestItems.length) % suggestItems.length;
+    renderSuggest();
+    return;
+  }
+  if (e.key === "Escape") {
+    if (suggestItems.length) hideSuggest();
+    else $("yt-query").blur();
+    return;
+  }
+  if (e.key === "Enter") {
+    e.preventDefault();
+    const query = suggestIndex >= 0 ? suggestItems[suggestIndex] : $("yt-query").value.trim();
+    if (!query) return;
+    $("yt-query").value = query;
+    hideSuggest();
+    runSearch(query);
+  }
 });
 
 function shuffleYt() {
@@ -655,6 +967,7 @@ async function loadSettings() {
     if (streaming) streaming.checked = !!s.streaming_account;
     const limit = $("opt-cache-limit");
     if (limit) limit.value = String(s.cache_limit_mb ?? 2048);
+    setSearchFilter(s.search_filter || "songs", false);
   } catch (e) {
     showError(e);
   }
@@ -786,7 +1099,6 @@ let trackRows = [];
 let trackActive = -1;
 let lastFirst = -1;
 let trackListEl = null;
-let activeListIsSearch = false;
 
 function buildRow(row, i) {
   const div = document.createElement("div");
@@ -800,14 +1112,8 @@ function buildRow(row, i) {
     `<div class="t-title">${escapeHtml(row.title)}</div>` +
     `<div class="t-artist">${escapeHtml(row.artist || "")}</div>` +
     `<div class="t-dur">${dur}</div>`;
-  const isSearch = activeListIsSearch;
   div.onclick = () => {
     const orig = row.orig;
-    if (isSearch) {
-      playYtAt(orig);
-      showMainView("player");
-      return;
-    }
     if (mode === "youtube") {
       playYtAt(orig);
     } else {
@@ -843,7 +1149,7 @@ function updateTracks() {
   el.scrollTop = savedScroll;
 }
 
-["tracks", "search-results"].forEach((id) => {
+["tracks"].forEach((id) => {
   const el = document.getElementById(id);
   if (el) {
     el.addEventListener("scroll", () => {

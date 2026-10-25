@@ -117,6 +117,13 @@ struct Settings {
     /// Audio cache budget in MiB; 0 disables eviction.
     #[serde(default = "default_cache_limit_mb")]
     cache_limit_mb: u64,
+    /// Last search tab: "", songs, videos, albums, artists, playlists.
+    #[serde(default = "default_search_filter")]
+    search_filter: String,
+}
+
+fn default_search_filter() -> String {
+    "songs".to_string()
 }
 
 fn default_cache_limit_mb() -> u64 {
@@ -143,6 +150,7 @@ impl Default for Settings {
             volume_curve: true,
             streaming_account: false,
             cache_limit_mb: default_cache_limit_mb(),
+            search_filter: default_search_filter(),
         }
     }
 }
@@ -619,6 +627,12 @@ fn open_playlist(
         .get(index)
         .cloned()
         .ok_or("playlist not found")?;
+    Ok(load_local_playlist(pl, &state))
+}
+
+/// Hands a local playlist to the engine without starting playback, and
+/// publishes its track list to the UI. The queue stops driving playback.
+fn load_local_playlist(pl: Playlist, state: &AppState) -> Vec<engine::TrackInfo> {
     let infos: Vec<engine::TrackInfo> = pl.tracks.iter().map(track_to_info).collect();
     *state.local_current.lock() = Some(infos.clone());
     state.queue.lock().deactivate();
@@ -633,7 +647,27 @@ fn open_playlist(
         state.engine.lock().clone(),
         target_rms(&state.settings.lock().normalize_level).unwrap_or(0.12),
     );
-    Ok(infos)
+    infos
+}
+
+/// Plays one file of the local library, from the folder it belongs to (so
+/// "next" keeps walking that folder).
+#[tauri::command]
+fn play_local_path(path: String, state: tauri::State<AppState>) -> Result<(), String> {
+    let (playlist, index) = {
+        let library = state.library.lock();
+        let mut found = None;
+        for pl in library.iter() {
+            if let Some(idx) = pl.tracks.iter().position(|t| t.path.to_string_lossy() == path) {
+                found = Some((pl.clone(), idx));
+                break;
+            }
+        }
+        found.ok_or("track is not in the library")?
+    };
+    load_local_playlist(playlist, &state);
+    state.engine.lock().send(Cmd::PlayTrack(index));
+    Ok(())
 }
 
 #[tauri::command]
@@ -810,32 +844,6 @@ async fn search_suggestions(query: String) -> Result<Vec<String>, String> {
         return Ok(Vec::new());
     }
     grpc::suggest(&query).await.map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-async fn search_youtube(
-    query: String,
-    limit: Option<i32>,
-    _music: Option<bool>,
-    _state: tauri::State<'_, AppState>,
-) -> Result<Vec<SearchTrack>, String> {
-    // Stage 1 bridge: the sidecar answers with sections now, the UI still wants
-    // a flat song list. Replaced by search_music/search_suggestions next stage.
-    let sections = grpc::search(&query, "songs", limit.unwrap_or(20).clamp(1, 100))
-        .await
-        .map_err(|e| e.to_string())?;
-    Ok(sections
-        .into_iter()
-        .flat_map(|section| section.items)
-        .filter(|item| item.kind == "song" || item.kind == "video")
-        .map(|item| SearchTrack {
-            video_id: item.id,
-            title: item.title,
-            artist: item.subtitle,
-            duration_secs: item.duration_secs,
-            thumbnail: item.thumbnail,
-        })
-        .collect())
 }
 
 #[tauri::command]
@@ -1582,6 +1590,18 @@ fn set_cache_limit(limit_mb: u64, state: tauri::State<AppState>) {
 }
 
 #[tauri::command]
+fn set_search_filter(filter: String, state: tauri::State<AppState>) -> Result<(), String> {
+    const FILTERS: [&str; 6] = ["", "songs", "videos", "albums", "artists", "playlists"];
+    if !FILTERS.contains(&filter.as_str()) {
+        return Err("unknown search filter".to_string());
+    }
+    let mut settings = state.settings.lock();
+    settings.search_filter = filter;
+    save_settings(&settings);
+    Ok(())
+}
+
+#[tauri::command]
 fn set_streaming_account(enabled: bool, state: tauri::State<AppState>) {
     let mut settings = state.settings.lock();
     settings.streaming_account = enabled;
@@ -2164,9 +2184,10 @@ fn main() {
             get_library,
             get_api_status,
             get_download_progress,
-            search_youtube,
             search_music,
             search_suggestions,
+            set_search_filter,
+            play_local_path,
             get_user_playlists,
             get_playlist_tracks,
             get_liked_songs,
