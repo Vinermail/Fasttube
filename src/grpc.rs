@@ -11,7 +11,8 @@ pub mod proto {
 
 pub use proto::{
     AlbumRequest, AlbumResponse, ArtistRequest, ArtistResponse, Empty, HealthResponse,
-    LyricsRequest, LyricsResponse, ParseAuthHeadersRequest,
+    HomeRequest, LyricsRequest, LyricsResponse, ParseAuthHeadersRequest,
+    Shelf,
     PlaylistTracksRequest, PlaylistTracksResponse, PrefetchResolveRequest, RecommendRequest,
     ResolveRequest, ResolveResponse, SearchRequest, SearchSection, SessionState, SessionStatus,
     SetSessionRequest, SuggestRequest, Track, UserPlaylistsResponse,
@@ -158,6 +159,31 @@ pub async fn search(query: &str, filter: &str, limit: i32) -> Result<Vec<SearchS
         return Err(anyhow::anyhow!(resp.error));
     }
     Ok(resp.sections)
+}
+
+/// Home shelves (personal when signed in, public explore otherwise).
+pub async fn get_home(limit: i32) -> Result<Vec<Shelf>> {
+    let mut client = connect().await?;
+    let resp = client
+        .get_home(with_timeout(HomeRequest { limit }, SEARCH_TIMEOUT))
+        .await?
+        .into_inner();
+    if !resp.error.is_empty() {
+        return Err(anyhow::anyhow!(resp.error));
+    }
+    Ok(resp.shelves)
+}
+
+/// True for "the sidecar is not there yet" failures, which are worth retrying.
+/// An error the sidecar itself reported is not.
+pub fn is_transport_error(err: &anyhow::Error) -> bool {
+    if err.downcast_ref::<tonic::transport::Error>().is_some() {
+        return true;
+    }
+    matches!(
+        err.downcast_ref::<tonic::Status>().map(|s| s.code()),
+        Some(tonic::Code::Unavailable | tonic::Code::Unknown)
+    )
 }
 
 /// Album page (title, header line, tracks).

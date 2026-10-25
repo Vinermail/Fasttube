@@ -6,6 +6,7 @@ mod downloader;
 mod engine;
 mod fsutil;
 mod grpc;
+mod home;
 mod net;
 mod playlist;
 mod queue;
@@ -130,6 +131,24 @@ struct Settings {
     /// Last search tab: "", songs, videos, albums, artists, playlists.
     #[serde(default = "default_search_filter")]
     search_filter: String,
+    /// Last played track and where it stopped: feeds the «Продолжить» shelf.
+    #[serde(default)]
+    resume: Option<ResumeState>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+struct ResumeState {
+    id: String,
+    title: String,
+    artist: String,
+    thumbnail: String,
+    position_secs: f64,
+    /// Local files continue by path, network tracks by video id.
+    is_local: bool,
+    #[serde(default)]
+    path: String,
+    #[serde(default)]
+    saved_at: f64,
 }
 
 fn default_search_filter() -> String {
@@ -161,6 +180,7 @@ impl Default for Settings {
             streaming_account: false,
             cache_limit_mb: default_cache_limit_mb(),
             search_filter: default_search_filter(),
+            resume: None,
         }
     }
 }
@@ -494,6 +514,34 @@ fn spawn_cache_sweeper(app: tauri::AppHandle) {
         .expect("failed to spawn cache sweeper");
 }
 
+fn now_secs() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
+/// Reads history.json, giving old entries (no `played_at`) descending
+/// timestamps before anything reads them. The file is already newest-first, so
+/// the visible order does not change; the timestamps only make "recent" and
+/// "continue" meaningful.
+fn load_history() -> Vec<HistoryItem> {
+    let mut items: Vec<HistoryItem> = load_json(&history_file());
+    let mut next = now_secs();
+    let mut migrated = false;
+    for item in items.iter_mut() {
+        if item.played_at <= 0.0 {
+            item.played_at = next;
+            next -= 60.0;
+            migrated = true;
+        }
+    }
+    if migrated {
+        save_json(&history_file(), &items);
+    }
+    items
+}
+
 fn record_history(state: &AppState, item: &HistoryItem) {
     let mut history = state.history.lock();
     history.retain(|h| h.id != item.id);
@@ -512,6 +560,10 @@ struct HistoryItem {
     title: String,
     artist: String,
     thumbnail: String,
+    /// Unix seconds. Files written before this field existed get synthetic
+    /// stamps on load, so the order they already had survives.
+    #[serde(default)]
+    played_at: f64,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -977,6 +1029,12 @@ pub(crate) async fn install_session(
     }
 
     secrets::save(&bundle)?;
+    // A snapshot from another account must not be shown to this one.
+    if let Err(e) = std::fs::remove_file(home_file())
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!("[home] cannot drop the snapshot on sign-in: {e}");
+    }
     set_session_status(app, &info);
     Ok(info)
 }
@@ -1206,6 +1264,13 @@ async fn logout(state: tauri::State<'_, AppState>) -> Result<(), String> {
         eprintln!("[auth] clear_session failed: {e}");
     }
     secrets::clear()?;
+    // The snapshot may hold this account's picks: it must not outlive the
+    // session that fetched it.
+    if let Err(e) = std::fs::remove_file(home_file())
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!("[home] cannot drop the snapshot on logout: {e}");
+    }
     {
         let mut status = state.api_status.write();
         status.auth_ok = false;
@@ -1431,6 +1496,7 @@ async fn play_current(state: &AppState) -> Result<(), String> {
             title: item.title.clone(),
             artist: item.artist.clone(),
             thumbnail: item.thumbnail.clone(),
+            played_at: now_secs(),
         },
     );
     if normalize_enabled(&state.settings.lock()) {
@@ -1816,6 +1882,297 @@ fn queue_clear(state: tauri::State<AppState>) {
     state.engine.lock().send(Cmd::Stop);
 }
 
+fn home_file() -> std::path::PathBuf {
+    downloader::settings_file()
+        .parent()
+        .map(|dir| dir.join("home.json"))
+        .unwrap_or_else(|| std::path::PathBuf::from("home.json"))
+}
+
+fn home_signed_in(state: &AppState) -> bool {
+    state.api_status.read().session_state == "active"
+}
+
+/// Network shelves of the last successful refresh. Local shelves are rebuilt
+/// every time, so a snapshot never goes stale in the parts that matter offline.
+#[derive(Serialize, Deserialize, Clone, Default)]
+struct HomeSnapshot {
+    #[serde(default)]
+    generated_at: f64,
+    #[serde(default)]
+    personal: bool,
+    #[serde(default)]
+    shelves: Vec<home::Shelf>,
+}
+
+#[derive(Serialize, Clone)]
+struct HomePage {
+    shelves: Vec<home::Shelf>,
+    generated_at: f64,
+    /// "snapshot" for the cached page, "fresh" after a successful refresh.
+    source: String,
+    /// True when the page includes shelves fetched with an account.
+    personal: bool,
+}
+
+fn local_home_input(state: &AppState) -> home::LocalInput {
+    let resume = state
+        .settings
+        .lock()
+        .resume
+        .clone()
+        .filter(|r| !r.id.is_empty())
+        .map(|r| home::Resume {
+            id: r.id,
+            title: r.title,
+            artist: r.artist,
+            thumbnail: r.thumbnail,
+            position_secs: r.position_secs,
+            is_local: r.is_local,
+            path: r.path,
+        });
+
+    let history = state
+        .history
+        .lock()
+        .iter()
+        .map(|h| home::HistoryEntry {
+            id: h.id.clone(),
+            title: h.title.clone(),
+            artist: h.artist.clone(),
+            thumbnail: h.thumbnail.clone(),
+            played_at: h.played_at,
+        })
+        .collect();
+
+    let favorites = state
+        .favorites
+        .lock()
+        .iter()
+        .map(|f| home::FavoriteEntry {
+            path: f.path.clone(),
+            title: f.title.clone(),
+            artist: f.artist.clone(),
+            cover: f.cover.clone().unwrap_or_default(),
+        })
+        .collect();
+
+    // Newest local files by mtime, newest first.
+    let mut recent_files: Vec<home::FileEntry> = {
+        let library = state.library.lock();
+        let mut files = Vec::new();
+        for playlist in library.iter() {
+            for track in playlist.tracks.iter() {
+                let mtime = std::fs::metadata(&track.path)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs_f64())
+                    .unwrap_or(0.0);
+                files.push(home::FileEntry {
+                    path: track.path.to_string_lossy().into_owned(),
+                    title: track.title.clone(),
+                    artist: track.artist.clone(),
+                    cover: track
+                        .cover
+                        .as_ref()
+                        .map(|c| c.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                    mtime,
+                });
+            }
+        }
+        files
+    };
+    recent_files.sort_by(|a, b| {
+        b.mtime
+            .partial_cmp(&a.mtime)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    recent_files.truncate(60);
+
+    home::LocalInput {
+        resume,
+        history,
+        favorites,
+        recent_files,
+    }
+}
+
+fn shelf_from_pb(shelf: grpc::Shelf) -> home::Shelf {
+    home::Shelf {
+        title: shelf.title,
+        kind: shelf.kind,
+        items: shelf
+            .items
+            .into_iter()
+            .filter(|item| !item.id.is_empty())
+            .map(|item| home::Item {
+                kind: item.kind,
+                id: item.id,
+                title: item.title,
+                subtitle: item.subtitle,
+                thumbnail: item.thumbnail,
+                duration_secs: item.duration_secs,
+                video_type: item.video_type,
+                browse_id: item.browse_id,
+                playlist_id: item.playlist_id,
+                path: None,
+            })
+            .collect(),
+    }
+}
+
+/// Local shelves first, then whatever the snapshot still may show.
+#[tauri::command]
+fn get_home_cached(state: tauri::State<AppState>) -> HomePage {
+    let signed_in = home_signed_in(&state);
+    let snapshot: HomeSnapshot = load_json(&home_file());
+    let mut shelves = home::local_shelves(&local_home_input(&state), 20);
+    shelves.extend(home::visible_network_shelves(&snapshot.shelves, signed_in));
+    HomePage {
+        shelves,
+        generated_at: snapshot.generated_at,
+        source: "snapshot".to_string(),
+        personal: snapshot.personal && signed_in,
+    }
+}
+
+/// Fetches the network shelves, waits out a sidecar that is still starting, and
+/// stores the result so the next cold start is instant.
+async fn fetch_home_shelves() -> Result<Vec<home::Shelf>, String> {
+    const DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+    const PAUSE: std::time::Duration = std::time::Duration::from_millis(1500);
+
+    let started = std::time::Instant::now();
+    loop {
+        match grpc::get_home(4).await {
+            Ok(shelves) => {
+                return Ok(shelves.into_iter().map(shelf_from_pb).collect());
+            }
+            Err(e) => {
+                let message = e.to_string();
+                if !grpc::is_transport_error(&e) || started.elapsed() >= DEADLINE {
+                    return Err(message);
+                }
+                tokio::time::sleep(PAUSE).await;
+            }
+        }
+    }
+}
+
+#[tauri::command]
+async fn refresh_home(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<HomePage, String> {
+    let network = fetch_home_shelves().await?;
+    let signed_in = home_signed_in(&state);
+    let personal = network
+        .iter()
+        .any(|shelf| shelf.kind == home::KIND_PERSONAL);
+    let generated_at = now_secs();
+
+    let snapshot = HomeSnapshot {
+        generated_at,
+        personal,
+        shelves: network.clone(),
+    };
+    if let Err(e) = fsutil::write_json_atomic(&home_file(), &snapshot, true) {
+        eprintln!("[store] cannot save the home snapshot: {e}");
+    }
+
+    let mut shelves = home::local_shelves(&local_home_input(&state), 20);
+    shelves.extend(home::visible_network_shelves(&network, signed_in));
+
+    let page = HomePage {
+        shelves,
+        generated_at,
+        source: "fresh".to_string(),
+        personal,
+    };
+    let _ = app.emit("home-updated", page.clone());
+    Ok(page)
+}
+
+/// Remembers the last track and position so the home page can offer
+/// «Продолжить». Polls the engine rather than hooking every playback path.
+fn spawn_resume_saver(app: tauri::AppHandle) {
+    std::thread::Builder::new()
+        .name("resume-saver".to_string())
+        .spawn(move || {
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                let Some(state) = app.try_state::<AppState>() else {
+                    continue;
+                };
+                let snapshot = match state.engine.lock().snapshot() {
+                    Some(snapshot) if snapshot.status == "playing" => snapshot,
+                    _ => continue,
+                };
+                let Some(track) = snapshot.track.clone() else {
+                    continue;
+                };
+                // A network track downloads to a cache file, so the engine path
+                // alone cannot tell local playback from YouTube: the queue can.
+                // It is inactive only for local files (play_track deactivates it).
+                let queue_item = {
+                    let queue = state.queue.lock();
+                    if queue.active() {
+                        queue.current_item()
+                    } else {
+                        None
+                    }
+                };
+                let (id, title, artist, thumbnail, is_local, path) = match queue_item {
+                    Some(item) => (
+                        item.id,
+                        item.title,
+                        item.artist,
+                        item.thumbnail,
+                        false,
+                        String::new(),
+                    ),
+                    None => match track.path.clone() {
+                        Some(path) => (
+                            path.clone(),
+                            track.title,
+                            track.artist,
+                            track.cover.unwrap_or_default(),
+                            true,
+                            path,
+                        ),
+                        None => continue,
+                    },
+                };
+                let next = ResumeState {
+                    id,
+                    title,
+                    artist,
+                    thumbnail,
+                    position_secs: snapshot.elapsed,
+                    is_local,
+                    path,
+                    saved_at: now_secs(),
+                };
+                let mut settings = state.settings.lock();
+                let unchanged = settings
+                    .resume
+                    .as_ref()
+                    .map(|r| r.id == next.id && (r.position_secs - next.position_secs).abs() < 5.0)
+                    .unwrap_or(false);
+                if unchanged {
+                    continue;
+                }
+                settings.resume = Some(next);
+                let to_save = settings.clone();
+                drop(settings);
+                save_settings(&to_save);
+            }
+        })
+        .expect("failed to spawn the resume saver");
+}
+
 #[tauri::command]
 fn get_history(state: tauri::State<AppState>) -> Vec<HistoryItem> {
     state.history.lock().clone()
@@ -2157,7 +2514,7 @@ fn main() {
         queue: Mutex::new(Queue::default()),
         repeat: Mutex::new(RepeatMode::Off),
         fetching: Arc::new(Mutex::new(std::collections::HashSet::new())),
-        history: Mutex::new(load_json(&history_file())),
+        history: Mutex::new(load_history()),
         favorites: Mutex::new(load_json(&favorites_file())),
         sleep_until: Mutex::new(None),
         loudness: load_loudness(),
@@ -2180,6 +2537,7 @@ fn main() {
         .manage(app_state)
         .setup(move |app| {
             spawn_queue_watcher(app.handle().clone());
+            spawn_resume_saver(app.handle().clone());
             spawn_session_bootstrap(app.handle().clone());
             spawn_cache_sweeper(app.handle().clone());
             if let Some(dir) = initial_dir {
@@ -2230,6 +2588,8 @@ fn main() {
             get_download_progress,
             search_music,
             search_suggestions,
+            get_home_cached,
+            refresh_home,
             open_album,
             open_artist,
             set_search_filter,
