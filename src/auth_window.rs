@@ -35,10 +35,23 @@ const INSTALL_RETRY: Duration = Duration::from_millis(2500);
 /// `None` means "leave the webview's own UA alone" (the bundle then carries an
 /// empty UA and the sidecar falls back to ytmusicapi's default).
 fn session_user_agent() -> Option<String> {
-    let version = tauri::webview_version().ok()?;
+    user_agent_for(&tauri::webview_version().ok()?)
+}
+
+/// Reduced-form UA for a WebView2 version string.
+///
+/// WebView2 reports the full version (155.0.4283.62) but the UA a browser
+/// sends for this engine carries only the major, zero-padded:
+/// `Chrome/155.0.0.0 ... Edg/155.0.0.0`. A full version there would look like
+/// a spoofed client to Google.
+fn user_agent_for(version: &str) -> Option<String> {
+    let major = version
+        .split('.')
+        .next()
+        .filter(|m| !m.is_empty() && m.chars().all(|c| c.is_ascii_digit()))?;
     Some(format!(
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
-         (KHTML, like Gecko) Chrome/{version} Safari/537.36 Edg/{version}"
+         (KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36 Edg/{major}.0.0.0"
     ))
 }
 
@@ -361,5 +374,20 @@ mod tests {
         assert!(!ok("http://music.youtube.com/"));
         assert!(!ok("https://evil.example.com/"));
         assert!(!ok("https://youtube.com.evil.example/"));
+    }
+
+    #[test]
+    fn user_agent_keeps_only_the_major_version() {
+        let ua = user_agent_for("155.0.4283.62").expect("v4 version");
+        assert!(ua.contains("Chrome/155.0.0.0 "), "{ua}");
+        assert!(ua.ends_with("Edg/155.0.0.0"), "{ua}");
+        assert!(!ua.contains("4283"), "build number must not leak: {ua}");
+    }
+
+    #[test]
+    fn user_agent_rejects_a_version_without_a_major() {
+        assert!(user_agent_for("").is_none());
+        assert!(user_agent_for("WebView2/1.0").is_none());
+        assert!(user_agent_for("abc.1.2.3").is_none());
     }
 }

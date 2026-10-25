@@ -4,6 +4,7 @@
 # Python
 api/.venv/
 __pycache__/
+api/.ruff_cache/
 
 # Local runtime data & secrets (never commit)
 api/cache/

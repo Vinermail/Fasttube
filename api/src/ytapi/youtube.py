@@ -226,7 +226,11 @@ def _search_web_direct(query: str, limit: int) -> list[dict]:
         hdrs["origin"] = "https://www.youtube.com"
         hdrs["referer"] = "https://www.youtube.com/"
         hdrs["x-origin"] = "https://www.youtube.com"
-        client_version = hdrs.get("x-youtube-client-version") or WEB_CLIENT_VERSION
+        # ytmusicapi's defaults describe a response body, not a request body:
+        # sending content-encoding makes the server try to gunzip our JSON.
+        hdrs.pop("content-encoding", None)
+        hdrs.pop("accept-encoding", None)
+        client_version = _web_client_version()
         hdrs["x-youtube-client-name"] = "1"
         hdrs["x-youtube-client-version"] = client_version
 
@@ -552,9 +556,64 @@ def related_tracks(video_id: str, limit: int = 20) -> dict:
 # fields here through SetSession after every start or sign-in.
 
 YTM_ORIGIN = "https://music.youtube.com"
-# Client version for the plain www.youtube.com innertube endpoint (the web
-# client, not the music one); only used when the session carries none.
+# Fallback client version for the plain www.youtube.com innertube endpoint
+# (the web client, not the music one). The real one is read from youtube.com and
+# cached for a day; this constant only covers a failed fetch.
 WEB_CLIENT_VERSION = "2.20240926.05.00"
+WEB_CLIENT_VERSION_URL = "https://www.youtube.com/"
+WEB_CLIENT_VERSION_TTL = 24 * 60 * 60
+
+_client_version_lock = threading.Lock()
+# (fetched_at, version) of the last successful read.
+_client_version_cache: tuple[float, str] | None = None
+
+
+def _web_client_version() -> str:
+    """INNERTUBE_CONTEXT_CLIENT_VERSION of the live youtube.com page.
+
+    Cached for a day. A failed fetch returns the constant fallback without
+    poisoning the cache, so the next call tries again.
+    """
+    global _client_version_cache
+
+    now = time.time()
+    with _client_version_lock:
+        cached = _client_version_cache
+    if cached is not None and now - cached[0] < WEB_CLIENT_VERSION_TTL:
+        return cached[1]
+
+    version = ""
+    try:
+        import requests
+
+        proxy = net.detect_proxy()
+        proxies = {"http": proxy, "https": proxy} if proxy else None
+        resp = requests.get(
+            WEB_CLIENT_VERSION_URL,
+            headers={"user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+            proxies=proxies,
+            timeout=15,
+        )
+        if resp.status_code == 200:
+            match = re.search(
+                r'"INNERTUBE_CONTEXT_CLIENT_VERSION"\s*:\s*"([0-9.]+)"', resp.text
+            )
+            if match is None:
+                match = re.search(
+                    r'"INNERTUBE_CLIENT_VERSION"\s*:\s*"([0-9.]+)"', resp.text
+                )
+            if match is not None:
+                version = match.group(1)
+    except Exception:
+        log.warning("could not read the web client version", exc_info=True)
+
+    if not version:
+        return WEB_CLIENT_VERSION
+
+    with _client_version_lock:
+        _client_version_cache = (now, version)
+    log.info("web client version: %s", version)
+    return version
 
 _session_lock = threading.RLock()
 # {"client": YTMusic, "cookie": str, "user_agent": str, "authuser": str,
