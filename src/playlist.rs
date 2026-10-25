@@ -26,6 +26,8 @@ pub struct Track {
     pub path: PathBuf,
     pub title: String,
     pub artist: String,
+    /// Album tag, used by the library search.
+    pub album: String,
     pub duration: Option<f64>,
     pub cover: Option<PathBuf>,
     /// ReplayGain-style loudness normalization factor (1.0 = unchanged).
@@ -38,6 +40,7 @@ impl Track {
             path,
             title,
             artist: String::new(),
+            album: String::new(),
             duration: None,
             cover: None,
             gain: None,
@@ -49,6 +52,44 @@ impl Track {
 pub struct Playlist {
     pub name: String,
     pub tracks: Vec<Track>,
+}
+
+impl Track {
+    /// Case-insensitive substring match over the fields a user types into
+    /// the search box. `needle` is expected to be lowercased already.
+    pub fn matches_query(&self, needle: &str) -> bool {
+        [self.title.as_str(), self.artist.as_str(), self.album.as_str()]
+            .iter()
+            .any(|field| field.to_lowercase().contains(needle))
+    }
+}
+
+/// Tracks of the local library matching `query`, at most `limit`.
+///
+/// Matching is a case-insensitive substring over title, artist and album.
+/// One file can sit in several folder-playlists, so results are deduped by
+/// path and keep the order of the library.
+pub fn search_library<'a>(library: &'a [Playlist], query: &str, limit: usize) -> Vec<&'a Track> {
+    let needle = query.trim().to_lowercase();
+    if needle.is_empty() || limit == 0 {
+        return Vec::new();
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut found = Vec::new();
+    for playlist in library {
+        for track in &playlist.tracks {
+            if !seen.insert(track.path.clone()) {
+                continue;
+            }
+            if track.matches_query(&needle) {
+                found.push(track);
+                if found.len() >= limit {
+                    return found;
+                }
+            }
+        }
+    }
+    found
 }
 
 pub fn is_audio(path: &Path) -> bool {
@@ -118,6 +159,7 @@ fn read_track(path: &Path, cover_dir: &Path) -> Track {
         .to_string();
     let mut title = fallback_title.clone();
     let mut artist = String::new();
+    let mut album = String::new();
     let mut duration = None;
     let mut cover = None;
     let mut gain = None;
@@ -130,6 +172,9 @@ fn read_track(path: &Path, cover_dir: &Path) -> Track {
             }
             if let Some(a) = tag.artist() {
                 artist = a.to_string();
+            }
+            if let Some(a) = tag.album() {
+                album = a.to_string();
             }
             if let Some(pic) = tag.pictures().first() {
                 cover = write_cover(cover_dir, pic.data(), pic.mime_type().map(|m| m.as_str()));
@@ -162,6 +207,7 @@ fn read_track(path: &Path, cover_dir: &Path) -> Track {
         path: path.to_path_buf(),
         title,
         artist,
+        album,
         duration,
         cover,
         gain: gain.map(|g| limit_gain_by_peak(g, peak)),
@@ -322,4 +368,84 @@ mod tests {
         assert_ne!(a, c);
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    fn lib_track(path: &str, title: &str, artist: &str, album: &str) -> Track {
+        Track {
+            path: std::path::PathBuf::from(path),
+            title: title.to_string(),
+            artist: artist.to_string(),
+            album: album.to_string(),
+            duration: None,
+            cover: None,
+            gain: None,
+        }
+    }
+
+    fn library() -> Vec<Playlist> {
+        vec![
+            Playlist {
+                name: "Root".to_string(),
+                tracks: vec![
+                    lib_track("a.mp3", "Wonderwall", "Oasis", "Morning Glory"),
+                    lib_track("b.mp3", "Da Funk", "Daft Punk", "Homework"),
+                ],
+            },
+            Playlist {
+                name: "Homework".to_string(),
+                tracks: vec![
+                    // same file as in Root: must not show up twice
+                    lib_track("b.mp3", "Da Funk", "Daft Punk", "Homework"),
+                    lib_track("c.mp3", "Around the World", "Daft Punk", "Homework"),
+                ],
+            },
+        ]
+    }
+
+    #[test]
+    fn library_search_matches_title_artist_and_album_case_insensitively() {
+        let lib = library();
+
+        let by_title: Vec<_> = search_library(&lib, "WONDER", 10)
+            .iter()
+            .map(|t| t.title.clone())
+            .collect();
+        assert_eq!(by_title, vec!["Wonderwall"]);
+
+        let by_artist = search_library(&lib, "daft punk", 10);
+        assert_eq!(by_artist.len(), 2, "dedup keeps one entry per file");
+
+        let by_album = search_library(&lib, "homework", 10);
+        assert_eq!(by_album.len(), 2);
+    }
+
+    #[test]
+    fn library_search_keeps_library_order_and_respects_the_limit() {
+        let lib = library();
+
+        let all = search_library(&lib, "daft", 10);
+        assert_eq!(
+            all.iter().map(|t| t.title.as_str()).collect::<Vec<_>>(),
+            vec!["Da Funk", "Around the World"]
+        );
+
+        let limited = search_library(&lib, "daft", 1);
+        assert_eq!(limited.len(), 1);
+        assert_eq!(limited[0].title, "Da Funk");
+    }
+
+    #[test]
+    fn library_search_ignores_blank_queries_and_zero_limit() {
+        let lib = library();
+
+        assert!(search_library(&lib, "", 10).is_empty());
+        assert!(search_library(&lib, "   ", 10).is_empty());
+        assert!(search_library(&lib, "daft", 0).is_empty());
+    }
+
+    #[test]
+    fn library_search_reports_no_matches() {
+        let lib = library();
+        assert!(search_library(&lib, "nirvana", 10).is_empty());
+    }
+
 }

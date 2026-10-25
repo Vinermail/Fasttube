@@ -28,6 +28,64 @@ struct PlaylistInfo {
     tracks: usize,
 }
 
+/// One row of a search section, as the UI wants it.
+#[derive(Serialize, Clone)]
+struct SearchItemDto {
+    kind: String,
+    id: String,
+    title: String,
+    subtitle: String,
+    thumbnail: String,
+    duration_secs: f64,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    video_type: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    browse_id: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    playlist_id: String,
+    /// Set for local-library rows: the file to play instead of a video id.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+}
+
+#[derive(Serialize, Clone)]
+struct SearchSectionDto {
+    title: String,
+    kind: String,
+    items: Vec<SearchItemDto>,
+}
+
+#[derive(Serialize)]
+struct SearchPayload {
+    sections: Vec<SearchSectionDto>,
+    error: String,
+}
+
+impl From<grpc::SearchSection> for SearchSectionDto {
+    fn from(section: grpc::SearchSection) -> Self {
+        Self {
+            title: section.title,
+            kind: section.kind,
+            items: section
+                .items
+                .into_iter()
+                .map(|item| SearchItemDto {
+                    kind: item.kind,
+                    id: item.id,
+                    title: item.title,
+                    subtitle: item.subtitle,
+                    thumbnail: item.thumbnail,
+                    duration_secs: item.duration_secs,
+                    video_type: item.video_type,
+                    browse_id: item.browse_id,
+                    playlist_id: item.playlist_id,
+                    path: None,
+                })
+                .collect(),
+        }
+    }
+}
+
 #[derive(Serialize, Clone)]
 struct SearchTrack {
     video_id: String,
@@ -675,6 +733,85 @@ fn get_download_progress(state: tauri::State<AppState>) -> downloader::DownloadP
     state.download.snapshot()
 }
 
+/// YouTube Music search with the local library prepended.
+///
+/// The library is scanned in its own scope: no lock is held across the gRPC
+/// await, so fast typing in the UI cannot queue up on a mutex.
+#[tauri::command]
+async fn search_music(
+    query: String,
+    filter: Option<String>,
+    state: tauri::State<'_, AppState>,
+) -> Result<SearchPayload, String> {
+    let query = query.trim().to_string();
+    let filter = filter.unwrap_or_default();
+    if query.is_empty() {
+        return Ok(SearchPayload {
+            sections: Vec::new(),
+            error: String::new(),
+        });
+    }
+
+    let mut sections: Vec<SearchSectionDto> = Vec::new();
+    if filter.is_empty() || filter == "songs" {
+        let local: Vec<SearchItemDto> = {
+            let library = state.library.lock();
+            playlist::search_library(&library, &query, 10)
+                .into_iter()
+                .map(|track| {
+                    let path = track.path.to_string_lossy().into_owned();
+                    SearchItemDto {
+                        kind: "song".to_string(),
+                        id: path.clone(),
+                        title: track.title.clone(),
+                        subtitle: track.artist.clone(),
+                        thumbnail: track
+                            .cover
+                            .as_ref()
+                            .map(|c| c.to_string_lossy().into_owned())
+                            .unwrap_or_default(),
+                        duration_secs: track.duration.unwrap_or(0.0),
+                        video_type: String::new(),
+                        browse_id: String::new(),
+                        playlist_id: String::new(),
+                        path: Some(path),
+                    }
+                })
+                .collect()
+        };
+        if !local.is_empty() {
+            sections.push(SearchSectionDto {
+                title: "Моя библиотека".to_string(),
+                kind: "song".to_string(),
+                items: local,
+            });
+        }
+    }
+
+    match grpc::search(&query, &filter, 20).await {
+        Ok(remote) => {
+            sections.extend(remote.into_iter().map(SearchSectionDto::from));
+            Ok(SearchPayload {
+                sections,
+                error: String::new(),
+            })
+        }
+        // Keep the library hits: the user can still play those.
+        Err(e) => Ok(SearchPayload {
+            sections,
+            error: e.to_string(),
+        }),
+    }
+}
+
+#[tauri::command]
+async fn search_suggestions(query: String) -> Result<Vec<String>, String> {
+    if query.trim().len() < 2 {
+        return Ok(Vec::new());
+    }
+    grpc::suggest(&query).await.map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 async fn search_youtube(
     query: String,
@@ -1213,6 +1350,7 @@ async fn play_current(state: &AppState) -> Result<(), String> {
             path: dest.clone(),
             title: item.title.clone(),
             artist: item.artist.clone(),
+            album: String::new(),
             duration: if item.duration_secs > 0.0 {
                 Some(item.duration_secs)
             } else {
@@ -1680,6 +1818,7 @@ fn open_favorites(state: tauri::State<AppState>) -> Result<Vec<engine::TrackInfo
             path: std::path::PathBuf::from(f.path),
             title: f.title,
             artist: f.artist,
+            album: String::new(),
             duration: if f.duration > 0.0 {
                 Some(f.duration)
             } else {
@@ -2026,6 +2165,8 @@ fn main() {
             get_api_status,
             get_download_progress,
             search_youtube,
+            search_music,
+            search_suggestions,
             get_user_playlists,
             get_playlist_tracks,
             get_liked_songs,

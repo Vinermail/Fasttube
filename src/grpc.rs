@@ -13,7 +13,7 @@ pub use proto::{
     Empty, HealthResponse, LyricsRequest, LyricsResponse, ParseAuthHeadersRequest,
     PlaylistTracksRequest, PlaylistTracksResponse, PrefetchResolveRequest, RecommendRequest,
     ResolveRequest, ResolveResponse, SearchRequest, SearchSection, SessionState, SessionStatus,
-    SetSessionRequest, Track, UserPlaylistsResponse,
+    SetSessionRequest, SuggestRequest, Track, UserPlaylistsResponse,
     player_api_client::PlayerApiClient,
 };
 
@@ -23,6 +23,8 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(15);
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(45);
 /// Music search goes through ytmusicapi and may page through results.
 const SEARCH_TIMEOUT: Duration = Duration::from_secs(20);
+/// Autocomplete must feel instant; a slow answer is worse than none.
+const SUGGEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// One channel for the whole process: the sidecar reports its port once at
 /// startup and every call reuses this connection instead of dialling again.
@@ -155,6 +157,21 @@ pub async fn search(query: &str, filter: &str, limit: i32) -> Result<Vec<SearchS
         return Err(anyhow::anyhow!(resp.error));
     }
     Ok(resp.sections)
+}
+
+/// Query suggestions for the search box.
+pub async fn suggest(query: &str) -> Result<Vec<String>> {
+    let mut client = connect().await?;
+    let resp = client
+        .suggest(with_timeout(
+            SuggestRequest {
+                query: query.to_string(),
+            },
+            SUGGEST_TIMEOUT,
+        ))
+        .await?
+        .into_inner();
+    Ok(resp.suggestions)
 }
 
 pub async fn get_user_playlists() -> Result<UserPlaylistsResponse> {
