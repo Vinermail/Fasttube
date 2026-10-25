@@ -44,6 +44,11 @@ class PlayerApiStub:
                 request_serializer=player__api__pb2.SearchRequest.SerializeToString,
                 response_deserializer=player__api__pb2.SearchResponse.FromString,
                 _registered_method=True)
+        self.Suggest = channel.unary_unary(
+                '/player.PlayerApi/Suggest',
+                request_serializer=player__api__pb2.SuggestRequest.SerializeToString,
+                response_deserializer=player__api__pb2.SuggestResponse.FromString,
+                _registered_method=True)
         self.ResolveUrl = channel.unary_unary(
                 '/player.PlayerApi/ResolveUrl',
                 request_serializer=player__api__pb2.ResolveRequest.SerializeToString,
@@ -111,6 +116,12 @@ class PlayerApiServicer:
         raise NotImplementedError('Method not implemented!')
 
     def Search(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def Suggest(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -194,6 +205,11 @@ def add_PlayerApiServicer_to_server(servicer, server):
                     servicer.Search,
                     request_deserializer=player__api__pb2.SearchRequest.FromString,
                     response_serializer=player__api__pb2.SearchResponse.SerializeToString,
+            ),
+            'Suggest': grpc.unary_unary_rpc_method_handler(
+                    servicer.Suggest,
+                    request_deserializer=player__api__pb2.SuggestRequest.FromString,
+                    response_serializer=player__api__pb2.SuggestResponse.SerializeToString,
             ),
             'ResolveUrl': grpc.unary_unary_rpc_method_handler(
                     servicer.ResolveUrl,
@@ -305,6 +321,33 @@ class PlayerApi:
             '/player.PlayerApi/Search',
             player__api__pb2.SearchRequest.SerializeToString,
             player__api__pb2.SearchResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def Suggest(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/player.PlayerApi/Suggest',
+            player__api__pb2.SuggestRequest.SerializeToString,
+            player__api__pb2.SuggestResponse.FromString,
             options,
             channel_credentials,
             insecure,

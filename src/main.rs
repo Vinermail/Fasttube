@@ -679,24 +679,24 @@ fn get_download_progress(state: tauri::State<AppState>) -> downloader::DownloadP
 async fn search_youtube(
     query: String,
     limit: Option<i32>,
-    music: Option<bool>,
+    _music: Option<bool>,
     _state: tauri::State<'_, AppState>,
 ) -> Result<Vec<SearchTrack>, String> {
-    let tracks = grpc::search(
-        &query,
-        limit.unwrap_or(20).clamp(1, 100),
-        music.unwrap_or(false),
-    )
-    .await
-    .map_err(|e| e.to_string())?;
-    Ok(tracks
+    // Stage 1 bridge: the sidecar answers with sections now, the UI still wants
+    // a flat song list. Replaced by search_music/search_suggestions next stage.
+    let sections = grpc::search(&query, "songs", limit.unwrap_or(20).clamp(1, 100))
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(sections
         .into_iter()
-        .map(|t| SearchTrack {
-            video_id: t.video_id,
-            title: t.title,
-            artist: t.artist,
-            duration_secs: t.duration_secs,
-            thumbnail: t.thumbnail,
+        .flat_map(|section| section.items)
+        .filter(|item| item.kind == "song" || item.kind == "video")
+        .map(|item| SearchTrack {
+            video_id: item.id,
+            title: item.title,
+            artist: item.subtitle,
+            duration_secs: item.duration_secs,
+            thumbnail: item.thumbnail,
         })
         .collect())
 }

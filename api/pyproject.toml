@@ -20,6 +20,7 @@ build-backend = "hatchling.build"
 
 [dependency-groups]
 dev = [
+    "pytest>=9.1.1",
     "ruff>=0.17.2",
 ]
 
@@ -33,3 +34,6 @@ exclude = ["src/ytapi/pb"]
 [tool.ruff.lint]
 # pyflakes: F821 (undefined name) is exactly the bug class this module had.
 select = ["F"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -85,15 +85,45 @@ class PlayerApiServicer(player_api_pb2_grpc.PlayerApiServicer):
 
     def Search(self, request, context):
         try:
-            tracks = youtube.search(
-                request.query, limit=request.limit or 20, music=request.music
+            result = youtube.search_music(
+                request.query, request.filter, request.limit or 20
             )
-            return player_api_pb2.SearchResponse(
-                tracks=[_to_pb_track(t) for t in tracks]
-            )
-        except Exception as e:
+        except Exception as e:  # search_music reports errors, this is a bug path
             log.exception("search failed")
-            context.abort(grpc.StatusCode.INTERNAL, str(e))
+            return player_api_pb2.SearchResponse(error=str(e))
+        return player_api_pb2.SearchResponse(
+            sections=[
+                player_api_pb2.SearchSection(
+                    title=section.get("title", ""),
+                    kind=section.get("kind", ""),
+                    items=[
+                        player_api_pb2.SearchItem(
+                            kind=item.get("kind", ""),
+                            id=item.get("id", ""),
+                            title=item.get("title", ""),
+                            subtitle=item.get("subtitle", ""),
+                            thumbnail=item.get("thumbnail", ""),
+                            duration_secs=item.get("duration_secs", 0.0),
+                            video_type=item.get("video_type", ""),
+                            browse_id=item.get("browse_id", ""),
+                            playlist_id=item.get("playlist_id", ""),
+                        )
+                        for item in section.get("items", [])
+                    ],
+                )
+                for section in result.get("sections", [])
+            ],
+            error=result.get("error", ""),
+        )
+
+    def Suggest(self, request, context):
+        try:
+            return player_api_pb2.SuggestResponse(
+                suggestions=youtube.suggestions(request.query)
+            )
+        except Exception:
+            log.exception("suggest failed")
+            return player_api_pb2.SuggestResponse()
 
     def ResolveUrl(self, request, context):
         try:

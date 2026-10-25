@@ -24,15 +24,15 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x10player_api.proto\x12\x06player\"\x07\n\x05\x45mpty\"W\n\x0eHealthResponse\x12\x0e\n\x06status\x18\x01 \x01(\t\x12\x0f\n\x07version\x18\x02 \x01(\t\x12\x13\n\x0bytdlp_ready\x18\x03 \x01(\x08\x12\x0f\n\x07\x61uth_ok\x18\x04 \x01(\x08\"q\n\x05Track\x12\x10\n\x08video_id\x18\x01 \x01(\t\x12\r\n\x05title\x18\x02 \x01(\t\x12\x0e\n\x06\x61rtist\x18\x03 \x01(\t\x12\r\n\x05\x61lbum\x18\x04 \x01(\t\x12\x15\n\rduration_secs\x18\x05 \x01(\x01\x12\x11\n\tthumbnail\x18\x06 \x01(\t\"<\n\rSearchRequest\x12\r\n\x05query\x18\x01 \x01(\t\x12\r\n\x05limit\x18\x02 \x01(\x05\x12\r\n\x05music\x18\x03 \x01(\x08\"/\n\x0eSearchResponse\x12\x1d\n\x06tracks\x18\x01 \x03(\x0b\x32\r.player.Track\"]\n\x0eResolveRequest\x12\x10\n\x08video_id\x18\x01 \x01(\t\x12\x15\n\raudio_quality\x18\x02 \x01(\t\x12\r\n\x05\x66orce\x18\x03 \x01(\x08\x12\x13\n\x0buse_account\x18\x04 \x01(\x08\"\x97\x01\n\x0fResolveResponse\x12\n\n\x02ok\x18\x01 \x01(\x08\x12\r\n\x05\x65rror\x18\x02 \x01(\t\x12\x1c\n\x05track\x18\x03 \x01(\x0b\x32\r.player.Track\x12\x12\n\nstream_url\x18\x04 \x01(\t\x12\x11\n\tmime_type\x18\x05 \x01(\t\x12\x16\n\x0e\x63ontent_length\x18\x06 \x01(\x04\x12\x0c\n\x04itag\x18\x07 \x01(\x05\"Q\n\x16PrefetchResolveRequest\x12\x0b\n\x03ids\x18\x01 \x03(\t\x12\x15\n\raudio_quality\x18\x02 \x01(\t\x12\x13\n\x0buse_account\x18\x03 \x01(\x08\"+\n\x17PrefetchResolveResponse\x12\x10\n\x08resolved\x18\x01 \x01(\x05\"3\n\x10RecommendRequest\x12\x10\n\x08video_id\x18\x01 \x01(\t\x12\r\n\x05limit\x18\x02 \x01(\x05\"2\n\x11RecommendResponse\x12\x1d\n\x06tracks\x18\x01 \x03(\x0b\x32\r.player.Track\"P\n\x0cUserPlaylist\x12\n\n\x02id\x18\x01 \x01(\t\x12\x0c\n\x04name\x18\x02 \x01(\t\x12\x13\n\x0btrack_count\x18\x03 \x01(\x05\x12\x11\n\tthumbnail\x18\x04 \x01(\t\"o\n\x15UserPlaylistsResponse\x12\'\n\tplaylists\x18\x01 \x03(\x0b\x32\x14.player.UserPlaylist\x12\x10\n\x08has_auth\x18\x02 \x01(\x08\x12\x0c\n\x04hint\x18\x03 \x01(\t\x12\r\n\x05\x65rror\x18\x04 \x01(\t\"#\n\x15PlaylistTracksRequest\x12\n\n\x02id\x18\x01 \x01(\t\"F\n\x16PlaylistTracksResponse\x12\x1d\n\x06tracks\x18\x01 \x03(\x0b\x32\r.player.Track\x12\r\n\x05\x65rror\x18\x02 \x01(\t\"\'\n\x17ParseAuthHeadersRequest\x12\x0c\n\x04text\x18\x01 \x01(\t\"P\n\x11SetSessionRequest\x12\x0e\n\x06\x63ookie\x18\x01 \x01(\t\x12\x12\n\nuser_agent\x18\x02 \x01(\t\x12\x17\n\x0fx_goog_authuser\x18\x03 \x01(\t\"Y\n\rSessionStatus\x12#\n\x05state\x18\x01 \x01(\x0e\x32\x14.player.SessionState\x12\x14\n\x0c\x61\x63\x63ount_name\x18\x02 \x01(\t\x12\r\n\x05\x65rror\x18\x03 \x01(\t\"E\n\rLyricsRequest\x12\x0e\n\x06\x61rtist\x18\x01 \x01(\t\x12\r\n\x05title\x18\x02 \x01(\t\x12\x15\n\rduration_secs\x18\x03 \x01(\x01\"J\n\x0eLyricsResponse\x12\n\n\x02ok\x18\x01 \x01(\x08\x12\x0e\n\x06synced\x18\x02 \x01(\t\x12\r\n\x05plain\x18\x03 \x01(\t\x12\r\n\x05\x65rror\x18\x04 \x01(\t*V\n\x0cSessionState\x12\x1d\n\x19SESSION_STATE_UNSPECIFIED\x10\x00\x12\x0e\n\nSIGNED_OUT\x10\x01\x12\n\n\x06\x41\x43TIVE\x10\x02\x12\x0b\n\x07\x45XPIRED\x10\x03\x32\xdb\x06\n\tPlayerApi\x12/\n\x06Health\x12\r.player.Empty\x1a\x16.player.HealthResponse\x12\x37\n\x06Search\x12\x15.player.SearchRequest\x1a\x16.player.SearchResponse\x12=\n\nResolveUrl\x12\x16.player.ResolveRequest\x1a\x17.player.ResolveResponse\x12R\n\x0fPrefetchResolve\x12\x1e.player.PrefetchResolveRequest\x1a\x1f.player.PrefetchResolveResponse\x12@\n\tRecommend\x12\x18.player.RecommendRequest\x1a\x19.player.RecommendResponse\x12@\n\x10GetUserPlaylists\x12\r.player.Empty\x1a\x1d.player.UserPlaylistsResponse\x12R\n\x11GetPlaylistTracks\x12\x1d.player.PlaylistTracksRequest\x1a\x1e.player.PlaylistTracksResponse\x12>\n\rGetLikedSongs\x12\r.player.Empty\x1a\x1e.player.PlaylistTracksResponse\x12:\n\tGetLyrics\x12\x15.player.LyricsRequest\x1a\x16.player.LyricsResponse\x12>\n\nSetSession\x12\x19.player.SetSessionRequest\x1a\x15.player.SessionStatus\x12N\n\x10ParseAuthHeaders\x12\x1f.player.ParseAuthHeadersRequest\x1a\x19.player.SetSessionRequest\x12\x37\n\x0fValidateSession\x12\r.player.Empty\x1a\x15.player.SessionStatus\x12\x34\n\x0c\x43learSession\x12\r.player.Empty\x1a\x15.player.SessionStatusb\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x10player_api.proto\x12\x06player\"\x07\n\x05\x45mpty\"W\n\x0eHealthResponse\x12\x0e\n\x06status\x18\x01 \x01(\t\x12\x0f\n\x07version\x18\x02 \x01(\t\x12\x13\n\x0bytdlp_ready\x18\x03 \x01(\x08\x12\x0f\n\x07\x61uth_ok\x18\x04 \x01(\x08\"q\n\x05Track\x12\x10\n\x08video_id\x18\x01 \x01(\t\x12\r\n\x05title\x18\x02 \x01(\t\x12\x0e\n\x06\x61rtist\x18\x03 \x01(\t\x12\r\n\x05\x61lbum\x18\x04 \x01(\t\x12\x15\n\rduration_secs\x18\x05 \x01(\x01\x12\x11\n\tthumbnail\x18\x06 \x01(\t\"=\n\rSearchRequest\x12\r\n\x05query\x18\x01 \x01(\t\x12\r\n\x05limit\x18\x02 \x01(\x05\x12\x0e\n\x06\x66ilter\x18\x03 \x01(\t\"O\n\rSearchSection\x12\r\n\x05title\x18\x01 \x01(\t\x12\x0c\n\x04kind\x18\x02 \x01(\t\x12!\n\x05items\x18\x03 \x03(\x0b\x32\x12.player.SearchItem\"\xad\x01\n\nSearchItem\x12\x0c\n\x04kind\x18\x01 \x01(\t\x12\n\n\x02id\x18\x02 \x01(\t\x12\r\n\x05title\x18\x03 \x01(\t\x12\x10\n\x08subtitle\x18\x04 \x01(\t\x12\x11\n\tthumbnail\x18\x05 \x01(\t\x12\x15\n\rduration_secs\x18\x06 \x01(\x01\x12\x12\n\nvideo_type\x18\x07 \x01(\t\x12\x11\n\tbrowse_id\x18\x08 \x01(\t\x12\x13\n\x0bplaylist_id\x18\t \x01(\t\"H\n\x0eSearchResponse\x12\'\n\x08sections\x18\x01 \x03(\x0b\x32\x15.player.SearchSection\x12\r\n\x05\x65rror\x18\x02 \x01(\t\"\x1f\n\x0eSuggestRequest\x12\r\n\x05query\x18\x01 \x01(\t\"&\n\x0fSuggestResponse\x12\x13\n\x0bsuggestions\x18\x01 \x03(\t\"]\n\x0eResolveRequest\x12\x10\n\x08video_id\x18\x01 \x01(\t\x12\x15\n\raudio_quality\x18\x02 \x01(\t\x12\r\n\x05\x66orce\x18\x03 \x01(\x08\x12\x13\n\x0buse_account\x18\x04 \x01(\x08\"\x97\x01\n\x0fResolveResponse\x12\n\n\x02ok\x18\x01 \x01(\x08\x12\r\n\x05\x65rror\x18\x02 \x01(\t\x12\x1c\n\x05track\x18\x03 \x01(\x0b\x32\r.player.Track\x12\x12\n\nstream_url\x18\x04 \x01(\t\x12\x11\n\tmime_type\x18\x05 \x01(\t\x12\x16\n\x0e\x63ontent_length\x18\x06 \x01(\x04\x12\x0c\n\x04itag\x18\x07 \x01(\x05\"Q\n\x16PrefetchResolveRequest\x12\x0b\n\x03ids\x18\x01 \x03(\t\x12\x15\n\raudio_quality\x18\x02 \x01(\t\x12\x13\n\x0buse_account\x18\x03 \x01(\x08\"+\n\x17PrefetchResolveResponse\x12\x10\n\x08resolved\x18\x01 \x01(\x05\"3\n\x10RecommendRequest\x12\x10\n\x08video_id\x18\x01 \x01(\t\x12\r\n\x05limit\x18\x02 \x01(\x05\"2\n\x11RecommendResponse\x12\x1d\n\x06tracks\x18\x01 \x03(\x0b\x32\r.player.Track\"P\n\x0cUserPlaylist\x12\n\n\x02id\x18\x01 \x01(\t\x12\x0c\n\x04name\x18\x02 \x01(\t\x12\x13\n\x0btrack_count\x18\x03 \x01(\x05\x12\x11\n\tthumbnail\x18\x04 \x01(\t\"o\n\x15UserPlaylistsResponse\x12\'\n\tplaylists\x18\x01 \x03(\x0b\x32\x14.player.UserPlaylist\x12\x10\n\x08has_auth\x18\x02 \x01(\x08\x12\x0c\n\x04hint\x18\x03 \x01(\t\x12\r\n\x05\x65rror\x18\x04 \x01(\t\"#\n\x15PlaylistTracksRequest\x12\n\n\x02id\x18\x01 \x01(\t\"F\n\x16PlaylistTracksResponse\x12\x1d\n\x06tracks\x18\x01 \x03(\x0b\x32\r.player.Track\x12\r\n\x05\x65rror\x18\x02 \x01(\t\"\'\n\x17ParseAuthHeadersRequest\x12\x0c\n\x04text\x18\x01 \x01(\t\"P\n\x11SetSessionRequest\x12\x0e\n\x06\x63ookie\x18\x01 \x01(\t\x12\x12\n\nuser_agent\x18\x02 \x01(\t\x12\x17\n\x0fx_goog_authuser\x18\x03 \x01(\t\"Y\n\rSessionStatus\x12#\n\x05state\x18\x01 \x01(\x0e\x32\x14.player.SessionState\x12\x14\n\x0c\x61\x63\x63ount_name\x18\x02 \x01(\t\x12\r\n\x05\x65rror\x18\x03 \x01(\t\"E\n\rLyricsRequest\x12\x0e\n\x06\x61rtist\x18\x01 \x01(\t\x12\r\n\x05title\x18\x02 \x01(\t\x12\x15\n\rduration_secs\x18\x03 \x01(\x01\"J\n\x0eLyricsResponse\x12\n\n\x02ok\x18\x01 \x01(\x08\x12\x0e\n\x06synced\x18\x02 \x01(\t\x12\r\n\x05plain\x18\x03 \x01(\t\x12\r\n\x05\x65rror\x18\x04 \x01(\t*V\n\x0cSessionState\x12\x1d\n\x19SESSION_STATE_UNSPECIFIED\x10\x00\x12\x0e\n\nSIGNED_OUT\x10\x01\x12\n\n\x06\x41\x43TIVE\x10\x02\x12\x0b\n\x07\x45XPIRED\x10\x03\x32\x97\x07\n\tPlayerApi\x12/\n\x06Health\x12\r.player.Empty\x1a\x16.player.HealthResponse\x12\x37\n\x06Search\x12\x15.player.SearchRequest\x1a\x16.player.SearchResponse\x12:\n\x07Suggest\x12\x16.player.SuggestRequest\x1a\x17.player.SuggestResponse\x12=\n\nResolveUrl\x12\x16.player.ResolveRequest\x1a\x17.player.ResolveResponse\x12R\n\x0fPrefetchResolve\x12\x1e.player.PrefetchResolveRequest\x1a\x1f.player.PrefetchResolveResponse\x12@\n\tRecommend\x12\x18.player.RecommendRequest\x1a\x19.player.RecommendResponse\x12@\n\x10GetUserPlaylists\x12\r.player.Empty\x1a\x1d.player.UserPlaylistsResponse\x12R\n\x11GetPlaylistTracks\x12\x1d.player.PlaylistTracksRequest\x1a\x1e.player.PlaylistTracksResponse\x12>\n\rGetLikedSongs\x12\r.player.Empty\x1a\x1e.player.PlaylistTracksResponse\x12:\n\tGetLyrics\x12\x15.player.LyricsRequest\x1a\x16.player.LyricsResponse\x12>\n\nSetSession\x12\x19.player.SetSessionRequest\x1a\x15.player.SessionStatus\x12N\n\x10ParseAuthHeaders\x12\x1f.player.ParseAuthHeadersRequest\x1a\x19.player.SetSessionRequest\x12\x37\n\x0fValidateSession\x12\r.player.Empty\x1a\x15.player.SessionStatus\x12\x34\n\x0c\x43learSession\x12\r.player.Empty\x1a\x15.player.SessionStatusb\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
 _builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, 'player_api_pb2', _globals)
 if not _descriptor._USE_C_DESCRIPTORS:
   DESCRIPTOR._loaded_options = None
-  _globals['_SESSIONSTATE']._serialized_start=1499
-  _globals['_SESSIONSTATE']._serialized_end=1585
+  _globals['_SESSIONSTATE']._serialized_start=1855
+  _globals['_SESSIONSTATE']._serialized_end=1941
   _globals['_EMPTY']._serialized_start=28
   _globals['_EMPTY']._serialized_end=35
   _globals['_HEALTHRESPONSE']._serialized_start=37
@@ -40,39 +40,47 @@ if not _descriptor._USE_C_DESCRIPTORS:
   _globals['_TRACK']._serialized_start=126
   _globals['_TRACK']._serialized_end=239
   _globals['_SEARCHREQUEST']._serialized_start=241
-  _globals['_SEARCHREQUEST']._serialized_end=301
-  _globals['_SEARCHRESPONSE']._serialized_start=303
-  _globals['_SEARCHRESPONSE']._serialized_end=350
-  _globals['_RESOLVEREQUEST']._serialized_start=352
-  _globals['_RESOLVEREQUEST']._serialized_end=445
-  _globals['_RESOLVERESPONSE']._serialized_start=448
-  _globals['_RESOLVERESPONSE']._serialized_end=599
-  _globals['_PREFETCHRESOLVEREQUEST']._serialized_start=601
-  _globals['_PREFETCHRESOLVEREQUEST']._serialized_end=682
-  _globals['_PREFETCHRESOLVERESPONSE']._serialized_start=684
-  _globals['_PREFETCHRESOLVERESPONSE']._serialized_end=727
-  _globals['_RECOMMENDREQUEST']._serialized_start=729
-  _globals['_RECOMMENDREQUEST']._serialized_end=780
-  _globals['_RECOMMENDRESPONSE']._serialized_start=782
-  _globals['_RECOMMENDRESPONSE']._serialized_end=832
-  _globals['_USERPLAYLIST']._serialized_start=834
-  _globals['_USERPLAYLIST']._serialized_end=914
-  _globals['_USERPLAYLISTSRESPONSE']._serialized_start=916
-  _globals['_USERPLAYLISTSRESPONSE']._serialized_end=1027
-  _globals['_PLAYLISTTRACKSREQUEST']._serialized_start=1029
-  _globals['_PLAYLISTTRACKSREQUEST']._serialized_end=1064
-  _globals['_PLAYLISTTRACKSRESPONSE']._serialized_start=1066
-  _globals['_PLAYLISTTRACKSRESPONSE']._serialized_end=1136
-  _globals['_PARSEAUTHHEADERSREQUEST']._serialized_start=1138
-  _globals['_PARSEAUTHHEADERSREQUEST']._serialized_end=1177
-  _globals['_SETSESSIONREQUEST']._serialized_start=1179
-  _globals['_SETSESSIONREQUEST']._serialized_end=1259
-  _globals['_SESSIONSTATUS']._serialized_start=1261
-  _globals['_SESSIONSTATUS']._serialized_end=1350
-  _globals['_LYRICSREQUEST']._serialized_start=1352
-  _globals['_LYRICSREQUEST']._serialized_end=1421
-  _globals['_LYRICSRESPONSE']._serialized_start=1423
-  _globals['_LYRICSRESPONSE']._serialized_end=1497
-  _globals['_PLAYERAPI']._serialized_start=1588
-  _globals['_PLAYERAPI']._serialized_end=2447
+  _globals['_SEARCHREQUEST']._serialized_end=302
+  _globals['_SEARCHSECTION']._serialized_start=304
+  _globals['_SEARCHSECTION']._serialized_end=383
+  _globals['_SEARCHITEM']._serialized_start=386
+  _globals['_SEARCHITEM']._serialized_end=559
+  _globals['_SEARCHRESPONSE']._serialized_start=561
+  _globals['_SEARCHRESPONSE']._serialized_end=633
+  _globals['_SUGGESTREQUEST']._serialized_start=635
+  _globals['_SUGGESTREQUEST']._serialized_end=666
+  _globals['_SUGGESTRESPONSE']._serialized_start=668
+  _globals['_SUGGESTRESPONSE']._serialized_end=706
+  _globals['_RESOLVEREQUEST']._serialized_start=708
+  _globals['_RESOLVEREQUEST']._serialized_end=801
+  _globals['_RESOLVERESPONSE']._serialized_start=804
+  _globals['_RESOLVERESPONSE']._serialized_end=955
+  _globals['_PREFETCHRESOLVEREQUEST']._serialized_start=957
+  _globals['_PREFETCHRESOLVEREQUEST']._serialized_end=1038
+  _globals['_PREFETCHRESOLVERESPONSE']._serialized_start=1040
+  _globals['_PREFETCHRESOLVERESPONSE']._serialized_end=1083
+  _globals['_RECOMMENDREQUEST']._serialized_start=1085
+  _globals['_RECOMMENDREQUEST']._serialized_end=1136
+  _globals['_RECOMMENDRESPONSE']._serialized_start=1138
+  _globals['_RECOMMENDRESPONSE']._serialized_end=1188
+  _globals['_USERPLAYLIST']._serialized_start=1190
+  _globals['_USERPLAYLIST']._serialized_end=1270
+  _globals['_USERPLAYLISTSRESPONSE']._serialized_start=1272
+  _globals['_USERPLAYLISTSRESPONSE']._serialized_end=1383
+  _globals['_PLAYLISTTRACKSREQUEST']._serialized_start=1385
+  _globals['_PLAYLISTTRACKSREQUEST']._serialized_end=1420
+  _globals['_PLAYLISTTRACKSRESPONSE']._serialized_start=1422
+  _globals['_PLAYLISTTRACKSRESPONSE']._serialized_end=1492
+  _globals['_PARSEAUTHHEADERSREQUEST']._serialized_start=1494
+  _globals['_PARSEAUTHHEADERSREQUEST']._serialized_end=1533
+  _globals['_SETSESSIONREQUEST']._serialized_start=1535
+  _globals['_SETSESSIONREQUEST']._serialized_end=1615
+  _globals['_SESSIONSTATUS']._serialized_start=1617
+  _globals['_SESSIONSTATUS']._serialized_end=1706
+  _globals['_LYRICSREQUEST']._serialized_start=1708
+  _globals['_LYRICSREQUEST']._serialized_end=1777
+  _globals['_LYRICSRESPONSE']._serialized_start=1779
+  _globals['_LYRICSRESPONSE']._serialized_end=1853
+  _globals['_PLAYERAPI']._serialized_start=1944
+  _globals['_PLAYERAPI']._serialized_end=2863
 # @@protoc_insertion_point(module_scope)

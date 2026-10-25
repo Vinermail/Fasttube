@@ -12,8 +12,8 @@ pub mod proto {
 pub use proto::{
     Empty, HealthResponse, LyricsRequest, LyricsResponse, ParseAuthHeadersRequest,
     PlaylistTracksRequest, PlaylistTracksResponse, PrefetchResolveRequest, RecommendRequest,
-    ResolveRequest, ResolveResponse, SearchRequest, SessionState, SessionStatus, SetSessionRequest,
-    Track, UserPlaylistsResponse,
+    ResolveRequest, ResolveResponse, SearchRequest, SearchSection, SessionState, SessionStatus,
+    SetSessionRequest, Track, UserPlaylistsResponse,
     player_api_client::PlayerApiClient,
 };
 
@@ -21,6 +21,8 @@ pub use proto::{
 /// allowed to take longer (see [`RESOLVE_TIMEOUT`]).
 const CALL_TIMEOUT: Duration = Duration::from_secs(15);
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(45);
+/// Music search goes through ytmusicapi and may page through results.
+const SEARCH_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// One channel for the whole process: the sidecar reports its port once at
 /// startup and every call reuses this connection instead of dialling again.
@@ -134,16 +136,25 @@ pub async fn prefetch_resolve(
     Ok(resp.into_inner().resolved)
 }
 
-pub async fn search(query: &str, limit: i32, music: bool) -> Result<Vec<Track>> {
+/// YouTube Music search. `filter` is "", "songs", "videos", "albums",
+/// "artists" or "playlists"; the sidecar answers with titled sections.
+pub async fn search(query: &str, filter: &str, limit: i32) -> Result<Vec<SearchSection>> {
     let mut client = connect().await?;
     let resp = client
-        .search(request(SearchRequest {
-            query: query.to_string(),
-            limit,
-            music,
-        }))
-        .await?;
-    Ok(resp.into_inner().tracks)
+        .search(with_timeout(
+            SearchRequest {
+                query: query.to_string(),
+                limit,
+                filter: filter.to_string(),
+            },
+            SEARCH_TIMEOUT,
+        ))
+        .await?
+        .into_inner();
+    if !resp.error.is_empty() {
+        return Err(anyhow::anyhow!(resp.error));
+    }
+    Ok(resp.sections)
 }
 
 pub async fn get_user_playlists() -> Result<UserPlaylistsResponse> {

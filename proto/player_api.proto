@@ -23,11 +23,44 @@ message Track {
 message SearchRequest {
   string query = 1;
   int32 limit = 2;
-  bool music = 3;
+  // "", "songs", "videos", "albums", "artists", "playlists"
+  string filter = 3;
+}
+
+// One block of results, rendered as a titled group by the UI.
+message SearchSection {
+  string title = 1;
+  // song | video | album | artist | playlist
+  string kind = 2;
+  repeated SearchItem items = 3;
+}
+
+message SearchItem {
+  // song | video | album | artist | playlist
+  string kind = 1;
+  // videoId for song/video, browseId (or playlist id) for the rest
+  string id = 2;
+  string title = 3;
+  string subtitle = 4;
+  string thumbnail = 5;
+  double duration_secs = 6;
+  // innertube videoType, e.g. MUSIC_VIDEO_TYPE_OMV
+  string video_type = 7;
+  string browse_id = 8;
+  string playlist_id = 9;
 }
 
 message SearchResponse {
-  repeated Track tracks = 1;
+  repeated SearchSection sections = 1;
+  string error = 2;
+}
+
+message SuggestRequest {
+  string query = 1;
+}
+
+message SuggestResponse {
+  repeated string suggestions = 1;
 }
 
 message ResolveRequest {
@@ -128,6 +161,7 @@ message LyricsResponse {
 service PlayerApi {
   rpc Health(Empty) returns (HealthResponse);
   rpc Search(SearchRequest) returns (SearchResponse);
+  rpc Suggest(SuggestRequest) returns (SuggestResponse);
   rpc ResolveUrl(ResolveRequest) returns (ResolveResponse);
   rpc PrefetchResolve(PrefetchResolveRequest) returns (PrefetchResolveResponse);
   rpc Recommend(RecommendRequest) returns (RecommendResponse);

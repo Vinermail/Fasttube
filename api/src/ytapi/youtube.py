@@ -201,205 +201,280 @@ def resolve_url(
     return result
 
 
-def _search_web_direct(query: str, limit: int) -> list[dict]:
-    """Calls the innertube search endpoint directly with the session's headers
-    (the same way youtube.com does), including continuation pages.
+# Search filters accepted by the sidecar, mirroring ytmusicapi's search().
+SEARCH_FILTERS = ("", "songs", "videos", "albums", "artists", "playlists")
 
-    Returns [] when there is no active session; the caller then falls back to
-    yt-dlp's anonymous search. Headers are rebuilt on every call because the
-    SAPISIDHASH they carry embeds a timestamp and expires.
+# Video results are filtered by innertube's videoType. UGC uploads (fan
+# uploads, lyric videos, gameplay clips riding a song title) are what made the
+# old youtube.com search unusable; official videos (OMV/ATV) and
+# MUSIC_VIDEO_TYPE_OFFICIAL_SOURCE_MUSIC stay.
+HIDDEN_VIDEO_TYPES = frozenset({"MUSIC_VIDEO_TYPE_UGC"})
+
+_KIND_BY_RESULT_TYPE = {
+    "song": "song",
+    "video": "video",
+    "album": "album",
+    "artist": "artist",
+    "playlist": "playlist",
+}
+
+_DEFAULT_SECTION_TITLES = {
+    "song": "Songs",
+    "video": "Videos",
+    "album": "Albums",
+    "artist": "Artists",
+    "playlist": "Playlists",
+}
+
+
+def _item_from_result(result: dict) -> dict | None:
+    """One ytmusicapi search result -> SearchItem dict.
+
+    None when the result is not something the app can show or play (profiles,
+    podcasts, UGC videos, entries without an id).
     """
-    snapshot = _session_snapshot()
-    if snapshot is None:
-        return []
-    try:
-        import requests
+    kind = _KIND_BY_RESULT_TYPE.get(result.get("resultType") or "")
+    if kind is None:
+        return None
 
-        hdrs = dict(
-            _browser_headers(
-                snapshot["cookie"], snapshot["user_agent"], snapshot["authuser"]
-            )
+    video_type = result.get("videoType") or ""
+    if kind == "video" and video_type in HIDDEN_VIDEO_TYPES:
+        return None
+
+    thumbnails = result.get("thumbnails") or []
+    item = {
+        "kind": kind,
+        "id": "",
+        "title": "",
+        "subtitle": "",
+        "thumbnail": thumbnails[-1].get("url", "") if thumbnails else "",
+        "duration_secs": 0.0,
+        "video_type": video_type,
+        "browse_id": "",
+        "playlist_id": "",
+    }
+
+    if kind in ("song", "video"):
+        video_id = result.get("videoId") or ""
+        if not video_id:
+            return None
+        artists = ", ".join(
+            a.get("name", "") for a in (result.get("artists") or []) if a.get("name")
         )
-        # The session was captured on music.youtube.com; the web search
-        # endpoint requires Origin/Referer to match www.youtube.com, otherwise
-        # it rejects the request with a 400.
-        hdrs["origin"] = "https://www.youtube.com"
-        hdrs["referer"] = "https://www.youtube.com/"
-        hdrs["x-origin"] = "https://www.youtube.com"
-        # ytmusicapi's defaults describe a response body, not a request body:
-        # sending content-encoding makes the server try to gunzip our JSON.
-        hdrs.pop("content-encoding", None)
-        hdrs.pop("accept-encoding", None)
-        client_version = _web_client_version()
-        hdrs["x-youtube-client-name"] = "1"
-        hdrs["x-youtube-client-version"] = client_version
-
-        proxy = net.detect_proxy()
-        proxies = {"http": proxy, "https": proxy} if proxy else None
-        session = requests.Session()
-
-        context = {
-            "context": {
-                "client": {
-                    "clientName": "WEB",
-                    "clientVersion": client_version,
-                    "hl": "ru",
-                    "gl": "RU",
-                }
+        item.update(
+            {
+                "id": video_id,
+                "title": result.get("title") or "",
+                "subtitle": artists,
+                "duration_secs": float(result.get("duration_seconds") or 0.0),
             }
+        )
+        return item
+
+    if kind == "album":
+        browse_id = result.get("browseId") or ""
+        if not browse_id:
+            return None
+        subtitle = " • ".join(
+            part for part in (result.get("artist"), result.get("year")) if part
+        )
+        item.update(
+            {
+                "id": browse_id,
+                "title": result.get("title") or "",
+                "subtitle": subtitle,
+                "browse_id": browse_id,
+                "playlist_id": result.get("playlistId") or "",
+            }
+        )
+        return item
+
+    if kind == "artist":
+        browse_id = result.get("browseId") or ""
+        if not browse_id:
+            return None
+        item.update(
+            {
+                "id": browse_id,
+                "title": result.get("artist") or "",
+                "subtitle": result.get("subscribers") or "",
+                "browse_id": browse_id,
+            }
+        )
+        return item
+
+    # playlist
+    browse_id = result.get("browseId") or ""
+    playlist_id = result.get("playlistId") or ""
+    if not playlist_id and browse_id.startswith("VL"):
+        playlist_id = browse_id[2:]
+    item_id = browse_id or playlist_id
+    if not item_id:
+        return None
+    count = result.get("itemCount")
+    subtitle = " • ".join(
+        str(part)
+        for part in (result.get("author"), f"{count} songs" if count else "")
+        if part
+    )
+    item.update(
+        {
+            "id": item_id,
+            "title": result.get("title") or "",
+            "subtitle": subtitle,
+            "browse_id": browse_id,
+            "playlist_id": playlist_id,
         }
-
-        tracks: list[dict] = []
-        continuation: str | None = None
-
-        for _ in range(max(1, (limit // 20) + 1)):
-            url = "https://www.youtube.com/youtubei/v1/search?prettyPrint=false"
-            body: dict = dict(context)
-            if continuation:
-                url += f"&continuation={continuation}"
-                body["continuation"] = continuation
-            else:
-                body["query"] = query
-
-            resp = session.post(url, headers=hdrs, json=body, proxies=proxies, timeout=30)
-            if resp.status_code != 200:
-                log.warning("direct search HTTP %s", resp.status_code)
-                break
-            data = resp.json()
-
-            items: list[dict] = []
-            next_token = None
-            if continuation is not None or "continuation" in body:
-                # Continuation responses use `continuationContents`.
-                cc = data.get("continuationContents") or {}
-                slc = cc.get("sectionListContinuation") or {}
-                for section in slc.get("contents", []) or []:
-                    for item in (section.get("itemSectionRenderer") or {}).get("contents", []):
-                        items.append(item)
-                if not items:
-                    isc = cc.get("itemSectionContinuation") or {}
-                    items = isc.get("continuationItems", []) or []
-                if not items:
-                    # Older shape fallback.
-                    for cmd in data.get("onResponseReceivedCommands") or []:
-                        for item in (
-                            cmd.get("appendContinuationItemsAction") or {}
-                        ).get("continuationItems", []):
-                            items.append(item)
-            else:
-                primary = (
-                    (data.get("contents") or {})
-                    .get("twoColumnSearchResultsRenderer", {})
-                    .get("primaryContents", {})
-                    .get("sectionListRenderer", {})
-                )
-                for section in primary.get("contents", []) or []:
-                    for item in (section.get("itemSectionRenderer") or {}).get("contents", []):
-                        items.append(item)
-                # Modern responses keep the token in `continuations`, not in items.
-                for c in primary.get("continuations", []) or []:
-                    tok = (c.get("nextContinuationData") or {}).get("continuation")
-                    if tok:
-                        next_token = tok
-
-            for item in items:
-                vr = item.get("videoRenderer")
-                if vr:
-                    vid = vr.get("videoId")
-                    if not vid:
-                        continue
-                    title = "".join(r.get("text", "") for r in (vr.get("title") or {}).get("runs", []))
-                    artist = "".join(r.get("text", "") for r in (vr.get("ownerText") or {}).get("runs", []))
-                    duration = 0.0
-                    for part in ((vr.get("lengthText") or {}).get("simpleText") or "").split(":"):
-                        duration = duration * 60 + float(part or 0)
-                    thumbnails = (vr.get("thumbnail") or {}).get("thumbnails") or []
-                    thumbnail = thumbnails[-1].get("url", "") if thumbnails else ""
-                    tracks.append(
-                        {
-                            "video_id": vid,
-                            "title": title,
-                            "artist": artist,
-                            "album": "",
-                            "duration_secs": duration,
-                            "thumbnail": thumbnail,
-                        }
-                    )
-                    if len(tracks) >= limit:
-                        return tracks
-                    continue
-                cont = item.get("continuationItemRenderer")
-                if cont:
-                    endpoint = (cont.get("continuationEndpoint") or {}).get("continuationCommand") or {}
-                    next_token = endpoint.get("token")
-            continuation = next_token
-            if not continuation:
-                break
-
-        return tracks
-    except Exception:
-        log.exception("direct web search failed")
-        return []
+    )
+    return item
 
 
-def search(query: str, limit: int = 20, music: bool = False) -> list[dict]:
-    """Search. `music=False` mirrors the youtube.com web search: with an active
-    session the innertube search endpoint is called directly with the session's
-    headers (personalized, logged-in results); otherwise yt-dlp's anonymous
-    search is used. `music=True` searches the YouTube Music catalog."""
-    if not music:
-        tracks = _search_web_direct(query, limit)
-        if tracks:
-            return tracks
+def _section_key(result: dict, item: dict) -> str:
+    """Groups results the way YTM groups them.
+
+    Default search carries a localized `category` ("Top result", "Songs", ...);
+    a filtered search carries none and is a single group. Community/featured
+    playlists are folded into the playlists group so the UI always shows one
+    playlist section.
+    """
+    if item["kind"] == "playlist":
+        return "playlist"
+    category = (result.get("category") or "").strip()
+    return f"{item['kind']}:{category}" if category else item["kind"]
+
+
+def sections_from_results(
+    results: list[dict], filter_kind: str = "", limit: int = 20
+) -> list[dict]:
+    """Flat ytmusicapi results -> sections, in YouTube Music's order."""
+    sections: list[dict] = []
+    by_key: dict[str, dict] = {}
+    seen: set[str] = set()
+
+    for result in results or []:
+        if not isinstance(result, dict):
+            continue
+        item = _item_from_result(result)
+        if item is None or not item["id"] or item["id"] in seen:
+            continue
+        if filter_kind and item["kind"] != filter_kind:
+            continue
+
+        seen.add(item["id"])
+        key = _section_key(result, item)
+        section = by_key.get(key)
+        if section is None:
+            title = (result.get("category") or "").strip() or _DEFAULT_SECTION_TITLES.get(
+                item["kind"], item["kind"].title()
+            )
+            section = {"title": title, "kind": item["kind"], "items": []}
+            by_key[key] = section
+            sections.append(section)
+        if len(section["items"]) < limit:
+            section["items"].append(item)
+
+    return [section for section in sections if section["items"]]
+
+
+def _search_fallback(query: str, limit: int) -> dict:
+    """yt-dlp ytsearch, used once when ytmusicapi fails for songs/all."""
+    try:
         import yt_dlp
 
-        opts = {"quiet": True, "no_warnings": True, "skip_download": True, "noplaylist": True}
+        opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "skip_download": True,
+            "noplaylist": True,
+        }
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(f"ytsearch{limit}:{query}", download=False)
-        out = []
+        items: list[dict] = []
+        seen: set[str] = set()
         for entry in (info or {}).get("entries", []) or []:
-            if entry:
-                out.append(_track_from_info(entry))
-        return out
+            if not entry:
+                continue
+            track = _track_from_info(entry)
+            video_id = track.get("video_id") or ""
+            if not video_id or video_id in seen:
+                continue
+            seen.add(video_id)
+            items.append(
+                {
+                    "kind": "song",
+                    "id": video_id,
+                    "title": track.get("title") or "",
+                    "subtitle": track.get("artist") or "",
+                    "thumbnail": track.get("thumbnail") or "",
+                    "duration_secs": float(track.get("duration_secs") or 0.0),
+                    "video_type": "",
+                    "browse_id": "",
+                    "playlist_id": "",
+                }
+            )
+            if len(items) >= limit:
+                break
+        section = {"title": _DEFAULT_SECTION_TITLES["song"], "kind": "song", "items": items}
+        return {"sections": [section] if items else [], "error": ""}
+    except Exception as e:
+        log.warning("yt-dlp search fallback failed: %s", e)
+        return {"sections": [], "error": f"search failed: {e}"}
+
+
+def search_music(query: str, filter_name: str = "", limit: int = 20) -> dict:
+    """YouTube Music search, sectioned for the UI.
+
+    Returns {"sections": [{"title", "kind", "items": [...]}], "error": ""}.
+    """
+    query = (query or "").strip()
+    filter_name = (filter_name or "").strip()
+    if filter_name not in SEARCH_FILTERS:
+        return {"sections": [], "error": f"unknown filter: {filter_name}"}
+    if not query:
+        return {"sections": [], "error": ""}
+    limit = max(1, min(int(limit or 20), 50))
 
     try:
         from ytmusicapi import YTMusic
 
-        # Same client as the rest of the service: the signed-in one when a
-        # session is active, an anonymous one otherwise.
         ytm = _session_client() or YTMusic()
-        results = ytm.search(query, filter="songs", limit=max(limit, 10))
-        tracks = []
-        seen = set()
-        for r in results or []:
-            vid = r.get("videoId") or ""
-            if not vid or vid in seen:
-                continue
-            seen.add(vid)
-            tracks.append(
-                {
-                    "video_id": vid,
-                    "title": r.get("title") or "",
-                    "artist": ", ".join(a.get("name", "") for a in (r.get("artists") or [])),
-                    "album": (r.get("album") or {}).get("name") or "",
-                    "duration_secs": float(r.get("duration_seconds") or 0.0),
-                    "thumbnail": (r.get("thumbnails") or [{}])[-1].get("url") or "",
-                }
-            )
-        if tracks:
-            return tracks
-    except Exception:
-        log.exception("ytmusicapi search failed, falling back to yt-dlp")
+        results = ytm.search(query, filter=filter_name or None, limit=limit)
+        filter_kind = filter_name[:-1] if filter_name else ""
+        return {
+            "sections": sections_from_results(results, filter_kind, limit),
+            "error": "",
+        }
+    except Exception as e:
+        log.warning("music search failed (%s): %s", filter_name or "all", e)
+        # Only songs/all have a sensible yt-dlp equivalent; the other tabs
+        # would turn into a pile of raw videos.
+        if filter_name in ("", "songs"):
+            return _search_fallback(query, limit)
+        return {"sections": [], "error": f"search failed: {e}"}
 
-    import yt_dlp
 
-    opts = {"quiet": True, "no_warnings": True, "skip_download": True, "noplaylist": True}
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(f"ytsearch{limit}:{query}", download=False)
-    out = []
-    for entry in (info or {}).get("entries", []) or []:
-        if entry:
-            out.append(_track_from_info(entry))
+def suggestions(query: str, limit: int = 8) -> list[str]:
+    """Search suggestions for the query box; empty below two characters."""
+    query = (query or "").strip()
+    if len(query) < 2:
+        return []
+    try:
+        from ytmusicapi import YTMusic
+
+        ytm = _session_client() or YTMusic()
+        raw = ytm.get_search_suggestions(query)
+    except Exception as e:
+        log.warning("search suggestions failed: %s", e)
+        return []
+
+    out: list[str] = []
+    for entry in raw or []:
+        text = entry.get("text") if isinstance(entry, dict) else entry
+        text = (text or "").strip()
+        if text and text not in out:
+            out.append(text)
+        if len(out) >= limit:
+            break
     return out
 
 
@@ -540,8 +615,26 @@ def related_tracks(video_id: str, limit: int = 20) -> dict:
         artist = (resolved.get("track") or {}).get("artist") or ""
         if not artist:
             return {"tracks": [], "error": "related tracks unavailable"}
-        found = search(artist, limit=limit + 5, music=True)
-        tracks = [t for t in found if t.get("video_id") != video_id][:limit]
+        found = search_music(artist, "songs", limit + 5)
+        tracks = []
+        for section in found.get("sections") or []:
+            for item in section.get("items") or []:
+                if item.get("kind") not in ("song", "video") or item.get("id") == video_id:
+                    continue
+                tracks.append(
+                    {
+                        "video_id": item.get("id", ""),
+                        "title": item.get("title", ""),
+                        "artist": item.get("subtitle", ""),
+                        "album": "",
+                        "duration_secs": item.get("duration_secs", 0.0),
+                        "thumbnail": item.get("thumbnail", ""),
+                    }
+                )
+                if len(tracks) >= limit:
+                    break
+            if len(tracks) >= limit:
+                break
         return {"tracks": tracks, "error": ""}
     except Exception as e:
         log.exception("related fallback failed")
@@ -556,65 +649,6 @@ def related_tracks(video_id: str, limit: int = 20) -> dict:
 # fields here through SetSession after every start or sign-in.
 
 YTM_ORIGIN = "https://music.youtube.com"
-# Fallback client version for the plain www.youtube.com innertube endpoint
-# (the web client, not the music one). The real one is read from youtube.com and
-# cached for a day; this constant only covers a failed fetch.
-WEB_CLIENT_VERSION = "2.20240926.05.00"
-WEB_CLIENT_VERSION_URL = "https://www.youtube.com/"
-WEB_CLIENT_VERSION_TTL = 24 * 60 * 60
-
-_client_version_lock = threading.Lock()
-# (fetched_at, version) of the last successful read.
-_client_version_cache: tuple[float, str] | None = None
-
-
-def _web_client_version() -> str:
-    """INNERTUBE_CONTEXT_CLIENT_VERSION of the live youtube.com page.
-
-    Cached for a day. A failed fetch returns the constant fallback without
-    poisoning the cache, so the next call tries again.
-    """
-    global _client_version_cache
-
-    now = time.time()
-    with _client_version_lock:
-        cached = _client_version_cache
-    if cached is not None and now - cached[0] < WEB_CLIENT_VERSION_TTL:
-        return cached[1]
-
-    version = ""
-    try:
-        import requests
-
-        proxy = net.detect_proxy()
-        proxies = {"http": proxy, "https": proxy} if proxy else None
-        resp = requests.get(
-            WEB_CLIENT_VERSION_URL,
-            headers={"user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
-            proxies=proxies,
-            timeout=15,
-        )
-        if resp.status_code == 200:
-            match = re.search(
-                r'"INNERTUBE_CONTEXT_CLIENT_VERSION"\s*:\s*"([0-9.]+)"', resp.text
-            )
-            if match is None:
-                match = re.search(
-                    r'"INNERTUBE_CLIENT_VERSION"\s*:\s*"([0-9.]+)"', resp.text
-                )
-            if match is not None:
-                version = match.group(1)
-    except Exception:
-        log.warning("could not read the web client version", exc_info=True)
-
-    if not version:
-        return WEB_CLIENT_VERSION
-
-    with _client_version_lock:
-        _client_version_cache = (now, version)
-    log.info("web client version: %s", version)
-    return version
-
 _session_lock = threading.RLock()
 # {"client": YTMusic, "cookie": str, "user_agent": str, "authuser": str,
 #  "state": "active"|"expired", "account": str, "validated_at": float}
