@@ -42,7 +42,7 @@
                                                           │ gRPC (localhost, динамич. порт)
                                            ┌──────────────▼───────────────┐
                                            │ Python-сервис (api/)          │
-                                           │ ├ yt-dlp: resolve/search      │
+                                           │ ├ yt-dlp: resolve             │
                                            │ ├ ytmusicapi: плейлисты/auth │
                                            │ ├ lrclib: тексты              │
                                            │ └ прокси/DoH-обходы           │

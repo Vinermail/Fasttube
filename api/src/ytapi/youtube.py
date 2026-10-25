@@ -1,5 +1,6 @@
 """YouTube backend: yt-dlp / ytmusicapi wrappers."""
 
+import contextlib
 import json
 import logging
 import os
@@ -206,6 +207,11 @@ def resolve_url(
 # Search filters accepted by the sidecar, mirroring ytmusicapi's search().
 SEARCH_FILTERS = ("", "songs", "videos", "albums", "artists", "playlists")
 
+# Every ytmusicapi client — the signed-in one and the anonymous ones — asks
+# YouTube Music for Russian metadata, so section titles, artist names and
+# release dates match the rest of the interface.
+YTM_LANGUAGE = "ru"
+
 # Video results are filtered by innertube's videoType. UGC uploads (fan
 # uploads, lyric videos, gameplay clips riding a song title) are what made the
 # old youtube.com search unusable; official videos (OMV/ATV) and
@@ -221,11 +227,11 @@ _KIND_BY_RESULT_TYPE = {
 }
 
 _DEFAULT_SECTION_TITLES = {
-    "song": "Songs",
-    "video": "Videos",
-    "album": "Albums",
-    "artist": "Artists",
-    "playlist": "Playlists",
+    "song": "Песни",
+    "video": "Видео",
+    "album": "Альбомы",
+    "artist": "Исполнители",
+    "playlist": "Плейлисты",
 }
 
 
@@ -366,9 +372,14 @@ def sections_from_results(
         key = _section_key(result, item)
         section = by_key.get(key)
         if section is None:
-            title = (result.get("category") or "").strip() or _DEFAULT_SECTION_TITLES.get(
-                item["kind"], item["kind"].title()
-            )
+            if filter_kind:
+                # One tab, one section: the name is ours (the server answers in
+                # whatever language the request asked for).
+                title = _DEFAULT_SECTION_TITLES.get(filter_kind, filter_kind.title())
+            else:
+                title = (result.get("category") or "").strip() or _DEFAULT_SECTION_TITLES.get(
+                    item["kind"], item["kind"].title()
+                )
             section = {"title": title, "kind": item["kind"], "items": []}
             by_key[key] = section
             sections.append(section)
@@ -378,49 +389,35 @@ def sections_from_results(
     return [section for section in sections if section["items"]]
 
 
-def _search_fallback(query: str, limit: int) -> dict:
-    """yt-dlp ytsearch, used once when ytmusicapi fails for songs/all."""
-    try:
-        import yt_dlp
+@contextlib.contextmanager
+def _english_categories(client):
+    """Ask YouTube for English shelf names for the duration of one call.
 
-        opts = {
-            "quiet": True,
-            "no_warnings": True,
-            "skip_download": True,
-            "noplaylist": True,
-        }
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(f"ytsearch{limit}:{query}", download=False)
-        items: list[dict] = []
-        seen: set[str] = set()
-        for entry in (info or {}).get("entries", []) or []:
-            if not entry:
-                continue
-            track = _track_from_info(entry)
-            video_id = track.get("video_id") or ""
-            if not video_id or video_id in seen:
-                continue
-            seen.add(video_id)
-            items.append(
-                {
-                    "kind": "song",
-                    "id": video_id,
-                    "title": track.get("title") or "",
-                    "subtitle": track.get("artist") or "",
-                    "thumbnail": track.get("thumbnail") or "",
-                    "duration_secs": float(track.get("duration_secs") or 0.0),
-                    "video_type": "",
-                    "browse_id": "",
-                    "playlist_id": "",
-                }
-            )
-            if len(items) >= limit:
-                break
-        section = {"title": _DEFAULT_SECTION_TITLES["song"], "kind": "song", "items": items}
-        return {"sections": [section] if items else [], "error": ""}
-    except Exception as e:
-        log.warning("yt-dlp search fallback failed: %s", e)
-        return {"sections": [], "error": f"search failed: {e}"}
+    ytmusicapi 1.12.2 decides whether a shelf belongs to the requested filter by
+    looking for the English word in the shelf title ("song" in "Songs"). With
+    `hl=ru` the title is "Песни", the check fails for every filter, and a
+    filtered search silently comes back empty. The request context carries `hl`,
+    so it is flipped around the call and restored afterwards; the section title
+    the user sees is ours anyway (see `_DEFAULT_SECTION_TITLES`).
+    """
+    context = getattr(client, "context", None)
+    if not isinstance(context, dict):
+        yield
+        return
+    client_context = context.get("context")
+    if not isinstance(client_context, dict) or not isinstance(client_context.get("client"), dict):
+        yield
+        return
+    slot = client_context["client"]
+    previous = slot.get("hl")
+    slot["hl"] = "en"
+    try:
+        yield
+    finally:
+        if previous is None:
+            slot.pop("hl", None)
+        else:
+            slot["hl"] = previous
 
 
 def search_music(query: str, filter_name: str = "", limit: int = 20) -> dict:
@@ -439,19 +436,21 @@ def search_music(query: str, filter_name: str = "", limit: int = 20) -> dict:
     try:
         from ytmusicapi import YTMusic
 
-        ytm = _session_client() or YTMusic()
-        results = ytm.search(query, filter=filter_name or None, limit=limit)
+        ytm = _session_client() or YTMusic(language=YTM_LANGUAGE)
+        if filter_name:
+            with _english_categories(ytm):
+                results = ytm.search(query, filter=filter_name, limit=limit)
+        else:
+            results = ytm.search(query, limit=limit)
         filter_kind = filter_name[:-1] if filter_name else ""
         return {
             "sections": sections_from_results(results, filter_kind, limit),
             "error": "",
         }
     except Exception as e:
+        # No yt-dlp fallback: a raw ytsearch answer is not a YouTube Music
+        # answer (UGC videos, no sections), so the UI offers «Повторить» instead.
         log.warning("music search failed (%s): %s", filter_name or "all", e)
-        # Only songs/all have a sensible yt-dlp equivalent; the other tabs
-        # would turn into a pile of raw videos.
-        if filter_name in ("", "songs"):
-            return _search_fallback(query, limit)
         return {"sections": [], "error": f"search failed: {e}"}
 
 
@@ -463,7 +462,7 @@ def suggestions(query: str, limit: int = 8) -> list[str]:
     try:
         from ytmusicapi import YTMusic
 
-        ytm = _session_client() or YTMusic()
+        ytm = _session_client() or YTMusic(language=YTM_LANGUAGE)
         raw = ytm.get_search_suggestions(query)
     except Exception as e:
         log.warning("search suggestions failed: %s", e)
@@ -510,7 +509,7 @@ def album(browse_id: str) -> dict:
     try:
         from ytmusicapi import YTMusic
 
-        ytm = _session_client() or YTMusic()
+        ytm = _session_client() or YTMusic(language=YTM_LANGUAGE)
         data = ytm.get_album(browse_id)
     except Exception as e:
         log.warning("get_album failed: %s", e)
@@ -547,7 +546,7 @@ def artist(browse_id: str) -> dict:
     try:
         from ytmusicapi import YTMusic
 
-        ytm = _session_client() or YTMusic()
+        ytm = _session_client() or YTMusic(language=YTM_LANGUAGE)
         data = ytm.get_artist(browse_id)
     except Exception as e:
         log.warning("get_artist failed: %s", e)
@@ -770,7 +769,7 @@ def get_home(limit: int = 4, client=None) -> dict:
         try:
             from ytmusicapi import YTMusic
 
-            client = _session_client() or YTMusic()
+            client = _session_client() or YTMusic(language=YTM_LANGUAGE)
         except Exception as e:
             log.warning("could not create a client for the home page: %s", e)
             client = None
@@ -914,7 +913,7 @@ def related_tracks(video_id: str, limit: int = 20) -> dict:
     try:
         from ytmusicapi import YTMusic
 
-        ytm = _session_client() or YTMusic()
+        ytm = _session_client() or YTMusic(language=YTM_LANGUAGE)
         data = ytm.get_song_related(video_id) or []
         tracks = []
         for r in data:
@@ -1014,7 +1013,7 @@ def set_session(cookie: str, user_agent: str, x_goog_authuser: str) -> dict:
 
     try:
         headers = _browser_headers(cookie, user_agent, x_goog_authuser)
-        client = YTMusic(auth=headers)
+        client = YTMusic(auth=headers, language=YTM_LANGUAGE)
     except KeyError:
         return {
             "state": "signed_out",

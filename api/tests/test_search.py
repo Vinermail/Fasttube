@@ -127,6 +127,9 @@ DEFAULT_RESULTS = [
 def test_default_search_sections_follow_ytm_order():
     sections = sections_from_results(DEFAULT_RESULTS)
 
+    # Titles here come from the response's own `category` field (the fixture
+    # carries the English ones). Our fallback titles are only used when that
+    # field is empty — see test_filtered_search_is_one_section.
     assert [s["title"] for s in sections] == [
         "Top result",
         "Songs",
@@ -198,13 +201,19 @@ def test_items_without_ids_are_dropped():
 
 
 def test_filtered_search_is_one_section():
-    results = [song("a0000000001", "A", category=None), song("a0000000002", "B", category=None)]
+    # A filtered search asks YouTube for English categories (see
+    # test_filtered_search_switches_to_english_categories), so the server's
+    # name here is "Songs" — the section still has to be named by us.
+    results = [
+        song("a0000000001", "A", category="Songs"),
+        song("a0000000002", "B", category="Songs"),
+    ]
 
     sections = sections_from_results(results, filter_kind="song")
 
     assert len(sections) == 1
     assert sections[0]["kind"] == "song"
-    assert sections[0]["title"] == "Songs"
+    assert sections[0]["title"] == "Песни"
     assert [i["id"] for i in sections[0]["items"]] == ["a0000000001", "a0000000002"]
 
 
@@ -259,3 +268,114 @@ def test_empty_query_returns_nothing_without_network():
 def test_suggestions_need_at_least_two_characters():
     assert suggestions("") == []
     assert suggestions(" a ") == []
+
+
+class FailingClient:
+    """Stands in for a signed-in client whose search blows up."""
+
+    def __init__(self, error="boom"):
+        self.error = error
+
+    def search(self, *_args, **_kwargs):
+        raise RuntimeError(self.error)
+
+    def get_search_suggestions(self, *_args, **_kwargs):
+        raise RuntimeError(self.error)
+
+
+def test_search_failure_returns_an_error_instead_of_a_ytdlp_fallback(monkeypatch):
+    import ytapi.youtube as youtube
+
+    monkeypatch.setattr(youtube, "_session_client", lambda: FailingClient())
+
+    for filter_name in ("", "songs", "albums"):
+        result = search_music("daft punk", filter_name, 10)
+
+        assert result == {"sections": [], "error": "search failed: boom"}, filter_name
+
+
+def test_the_ytdlp_search_fallback_is_gone():
+    import ytapi.youtube as youtube
+
+    assert not hasattr(youtube, "_search_fallback")
+
+
+def test_search_suggestions_fail_quietly(monkeypatch):
+    import ytapi.youtube as youtube
+
+    monkeypatch.setattr(youtube, "_session_client", lambda: FailingClient())
+
+    assert suggestions("daft punk") == []
+
+
+class LanguageSpyClient:
+    """A client that records the request language of every search."""
+
+    def __init__(self, language="ru", results=None):
+        self.context = {"context": {"client": {"hl": language}}}
+        self.seen = []
+        self._results = results if results is not None else [song("a0000000001", "A", category="Songs")]
+
+    def search(self, _query, filter=None, limit=20):
+        self.seen.append(self.context["context"]["client"]["hl"])
+        return self._results
+
+
+def test_filtered_search_switches_to_english_categories(monkeypatch):
+    import ytapi.youtube as youtube
+
+    client = LanguageSpyClient()
+    monkeypatch.setattr(youtube, "_session_client", lambda: client)
+
+    result = search_music("daft punk", "songs", 10)
+
+    # The library checks the shelf title for the English filter name, so the
+    # request goes out in English...
+    assert client.seen == ["en"]
+    # ...and the client is put back the way it was.
+    assert client.context["context"]["client"]["hl"] == "ru"
+    assert [(s["title"], s["kind"]) for s in result["sections"]] == [("Песни", "song")]
+
+
+def test_default_search_keeps_the_russian_language(monkeypatch):
+    import ytapi.youtube as youtube
+
+    client = LanguageSpyClient(results=[song("a0000000001", "A", category="Песни")])
+    monkeypatch.setattr(youtube, "_session_client", lambda: client)
+
+    result = search_music("daft punk", "", 10)
+
+    assert client.seen == ["ru"]
+    # No filter: YouTube's own (Russian) shelf name is kept as it is.
+    assert [s["title"] for s in result["sections"]] == ["Песни"]
+
+
+def test_clients_ask_for_russian_metadata(monkeypatch):
+    import ytmusicapi
+
+    import ytapi.youtube as youtube
+
+    monkeypatch.setattr(youtube, "_session_client", lambda: None)
+    seen = {}
+
+    class Ctor:
+        def __init__(self, **kwargs):
+            seen.update(kwargs)
+            self.calls = 0
+
+        def search(self, *_args, **_kwargs):
+            self.calls += 1
+            return []
+
+        def get_home(self, **_kwargs):
+            return []
+
+        def get_explore(self):
+            return {}
+
+    monkeypatch.setattr(ytmusicapi, "YTMusic", Ctor)
+
+    search_music("daft punk", "songs", 5)
+    assert seen.get("language") == youtube.YTM_LANGUAGE == "ru"
+    assert youtube._DEFAULT_SECTION_TITLES["song"] == "Песни"
+

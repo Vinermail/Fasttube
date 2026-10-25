@@ -16,3 +16,4 @@ code.txt
 
 # Misc
 *.part
+api/.pytest_cache/
