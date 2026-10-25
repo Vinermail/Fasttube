@@ -23,10 +23,24 @@ const AUTH_URL: &str = "https://music.youtube.com/";
 const EVENT: &str = "yt-auth-changed";
 const POLL_EVERY: Duration = Duration::from_secs(1);
 const TIMEOUT: Duration = Duration::from_secs(600);
-/// User agent of the sign-in window and of every later API call, so the
-/// captured cookies and the sidecar requests come from the same client.
-pub const SESSION_UA: &str =
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36";
+/// How many times the captured session is pushed to the sidecar before the
+/// window is closed for good.
+const INSTALL_ATTEMPTS: usize = 3;
+const INSTALL_RETRY: Duration = Duration::from_millis(2500);
+
+/// User agent of the sign-in window, built from the WebView2 version the app is
+/// actually running, so the cookies and the sidecar's later requests come from
+/// the same client without pinning a Chrome version in the source.
+///
+/// `None` means "leave the webview's own UA alone" (the bundle then carries an
+/// empty UA and the sidecar falls back to ytmusicapi's default).
+fn session_user_agent() -> Option<String> {
+    let version = tauri::webview_version().ok()?;
+    Some(format!(
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+         (KHTML, like Gecko) Chrome/{version} Safari/537.36 Edg/{version}"
+    ))
+}
 
 /// Bumped on every `open`. A watcher whose generation is stale stops silently,
 /// so closing and reopening the window cannot leave two watchers racing.
@@ -54,24 +68,28 @@ pub fn open(app: &AppHandle) -> Result<(), String> {
     let profile = profile_dir();
     let _ = std::fs::create_dir_all(&profile);
 
-    WebviewWindowBuilder::new(app, AUTH_WINDOW, WebviewUrl::External(url))
+    let user_agent = session_user_agent();
+    let mut builder = WebviewWindowBuilder::new(app, AUTH_WINDOW, WebviewUrl::External(url))
         .title("Sign in to YouTube Music")
         .inner_size(520.0, 760.0)
         .min_inner_size(420.0, 560.0)
-        .user_agent(SESSION_UA)
         // InPrivate + a throwaway profile: session cookies die with the window
         // even on WebView2 versions that ignore the InPrivate flag.
         .incognito(true)
         .data_directory(profile)
         // Google's login flow bounces between its own domains; anything else
         // is a navigation we never want to allow.
-        .on_navigation(|url| is_allowed(url))
+        .on_navigation(|url| is_allowed(url));
+    if let Some(ua) = user_agent.as_deref() {
+        builder = builder.user_agent(ua);
+    }
+    builder
         .build()
         .map_err(|e| format!("failed to open the sign-in window: {e}"))?;
 
     let generation = GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
     let app = app.clone();
-    tauri::async_runtime::spawn(async move { watch(app, generation).await });
+    tauri::async_runtime::spawn(async move { watch(app, generation, user_agent).await });
     Ok(())
 }
 
@@ -110,7 +128,7 @@ enum Outcome {
     Failed(String),
 }
 
-async fn watch(app: AppHandle, generation: u64) {
+async fn watch(app: AppHandle, generation: u64, user_agent: Option<String>) {
     let Ok(url) = Url::parse(AUTH_URL) else {
         return;
     };
@@ -160,16 +178,11 @@ async fn watch(app: AppHandle, generation: u64) {
 
         let bundle = crate::secrets::AuthBundle::new(
             cookie,
-            SESSION_UA.to_string(),
+            user_agent.clone().unwrap_or_default(),
             "0".to_string(),
         );
-        outcome = match crate::install_session(&app, bundle).await {
-            Ok(info) if info.state == "active" => Outcome::SignedIn(info),
-            Ok(info) => Outcome::Failed(if info.error.is_empty() {
-                format!("session state: {}", info.state)
-            } else {
-                info.error
-            }),
+        outcome = match install_with_retries(&app, &bundle).await {
+            Ok(info) => Outcome::SignedIn(info),
             Err(e) => Outcome::Failed(e),
         };
         break;
@@ -219,6 +232,38 @@ async fn watch(app: AppHandle, generation: u64) {
         },
     };
     let _ = app.emit(EVENT, event);
+}
+
+/// Pushes the captured session to the sidecar, retrying a couple of times.
+///
+/// The first attempt right after the cookie is captured can lose a race (the
+/// sidecar may still be finishing the previous session, or the account endpoint
+/// answers slowly), and a retry costs a few seconds instead of a full re-login.
+async fn install_with_retries(
+    app: &AppHandle,
+    bundle: &crate::secrets::AuthBundle,
+) -> Result<crate::SessionInfo, String> {
+    let mut last = String::new();
+    for attempt in 1..=INSTALL_ATTEMPTS {
+        match crate::install_session(app, bundle.clone()).await {
+            Ok(info) if info.state == "active" => return Ok(info),
+            Ok(info) => {
+                last = if info.error.is_empty() {
+                    format!("session state: {}", info.state)
+                } else {
+                    info.error
+                };
+            }
+            Err(e) => last = e,
+        }
+        if attempt < INSTALL_ATTEMPTS {
+            eprintln!(
+                "[auth] session install failed ({last}); retrying {attempt}/{INSTALL_ATTEMPTS}"
+            );
+            tokio::time::sleep(INSTALL_RETRY).await;
+        }
+    }
+    Err(last)
 }
 
 /// Cookie pairs for the captured session, or `None` while the session is not

@@ -202,47 +202,43 @@ def resolve_url(
 
 
 def _search_web_direct(query: str, limit: int) -> list[dict]:
-    """Calls the innertube search endpoint directly with the browser's
-    headers (the same way youtube.com does), including continuation pages."""
-    if not os.path.exists(BROWSER_FILE):
+    """Calls the innertube search endpoint directly with the session's headers
+    (the same way youtube.com does), including continuation pages.
+
+    Returns [] when there is no active session; the caller then falls back to
+    yt-dlp's anonymous search. Headers are rebuilt on every call because the
+    SAPISIDHASH they carry embeds a timestamp and expires.
+    """
+    snapshot = _session_snapshot()
+    if snapshot is None:
         return []
     try:
         import requests
 
-        with open(BROWSER_FILE, encoding="utf8") as f:
-            headers = json.load(f)
-        if "cookie" not in headers and "Cookie" not in headers:
-            return []
+        hdrs = dict(
+            _browser_headers(
+                snapshot["cookie"], snapshot["user_agent"], snapshot["authuser"]
+            )
+        )
+        # The session was captured on music.youtube.com; the web search
+        # endpoint requires Origin/Referer to match www.youtube.com, otherwise
+        # it rejects the request with a 400.
+        hdrs["origin"] = "https://www.youtube.com"
+        hdrs["referer"] = "https://www.youtube.com/"
+        hdrs["x-origin"] = "https://www.youtube.com"
+        client_version = hdrs.get("x-youtube-client-version") or WEB_CLIENT_VERSION
+        hdrs["x-youtube-client-name"] = "1"
+        hdrs["x-youtube-client-version"] = client_version
 
         proxy = net.detect_proxy()
         proxies = {"http": proxy, "https": proxy} if proxy else None
         session = requests.Session()
 
-        hdrs = {
-            k: v
-            for k, v in headers.items()
-            if k
-            in (
-                "authorization",
-                "cookie",
-                "x-goog-authuser",
-                "user-agent",
-                "x-youtube-client-name",
-                "x-youtube-client-version",
-            )
-        }
-        # The browser headers were captured on music.youtube.com; the web
-        # search endpoint requires Origin/Referer to match www.youtube.com,
-        # otherwise it rejects the request with a 400.
-        hdrs["Origin"] = "https://www.youtube.com"
-        hdrs["Referer"] = "https://www.youtube.com/"
-        hdrs["X-Origin"] = "https://www.youtube.com"
-
         context = {
             "context": {
                 "client": {
                     "clientName": "WEB",
-                    "clientVersion": hdrs.get("x-youtube-client-version", "2.20240926.05.00"),
+                    "clientVersion": client_version,
                     "hl": "ru",
                     "gl": "RU",
                 }
@@ -343,10 +339,10 @@ def _search_web_direct(query: str, limit: int) -> list[dict]:
 
 
 def search(query: str, limit: int = 20, music: bool = False) -> list[dict]:
-    """Search. `music=False` mirrors the youtube.com web search: when browser
-    auth is present the innertube search endpoint is called directly with the
-    browser's headers (personalized, logged-in results); otherwise yt-dlp's
-    anonymous search is used. `music=True` searches the YouTube Music catalog."""
+    """Search. `music=False` mirrors the youtube.com web search: with an active
+    session the innertube search endpoint is called directly with the session's
+    headers (personalized, logged-in results); otherwise yt-dlp's anonymous
+    search is used. `music=True` searches the YouTube Music catalog."""
     if not music:
         tracks = _search_web_direct(query, limit)
         if tracks:
@@ -365,9 +361,9 @@ def search(query: str, limit: int = 20, music: bool = False) -> list[dict]:
     try:
         from ytmusicapi import YTMusic
 
-        # Use the same auth source as the rest of the service (browser
-        # cookies first, then OAuth), so music search respects the login.
-        ytm = _authed_ytm() if has_auth() else YTMusic()
+        # Same client as the rest of the service: the signed-in one when a
+        # session is active, an anonymous one otherwise.
+        ytm = _session_client() or YTMusic()
         results = ytm.search(query, filter="songs", limit=max(limit, 10))
         tracks = []
         seen = set()
@@ -511,7 +507,7 @@ def related_tracks(video_id: str, limit: int = 20) -> dict:
     try:
         from ytmusicapi import YTMusic
 
-        ytm = _authed_ytm() if has_auth() else YTMusic()
+        ytm = _session_client() or YTMusic()
         data = ytm.get_song_related(video_id) or []
         tracks = []
         for r in data:
@@ -556,10 +552,13 @@ def related_tracks(video_id: str, limit: int = 20) -> dict:
 # fields here through SetSession after every start or sign-in.
 
 YTM_ORIGIN = "https://music.youtube.com"
+# Client version for the plain www.youtube.com innertube endpoint (the web
+# client, not the music one); only used when the session carries none.
+WEB_CLIENT_VERSION = "2.20240926.05.00"
 
 _session_lock = threading.RLock()
-# {"client": YTMusic, "cookie": str, "state": "active"|"expired",
-#  "account": str, "validated_at": float}
+# {"client": YTMusic, "cookie": str, "user_agent": str, "authuser": str,
+#  "state": "active"|"expired", "account": str, "validated_at": float}
 _session: dict | None = None
 
 
@@ -609,6 +608,10 @@ def set_session(cookie: str, user_agent: str, x_goog_authuser: str) -> dict:
         _session = {
             "client": client,
             "cookie": cookie.strip(),
+            # Kept for the direct web search, which rebuilds its headers
+            # (and the SAPISIDHASH timestamp) on every request.
+            "user_agent": (user_agent or "").strip(),
+            "authuser": (x_goog_authuser or "0").strip() or "0",
             "state": "active",
             "account": "",
             "validated_at": 0.0,
@@ -740,6 +743,21 @@ def _session_client():
         if _session is None or _session["state"] == "expired":
             return None
         return _session["client"]
+
+
+def _session_snapshot() -> dict | None:
+    """Cookie/UA/authuser of an active session, or None.
+
+    A copy, so the caller builds headers without holding the lock.
+    """
+    with _session_lock:
+        if _session is None or _session["state"] != "active":
+            return None
+        return {
+            "cookie": _session.get("cookie", ""),
+            "user_agent": _session.get("user_agent", ""),
+            "authuser": _session.get("authuser", "0"),
+        }
 
 
 def _parse_cookie_header(cookie_header: str) -> list[tuple[str, str]]:

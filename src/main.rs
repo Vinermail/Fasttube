@@ -1140,7 +1140,7 @@ async fn play_video_inner(id: &str, state: &AppState) -> Result<PlaylistInfo, St
         downloader::download(&resolved.stream_url, &dest, &state.download)
             .await
             .map_err(|e| e.to_string())?;
-        if let Err(e) = std::fs::write(&meta, &title) {
+        if let Err(e) = fsutil::write_atomic(&meta, title.as_bytes()) {
             eprintln!("[yt] failed to write metadata: {e}");
         }
         title
@@ -1306,7 +1306,9 @@ async fn play_current_download(
     }
 
     let meta = downloader::cached_meta(&item.id, &quality);
-    let _ = std::fs::write(&meta, &item.title);
+    if let Err(e) = fsutil::write_atomic(&meta, item.title.as_bytes()) {
+        eprintln!("[cache] failed to write the title sidecar: {e}");
+    }
     Ok(())
 }
 
@@ -1375,7 +1377,9 @@ async fn ensure_cached(
             }
         }
         let meta = downloader::cached_meta(&item.id, quality);
-        let _ = std::fs::write(&meta, &item.title);
+        if let Err(e) = fsutil::write_atomic(&meta, item.title.as_bytes()) {
+            eprintln!("[cache] failed to write the title sidecar: {e}");
+        }
         Ok(())
     }
     .await;
