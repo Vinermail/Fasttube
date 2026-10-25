@@ -22,6 +22,16 @@ let viewHistory = ["player"];
 let viewHistoryIdx = 0;
 let currentViewName = "player";
 
+/// Transport noise is not something a listener can act on: say what happened
+/// in one line instead of dumping a tonic error.
+function playlistError(e) {
+  const text = String(e || "");
+  if (/Timeout expired|DeadlineExceeded|deadline|unavailable|tcp connect|connection/i.test(text)) {
+    return "YouTube не ответил вовремя — попробуйте открыть ещё раз";
+  }
+  return text.length > 200 ? text.slice(0, 200) + "…" : text;
+}
+
 function showError(message) {
   $("sidebar-error").textContent = String(message);
   $("sidebar-error").classList.remove("hidden");
@@ -573,7 +583,7 @@ function openSearchPlaylist(item) {
         cover: item.thumbnail || (tracks[0] ? tracks[0].thumbnail || "" : ""),
       });
     })
-    .catch((e) => showError(e));
+    .catch((e) => showError(playlistError(e)));
 }
 
 function buildSearchCard(item) {
@@ -1085,7 +1095,7 @@ async function renderYtTrackList(invokeName) {
     });
     $("yt-more-btn").classList.add("hidden");
   } catch (e) {
-    showError(e);
+    showError(playlistError(e));
   }
 }
 
@@ -1126,7 +1136,7 @@ async function loadUserPlaylists() {
           });
           $("yt-more-btn").classList.add("hidden");
         } catch (e) {
-          showError(e);
+          showError(playlistError(e));
         }
       };
       el.appendChild(div);

@@ -23,6 +23,9 @@ pub use proto::{
 /// allowed to take longer (see [`RESOLVE_TIMEOUT`]).
 const CALL_TIMEOUT: Duration = Duration::from_secs(15);
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(45);
+/// A long playlist is fetched page by page in the sidecar; mixes are cut
+/// off, real playlists are not, so this gets more room than a plain call.
+const PLAYLIST_TIMEOUT: Duration = Duration::from_secs(45);
 /// Music search goes through ytmusicapi and may page through results.
 const SEARCH_TIMEOUT: Duration = Duration::from_secs(20);
 /// Autocomplete must feel instant; a slow answer is worse than none.
@@ -265,9 +268,12 @@ pub async fn get_user_playlists() -> Result<UserPlaylistsResponse> {
 pub async fn get_playlist_tracks(playlist_id: &str) -> Result<PlaylistTracksResponse> {
     let mut client = connect().await?;
     let resp = client
-        .get_playlist_tracks(request(PlaylistTracksRequest {
-            id: playlist_id.to_string(),
-        }))
+        .get_playlist_tracks(with_timeout(
+            PlaylistTracksRequest {
+                id: playlist_id.to_string(),
+            },
+            PLAYLIST_TIMEOUT,
+        ))
         .await?;
     Ok(resp.into_inner())
 }
@@ -275,7 +281,7 @@ pub async fn get_playlist_tracks(playlist_id: &str) -> Result<PlaylistTracksResp
 pub async fn get_liked_songs() -> Result<PlaylistTracksResponse> {
     let mut client = connect().await?;
     let resp = client
-        .get_liked_songs(request(Empty {}))
+        .get_liked_songs(with_timeout(Empty {}, PLAYLIST_TIMEOUT))
         .await?;
     Ok(resp.into_inner())
 }

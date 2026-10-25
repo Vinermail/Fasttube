@@ -1733,7 +1733,9 @@ input[type="range"]::-moz-range-thumb {
 }
 
 /* ---------- home ---------- */
-.home-nav {
+/* The id wins over `.btn.nav { flex: 1 }`, which in a column container means
+   "grow vertically" — that is what made the button a tall empty box. */
+#mode-home {
   flex: 0 0 auto;
   align-self: flex-start;
   width: auto;

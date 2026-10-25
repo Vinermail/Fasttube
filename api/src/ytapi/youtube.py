@@ -117,6 +117,20 @@ QUALITY_HIGH = "high"
 QUALITIES = (QUALITY_STANDARD, QUALITY_HIGH)
 
 
+def _itag(format_id) -> int:
+    """yt-dlp format id -> itag number.
+
+    Since yt-dlp 2025 the id can be composite, for example 140-drc or 140-0: the
+    number in front of the dash is the itag the rest of the app cares about, and
+    a bare int() on the whole string kills resolve_url.
+    """
+    head = str(format_id or "").split("-", 1)[0].strip()
+    try:
+        return int(head)
+    except ValueError:
+        return 0
+
+
 def resolve_url(
     video_id: str,
     cookie_header: str | None = None,
@@ -183,7 +197,7 @@ def resolve_url(
             std = [
                 f
                 for f in audio
-                if str(f.get("format_id")) == "140" or (f.get("tbr") or 0) <= 132
+                if _itag(f.get("format_id")) == 140 or (f.get("tbr") or 0) <= 132
             ]
             chosen = std[0] if std else audio[0]
         else:
@@ -195,7 +209,7 @@ def resolve_url(
             "stream_url": chosen.get("url") or "",
             "mime_type": _mime_for_ext(chosen.get("ext")),
             "content_length": int(chosen.get("filesize") or chosen.get("filesize_approx") or 0),
-            "itag": int(chosen.get("format_id") or 0),
+            "itag": _itag(chosen.get("format_id")),
         }
 
     with _resolve_lock:
@@ -1306,6 +1320,20 @@ def user_playlists() -> dict:
     return _cached_lib("user_playlists", 600, load)
 
 
+# A mix is endless by nature: the app takes the first N and stops there.
+MIX_TRACK_LIMIT = 100
+
+
+def _is_mix(playlist_id: str) -> bool:
+    """Auto-generated mixes and radios (RDTMAK…, RDCLAK…, RDAMVM…).
+
+    Their page has no playlist structure at all — get_playlist dies on a missing
+    `contents` path — while the watch-playlist endpoint returns exactly the list
+    of tracks the mix is.
+    """
+    return playlist_id.startswith("RD")
+
+
 def playlist_tracks(playlist_id: str) -> dict:
     if _session_client() is None:
         return {
@@ -1318,8 +1346,20 @@ def playlist_tracks(playlist_id: str) -> dict:
             ytm = _session_client()
             if ytm is None:
                 return {"tracks": [], "error": "not signed in"}
-            # limit=None fetches every track (paginated via continuations)
-            data = ytm.get_playlist(playlist_id, limit=None) or {}
+            if _is_mix(playlist_id):
+                try:
+                    data = (
+                        ytm.get_watch_playlist(playlistId=playlist_id, limit=MIX_TRACK_LIMIT)
+                        or {}
+                    )
+                except Exception as e:
+                    log.warning("mix %s via watch_playlist failed: %s", playlist_id, e)
+                    data = {}
+                if not data.get("tracks"):
+                    data = ytm.get_playlist(playlist_id, limit=None) or {}
+            else:
+                # limit=None fetches every track (paginated via continuations)
+                data = ytm.get_playlist(playlist_id, limit=None) or {}
             tracks = []
             for t in data.get("tracks") or []:
                 vid = t.get("videoId")
