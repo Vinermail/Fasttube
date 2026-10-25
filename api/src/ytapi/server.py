@@ -43,24 +43,28 @@ class _TokenInterceptor(grpc.ServerInterceptor):
             return grpc.unary_unary_rpc_method_handler(deny)
         return continuation(handler_call_details)
 
+def _to_pb_items(items: list[dict]) -> list[player_api_pb2.SearchItem]:
+    return [
+        player_api_pb2.SearchItem(
+            kind=item.get("kind", ""),
+            id=item.get("id", ""),
+            title=item.get("title", ""),
+            subtitle=item.get("subtitle", ""),
+            thumbnail=item.get("thumbnail", ""),
+            duration_secs=item.get("duration_secs", 0.0),
+            video_type=item.get("video_type", ""),
+            browse_id=item.get("browse_id", ""),
+            playlist_id=item.get("playlist_id", ""),
+        )
+        for item in items or []
+    ]
+
+
 def _to_pb_section(section: dict) -> player_api_pb2.SearchSection:
     return player_api_pb2.SearchSection(
         title=section.get("title", ""),
         kind=section.get("kind", ""),
-        items=[
-            player_api_pb2.SearchItem(
-                kind=item.get("kind", ""),
-                id=item.get("id", ""),
-                title=item.get("title", ""),
-                subtitle=item.get("subtitle", ""),
-                thumbnail=item.get("thumbnail", ""),
-                duration_secs=item.get("duration_secs", 0.0),
-                video_type=item.get("video_type", ""),
-                browse_id=item.get("browse_id", ""),
-                playlist_id=item.get("playlist_id", ""),
-            )
-            for item in section.get("items", [])
-        ],
+        items=_to_pb_items(section.get("items", [])),
     )
 
 
@@ -130,6 +134,24 @@ class PlayerApiServicer(player_api_pb2_grpc.PlayerApiServicer):
             subtitle=data.get("subtitle", ""),
             thumbnail=data.get("thumbnail", ""),
             tracks=_to_pb_section(section),
+            error=data.get("error", ""),
+        )
+
+    def GetHome(self, request, context):
+        try:
+            data = youtube.get_home(request.limit or 4)
+        except Exception as e:
+            log.exception("get_home failed")
+            return player_api_pb2.HomeResponse(error=str(e))
+        return player_api_pb2.HomeResponse(
+            shelves=[
+                player_api_pb2.Shelf(
+                    title=shelf.get("title", ""),
+                    kind=shelf.get("kind", ""),
+                    items=_to_pb_items(shelf.get("items", [])),
+                )
+                for shelf in data.get("shelves", [])
+            ],
             error=data.get("error", ""),
         )
 

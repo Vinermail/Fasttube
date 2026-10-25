@@ -63,6 +63,22 @@ message SuggestResponse {
   repeated string suggestions = 1;
 }
 
+message HomeRequest {
+  int32 limit = 1;
+}
+
+message Shelf {
+  string title = 1;
+  // "personal" (signed in) or "explore" (public fallback)
+  string kind = 2;
+  repeated SearchItem items = 3;
+}
+
+message HomeResponse {
+  repeated Shelf shelves = 1;
+  string error = 2;
+}
+
 message AlbumRequest {
   string browse_id = 1;
 }
@@ -190,6 +206,7 @@ service PlayerApi {
   rpc Suggest(SuggestRequest) returns (SuggestResponse);
   rpc GetAlbum(AlbumRequest) returns (AlbumResponse);
   rpc GetArtist(ArtistRequest) returns (ArtistResponse);
+  rpc GetHome(HomeRequest) returns (HomeResponse);
   rpc ResolveUrl(ResolveRequest) returns (ResolveResponse);
   rpc PrefetchResolve(PrefetchResolveRequest) returns (PrefetchResolveResponse);
   rpc Recommend(RecommendRequest) returns (RecommendResponse);

@@ -104,6 +104,8 @@ def invalidate_account_caches() -> None:
     """
     with _lib_lock:
         _LIB_CACHE.clear()
+    with _home_lock:
+        _HOME_CACHE.clear()
 
 
 _load_resolve_cache()
@@ -598,6 +600,210 @@ def artist(browse_id: str) -> dict:
         "sections": sections,
         "error": "",
     }
+
+
+# ---------------------------------------------------------------- home
+#
+# Shelves are cached in memory for a quarter of an hour, keyed by the mode they
+# were fetched in: an anonymous page must never be served to a signed-in user
+# and vice versa. Failures are not cached.
+
+HOME_CACHE_TTL = 15 * 60
+
+_home_lock = threading.Lock()
+# mode ("anon"|"account") -> (fetched_at, shelves)
+_HOME_CACHE: dict[str, tuple[float, list[dict]]] = {}
+
+
+def _home_mode() -> str:
+    return "account" if has_auth() else "anon"
+
+
+def _item_from_home(entry: dict) -> dict | None:
+    """One get_home()/get_explore() entry -> SearchItem dict.
+
+    Home items are a mixed bag: songs and videos (videoId + videoType), albums
+    and artists (browseId), playlists (playlistId). Podcast episodes and
+    anything without a usable id are skipped.
+    """
+    thumbnails = entry.get("thumbnails") or []
+    thumbnail = thumbnails[-1].get("url", "") if thumbnails else ""
+
+    video_id = entry.get("videoId") or ""
+    if video_id:
+        video_type = entry.get("videoType") or ""
+        if video_type in HIDDEN_VIDEO_TYPES:
+            return None
+        artists = ", ".join(
+            a.get("name", "") for a in (entry.get("artists") or []) if a.get("name")
+        )
+        return {
+            "kind": "song" if video_type == "MUSIC_VIDEO_TYPE_ATV" else "video",
+            "id": video_id,
+            "title": entry.get("title") or "",
+            "subtitle": artists,
+            "thumbnail": thumbnail,
+            "duration_secs": float(entry.get("duration_seconds") or 0.0),
+            "video_type": video_type,
+            "browse_id": "",
+            "playlist_id": entry.get("playlistId") or "",
+        }
+
+    playlist_id = entry.get("playlistId") or ""
+    if playlist_id:
+        subtitle = entry.get("description") or ""
+        return {
+            "kind": "playlist",
+            "id": playlist_id,
+            "title": entry.get("title") or "",
+            "subtitle": subtitle,
+            "thumbnail": thumbnail,
+            "duration_secs": 0.0,
+            "video_type": "",
+            "browse_id": "",
+            "playlist_id": playlist_id,
+        }
+
+    browse_id = entry.get("browseId") or ""
+    if browse_id.startswith("MPREb") or entry.get("audioPlaylistId"):
+        parts = [
+            ", ".join(a.get("name", "") for a in (entry.get("artists") or []) if a.get("name")),
+            entry.get("year"),
+            entry.get("type"),
+        ]
+        return {
+            "kind": "album",
+            "id": browse_id,
+            "title": entry.get("title") or "",
+            "subtitle": " • ".join(str(p) for p in parts if p),
+            "thumbnail": thumbnail,
+            "duration_secs": 0.0,
+            "video_type": "",
+            "browse_id": browse_id,
+            "playlist_id": "",
+        }
+
+    if browse_id.startswith("UC") or browse_id.startswith("MPLA"):
+        return {
+            "kind": "artist",
+            "id": browse_id,
+            "title": entry.get("title") or entry.get("artist") or "",
+            "subtitle": entry.get("subscribers") or "",
+            "thumbnail": thumbnail,
+            "duration_secs": 0.0,
+            "video_type": "",
+            "browse_id": browse_id,
+            "playlist_id": "",
+        }
+
+    return None
+
+
+def shelves_from_home(raw: list[dict], limit: int = 20) -> list[dict]:
+    """get_home() rows -> Shelf dicts, dropping junk and empty shelves."""
+    shelves: list[dict] = []
+    seen_titles: set[str] = set()
+    for row in raw or []:
+        title = (row.get("title") or "").strip()
+        items: list[dict] = []
+        ids: set[str] = set()
+        for entry in row.get("contents") or []:
+            if not isinstance(entry, dict):
+                continue
+            item = _item_from_home(entry)
+            if item is None or not item["id"] or item["id"] in ids:
+                continue
+            ids.add(item["id"])
+            items.append(item)
+            if len(items) >= limit:
+                break
+        if not items or not title:
+            continue
+        if title in seen_titles:
+            continue
+        seen_titles.add(title)
+        shelves.append({"title": title, "kind": "personal", "items": items})
+    return shelves
+
+
+def shelves_from_explore(explore: dict, limit: int = 20) -> list[dict]:
+    """get_explore() -> public shelves for signed-out users."""
+    shelves: list[dict] = []
+
+    def add(title: str, entries: list[dict]) -> None:
+        items: list[dict] = []
+        ids: set[str] = set()
+        for entry in entries or []:
+            item = _item_from_home(entry)
+            if item is None or not item["id"] or item["id"] in ids:
+                continue
+            ids.add(item["id"])
+            items.append(item)
+            if len(items) >= limit:
+                break
+        if items:
+            shelves.append({"title": title, "kind": "explore", "items": items})
+
+    if not isinstance(explore, dict):
+        return shelves
+    add("Новые релизы", explore.get("new_releases") or [])
+    add("В тренде", (explore.get("trending") or {}).get("items") or [])
+    add("Новые клипы", explore.get("new_videos") or [])
+    return shelves
+
+
+def get_home(limit: int = 4, client=None) -> dict:
+    """Home shelves: personal when signed in, public explore otherwise.
+
+    `client` exists for tests; in production it is the signed-in ytmusicapi
+    client or a fresh anonymous one.
+    """
+    limit = max(1, min(int(limit or 4), 10))
+    mode = _home_mode()
+
+    with _home_lock:
+        cached = _HOME_CACHE.get(mode)
+    if cached is not None and time.time() - cached[0] < HOME_CACHE_TTL:
+        return {"shelves": cached[1], "error": ""}
+
+    if client is None:
+        try:
+            from ytmusicapi import YTMusic
+
+            client = _session_client() or YTMusic()
+        except Exception as e:
+            log.warning("could not create a client for the home page: %s", e)
+            client = None
+
+    personalized = mode == "account"
+    shelves: list[dict] = []
+    error = ""
+    if client is not None and personalized:
+        # The anonymous home page belongs to nobody: skip it entirely and show
+        # the public explore shelves instead.
+        try:
+            shelves = shelves_from_home(client.get_home(limit=limit), limit=20)
+        except Exception as e:
+            log.warning("get_home failed: %s", e)
+            error = str(e)
+
+    if not shelves and client is not None:
+        # No personal page (signed out) or it came back empty: the public
+        # explore page still gives the user something to tap.
+        try:
+            shelves = shelves_from_explore(client.get_explore(), limit=20)
+        except Exception as e:
+            log.warning("get_explore failed: %s", e)
+            error = error or str(e)
+        if error and shelves:
+            error = ""  # the fallback worked, no reason to warn the UI
+
+    if not shelves:
+        return {"shelves": [], "error": error or "no home content available"}
+
+    with _home_lock:
+        _HOME_CACHE[mode] = (time.time(), shelves)
+    return {"shelves": shelves, "error": ""}
 
 
 def prefetch_resolve(

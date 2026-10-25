@@ -59,6 +59,11 @@ class PlayerApiStub:
                 request_serializer=player__api__pb2.ArtistRequest.SerializeToString,
                 response_deserializer=player__api__pb2.ArtistResponse.FromString,
                 _registered_method=True)
+        self.GetHome = channel.unary_unary(
+                '/player.PlayerApi/GetHome',
+                request_serializer=player__api__pb2.HomeRequest.SerializeToString,
+                response_deserializer=player__api__pb2.HomeResponse.FromString,
+                _registered_method=True)
         self.ResolveUrl = channel.unary_unary(
                 '/player.PlayerApi/ResolveUrl',
                 request_serializer=player__api__pb2.ResolveRequest.SerializeToString,
@@ -144,6 +149,12 @@ class PlayerApiServicer:
         raise NotImplementedError('Method not implemented!')
 
     def GetArtist(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetHome(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -242,6 +253,11 @@ def add_PlayerApiServicer_to_server(servicer, server):
                     servicer.GetArtist,
                     request_deserializer=player__api__pb2.ArtistRequest.FromString,
                     response_serializer=player__api__pb2.ArtistResponse.SerializeToString,
+            ),
+            'GetHome': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetHome,
+                    request_deserializer=player__api__pb2.HomeRequest.FromString,
+                    response_serializer=player__api__pb2.HomeResponse.SerializeToString,
             ),
             'ResolveUrl': grpc.unary_unary_rpc_method_handler(
                     servicer.ResolveUrl,
@@ -434,6 +450,33 @@ class PlayerApi:
             '/player.PlayerApi/GetArtist',
             player__api__pb2.ArtistRequest.SerializeToString,
             player__api__pb2.ArtistResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetHome(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/player.PlayerApi/GetHome',
+            player__api__pb2.HomeRequest.SerializeToString,
+            player__api__pb2.HomeResponse.FromString,
             options,
             channel_credentials,
             insecure,
