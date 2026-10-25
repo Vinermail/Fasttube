@@ -478,6 +478,128 @@ def suggestions(query: str, limit: int = 8) -> list[str]:
     return out
 
 
+def _song_item(result: dict, fallback_thumbnail: str = "") -> dict | None:
+    """Album/artist song entry -> SearchItem dict."""
+    video_id = result.get("videoId") or ""
+    if not video_id:
+        return None
+    thumbnails = result.get("thumbnails") or []
+    artist = ", ".join(
+        a.get("name", "") for a in (result.get("artists") or []) if a.get("name")
+    )
+    return {
+        "kind": "song",
+        "id": video_id,
+        "title": result.get("title") or "",
+        "subtitle": artist,
+        "thumbnail": thumbnails[-1].get("url", "") if thumbnails else fallback_thumbnail,
+        "duration_secs": float(result.get("duration_seconds") or 0.0),
+        "video_type": result.get("videoType") or "",
+        "browse_id": "",
+        "playlist_id": "",
+    }
+
+
+def album(browse_id: str) -> dict:
+    """Album page: header line plus one section of tracks."""
+    browse_id = (browse_id or "").strip()
+    if not browse_id:
+        return {"title": "", "subtitle": "", "thumbnail": "", "sections": [], "error": "empty album id"}
+    try:
+        from ytmusicapi import YTMusic
+
+        ytm = _session_client() or YTMusic()
+        data = ytm.get_album(browse_id)
+    except Exception as e:
+        log.warning("get_album failed: %s", e)
+        return {"title": "", "subtitle": "", "thumbnail": "", "sections": [], "error": str(e)}
+
+    thumbnails = data.get("thumbnails") or []
+    cover = thumbnails[-1].get("url", "") if thumbnails else ""
+    tracks = []
+    for entry in data.get("tracks") or []:
+        item = _song_item(entry, cover)
+        if item is not None:
+            tracks.append(item)
+
+    artists = ", ".join(a.get("name", "") for a in (data.get("artists") or []) if a.get("name"))
+    parts = [artists, data.get("type"), data.get("year")]
+    if data.get("trackCount"):
+        parts.append(f"{data['trackCount']} tracks")
+    subtitle = " • ".join(str(p) for p in parts if p)
+
+    return {
+        "title": data.get("title") or "",
+        "subtitle": subtitle,
+        "thumbnail": cover,
+        "sections": [{"title": "Треки", "kind": "song", "items": tracks}] if tracks else [],
+        "error": "",
+    }
+
+
+def artist(browse_id: str) -> dict:
+    """Artist page: popular songs plus the album shelf as cards."""
+    browse_id = (browse_id or "").strip()
+    if not browse_id:
+        return {"name": "", "subtitle": "", "thumbnail": "", "sections": [], "error": "empty artist id"}
+    try:
+        from ytmusicapi import YTMusic
+
+        ytm = _session_client() or YTMusic()
+        data = ytm.get_artist(browse_id)
+    except Exception as e:
+        log.warning("get_artist failed: %s", e)
+        return {"name": "", "subtitle": "", "thumbnail": "", "sections": [], "error": str(e)}
+
+    thumbnails = data.get("thumbnails") or []
+    cover = thumbnails[-1].get("url", "") if thumbnails else ""
+
+    songs = []
+    for entry in (data.get("songs") or {}).get("results") or []:
+        item = _song_item(entry, cover)
+        if item is not None:
+            songs.append(item)
+
+    albums = []
+    for entry in (data.get("albums") or {}).get("results") or []:
+        album_id = entry.get("browseId") or ""
+        if not album_id:
+            continue
+        thumbs = entry.get("thumbnails") or []
+        albums.append(
+            {
+                "kind": "album",
+                "id": album_id,
+                "title": entry.get("title") or "",
+                "subtitle": " • ".join(
+                    str(part) for part in (entry.get("year"), entry.get("type")) if part
+                ),
+                "thumbnail": thumbs[-1].get("url", "") if thumbs else "",
+                "duration_secs": 0.0,
+                "video_type": "",
+                "browse_id": album_id,
+                "playlist_id": "",
+            }
+        )
+
+    sections = []
+    if songs:
+        sections.append({"title": "Популярные песни", "kind": "song", "items": songs})
+    if albums:
+        sections.append({"title": "Альбомы", "kind": "album", "items": albums})
+
+    parts = [data.get("subscribers") and f"{data['subscribers']} подписчиков"]
+    if data.get("monthlyListeners"):
+        parts.append(f"{data['monthlyListeners']} слушателей в месяц")
+    return {
+        "name": data.get("name") or "",
+        "subtitle": " • ".join(str(p) for p in parts if p),
+        "thumbnail": cover,
+        "sections": sections,
+        "error": "",
+    }
+
+
 def prefetch_resolve(
     video_ids: list[str], quality: str = QUALITY_STANDARD, use_account: bool = False
 ) -> int:

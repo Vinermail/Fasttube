@@ -63,6 +63,32 @@ message SuggestResponse {
   repeated string suggestions = 1;
 }
 
+message AlbumRequest {
+  string browse_id = 1;
+}
+
+message AlbumResponse {
+  string title = 1;
+  // "Album • 2013 • 13 tracks" style line for the header
+  string subtitle = 2;
+  string thumbnail = 3;
+  SearchSection tracks = 4;
+  string error = 5;
+}
+
+message ArtistRequest {
+  string browse_id = 1;
+}
+
+message ArtistResponse {
+  string name = 1;
+  string subtitle = 2;
+  string thumbnail = 3;
+  // "Popular songs" and "Albums" sections
+  repeated SearchSection sections = 4;
+  string error = 5;
+}
+
 message ResolveRequest {
   string video_id = 1;
   string audio_quality = 2; // "standard" | "high"
@@ -162,6 +188,8 @@ service PlayerApi {
   rpc Health(Empty) returns (HealthResponse);
   rpc Search(SearchRequest) returns (SearchResponse);
   rpc Suggest(SuggestRequest) returns (SuggestResponse);
+  rpc GetAlbum(AlbumRequest) returns (AlbumResponse);
+  rpc GetArtist(ArtistRequest) returns (ArtistResponse);
   rpc ResolveUrl(ResolveRequest) returns (ResolveResponse);
   rpc PrefetchResolve(PrefetchResolveRequest) returns (PrefetchResolveResponse);
   rpc Recommend(RecommendRequest) returns (RecommendResponse);

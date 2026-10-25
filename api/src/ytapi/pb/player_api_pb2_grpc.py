@@ -49,6 +49,16 @@ class PlayerApiStub:
                 request_serializer=player__api__pb2.SuggestRequest.SerializeToString,
                 response_deserializer=player__api__pb2.SuggestResponse.FromString,
                 _registered_method=True)
+        self.GetAlbum = channel.unary_unary(
+                '/player.PlayerApi/GetAlbum',
+                request_serializer=player__api__pb2.AlbumRequest.SerializeToString,
+                response_deserializer=player__api__pb2.AlbumResponse.FromString,
+                _registered_method=True)
+        self.GetArtist = channel.unary_unary(
+                '/player.PlayerApi/GetArtist',
+                request_serializer=player__api__pb2.ArtistRequest.SerializeToString,
+                response_deserializer=player__api__pb2.ArtistResponse.FromString,
+                _registered_method=True)
         self.ResolveUrl = channel.unary_unary(
                 '/player.PlayerApi/ResolveUrl',
                 request_serializer=player__api__pb2.ResolveRequest.SerializeToString,
@@ -122,6 +132,18 @@ class PlayerApiServicer:
         raise NotImplementedError('Method not implemented!')
 
     def Suggest(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetAlbum(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetArtist(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -210,6 +232,16 @@ def add_PlayerApiServicer_to_server(servicer, server):
                     servicer.Suggest,
                     request_deserializer=player__api__pb2.SuggestRequest.FromString,
                     response_serializer=player__api__pb2.SuggestResponse.SerializeToString,
+            ),
+            'GetAlbum': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetAlbum,
+                    request_deserializer=player__api__pb2.AlbumRequest.FromString,
+                    response_serializer=player__api__pb2.AlbumResponse.SerializeToString,
+            ),
+            'GetArtist': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetArtist,
+                    request_deserializer=player__api__pb2.ArtistRequest.FromString,
+                    response_serializer=player__api__pb2.ArtistResponse.SerializeToString,
             ),
             'ResolveUrl': grpc.unary_unary_rpc_method_handler(
                     servicer.ResolveUrl,
@@ -348,6 +380,60 @@ class PlayerApi:
             '/player.PlayerApi/Suggest',
             player__api__pb2.SuggestRequest.SerializeToString,
             player__api__pb2.SuggestResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetAlbum(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/player.PlayerApi/GetAlbum',
+            player__api__pb2.AlbumRequest.SerializeToString,
+            player__api__pb2.AlbumResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetArtist(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/player.PlayerApi/GetArtist',
+            player__api__pb2.ArtistRequest.SerializeToString,
+            player__api__pb2.ArtistResponse.FromString,
             options,
             channel_credentials,
             insecure,

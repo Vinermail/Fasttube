@@ -10,7 +10,8 @@ pub mod proto {
 }
 
 pub use proto::{
-    Empty, HealthResponse, LyricsRequest, LyricsResponse, ParseAuthHeadersRequest,
+    AlbumRequest, AlbumResponse, ArtistRequest, ArtistResponse, Empty, HealthResponse,
+    LyricsRequest, LyricsResponse, ParseAuthHeadersRequest,
     PlaylistTracksRequest, PlaylistTracksResponse, PrefetchResolveRequest, RecommendRequest,
     ResolveRequest, ResolveResponse, SearchRequest, SearchSection, SessionState, SessionStatus,
     SetSessionRequest, SuggestRequest, Track, UserPlaylistsResponse,
@@ -157,6 +158,42 @@ pub async fn search(query: &str, filter: &str, limit: i32) -> Result<Vec<SearchS
         return Err(anyhow::anyhow!(resp.error));
     }
     Ok(resp.sections)
+}
+
+/// Album page (title, header line, tracks).
+pub async fn get_album(browse_id: &str) -> Result<AlbumResponse> {
+    let mut client = connect().await?;
+    let resp = client
+        .get_album(with_timeout(
+            AlbumRequest {
+                browse_id: browse_id.to_string(),
+            },
+            SEARCH_TIMEOUT,
+        ))
+        .await?
+        .into_inner();
+    if !resp.error.is_empty() {
+        return Err(anyhow::anyhow!(resp.error));
+    }
+    Ok(resp)
+}
+
+/// Artist page (popular songs + albums).
+pub async fn get_artist(browse_id: &str) -> Result<ArtistResponse> {
+    let mut client = connect().await?;
+    let resp = client
+        .get_artist(with_timeout(
+            ArtistRequest {
+                browse_id: browse_id.to_string(),
+            },
+            SEARCH_TIMEOUT,
+        ))
+        .await?
+        .into_inner();
+    if !resp.error.is_empty() {
+        return Err(anyhow::anyhow!(resp.error));
+    }
+    Ok(resp)
 }
 
 /// Query suggestions for the search box.

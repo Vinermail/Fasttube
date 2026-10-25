@@ -43,6 +43,27 @@ class _TokenInterceptor(grpc.ServerInterceptor):
             return grpc.unary_unary_rpc_method_handler(deny)
         return continuation(handler_call_details)
 
+def _to_pb_section(section: dict) -> player_api_pb2.SearchSection:
+    return player_api_pb2.SearchSection(
+        title=section.get("title", ""),
+        kind=section.get("kind", ""),
+        items=[
+            player_api_pb2.SearchItem(
+                kind=item.get("kind", ""),
+                id=item.get("id", ""),
+                title=item.get("title", ""),
+                subtitle=item.get("subtitle", ""),
+                thumbnail=item.get("thumbnail", ""),
+                duration_secs=item.get("duration_secs", 0.0),
+                video_type=item.get("video_type", ""),
+                browse_id=item.get("browse_id", ""),
+                playlist_id=item.get("playlist_id", ""),
+            )
+            for item in section.get("items", [])
+        ],
+    )
+
+
 def _to_pb_track(t: dict) -> player_api_pb2.Track:
     return player_api_pb2.Track(
         video_id=t.get("video_id", ""),
@@ -92,28 +113,38 @@ class PlayerApiServicer(player_api_pb2_grpc.PlayerApiServicer):
             log.exception("search failed")
             return player_api_pb2.SearchResponse(error=str(e))
         return player_api_pb2.SearchResponse(
-            sections=[
-                player_api_pb2.SearchSection(
-                    title=section.get("title", ""),
-                    kind=section.get("kind", ""),
-                    items=[
-                        player_api_pb2.SearchItem(
-                            kind=item.get("kind", ""),
-                            id=item.get("id", ""),
-                            title=item.get("title", ""),
-                            subtitle=item.get("subtitle", ""),
-                            thumbnail=item.get("thumbnail", ""),
-                            duration_secs=item.get("duration_secs", 0.0),
-                            video_type=item.get("video_type", ""),
-                            browse_id=item.get("browse_id", ""),
-                            playlist_id=item.get("playlist_id", ""),
-                        )
-                        for item in section.get("items", [])
-                    ],
-                )
-                for section in result.get("sections", [])
-            ],
+            sections=[_to_pb_section(s) for s in result.get("sections", [])],
             error=result.get("error", ""),
+        )
+
+    def GetAlbum(self, request, context):
+        try:
+            data = youtube.album(request.browse_id)
+        except Exception as e:
+            log.exception("get_album failed")
+            return player_api_pb2.AlbumResponse(error=str(e))
+        tracks = data.get("sections") or []
+        section = tracks[0] if tracks else {"title": "", "kind": "song", "items": []}
+        return player_api_pb2.AlbumResponse(
+            title=data.get("title", ""),
+            subtitle=data.get("subtitle", ""),
+            thumbnail=data.get("thumbnail", ""),
+            tracks=_to_pb_section(section),
+            error=data.get("error", ""),
+        )
+
+    def GetArtist(self, request, context):
+        try:
+            data = youtube.artist(request.browse_id)
+        except Exception as e:
+            log.exception("get_artist failed")
+            return player_api_pb2.ArtistResponse(error=str(e))
+        return player_api_pb2.ArtistResponse(
+            name=data.get("name", ""),
+            subtitle=data.get("subtitle", ""),
+            thumbnail=data.get("thumbnail", ""),
+            sections=[_to_pb_section(s) for s in data.get("sections") or []],
+            error=data.get("error", ""),
         )
 
     def Suggest(self, request, context):

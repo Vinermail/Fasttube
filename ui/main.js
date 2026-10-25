@@ -33,7 +33,7 @@ function hideError() {
 
 /* ---------- modes ---------- */
 
-function setMode(m) {
+function applyMode(m) {
   mode = m;
   $("side-local").classList.toggle("hidden", mode !== "local");
   $("side-youtube").classList.toggle("hidden", mode !== "youtube");
@@ -42,6 +42,10 @@ function setMode(m) {
   const showShuffle = mode === "youtube";
   $("btn-shuffle").style.display = showShuffle ? "" : "none";
   $("lh-shuffle").style.display = showShuffle ? "" : "none";
+}
+
+function setMode(m) {
+  applyMode(m);
   showMainView("player");
 }
 
@@ -454,7 +458,7 @@ function playSectionItem(section, index) {
   const item = section.items[index];
   if (item.path) {
     invoke("play_local_path", { path: item.path })
-      .then(() => setMode("local"))
+      .then(() => applyMode("local"))
       .catch((e) => showError(e));
     return;
   }
@@ -471,7 +475,7 @@ function playSectionItem(section, index) {
     thumbnail: it.thumbnail || "",
     durationSecs: it.duration_secs || 0,
   }));
-  setMode("youtube");
+  applyMode("youtube");
   invoke("play_queue", { items, start: 0 }).catch((e) => showError(e));
 }
 
@@ -594,11 +598,9 @@ function buildSearchCard(item) {
   return card;
 }
 
-function renderSearchSections(sections, error) {
-  const body = $("search-body");
+function renderSectionsInto(body, sections, error) {
   body.textContent = "";
   body.classList.remove("hidden");
-  $("search-empty").classList.add("hidden");
 
   for (const section of sections) {
     if (!section.items.length) continue;
@@ -622,7 +624,10 @@ function renderSearchSections(sections, error) {
   }
 
   if (!body.childElementCount) {
-    renderSearchStatus("Ничего не найдено");
+    const empty = document.createElement("div");
+    empty.className = "s-status";
+    empty.textContent = "Ничего не найдено";
+    body.appendChild(empty);
     return;
   }
   if (error) {
@@ -633,6 +638,91 @@ function renderSearchSections(sections, error) {
     body.appendChild(note);
   }
 }
+
+function renderSearchSections(sections, error) {
+  $("search-empty").classList.add("hidden");
+  renderSectionsInto($("search-body"), sections, error);
+}
+
+/* ---------- album / artist pages ---------- */
+
+let browseSections = [];
+
+function albumQueueItems() {
+  const section = browseSections.find((s) => s.kind === "song" && s.items.length);
+  if (!section) return [];
+  return section.items.map((it) => ({
+    id: it.id,
+    title: it.title,
+    artist: it.subtitle || "",
+    thumbnail: it.thumbnail || "",
+    durationSecs: it.duration_secs || 0,
+  }));
+}
+
+function playAlbum(shuffle) {
+  const items = albumQueueItems();
+  if (!items.length) return;
+  if (shuffle) {
+    for (let i = items.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [items[i], items[j]] = [items[j], items[i]];
+    }
+  }
+  applyMode("youtube");
+  invoke("play_queue", { items, start: 0 }).catch((e) => showError(e));
+}
+
+$("browse-play").onclick = () => playAlbum(false);
+$("browse-shuffle").onclick = () => playAlbum(true);
+
+function showBrowsePage(page, isAlbum) {
+  $("browse-title").textContent = page.title || "";
+  $("browse-subtitle").textContent = page.subtitle || "";
+  const cover = $("browse-cover");
+  if (page.cover) {
+    cover.src = page.cover;
+    cover.classList.remove("hidden");
+  } else {
+    cover.removeAttribute("src");
+    cover.classList.add("hidden");
+  }
+  $("browse-play").classList.toggle("hidden", !isAlbum);
+  $("browse-shuffle").classList.toggle("hidden", !isAlbum);
+  browseSections = page.sections || [];
+  renderSectionsInto($("browse-body"), browseSections, page.error);
+  showMainView("browse");
+}
+
+async function openBrowsePage(command, item, isAlbum) {
+  const browseId = item.browse_id || item.id;
+  if (!browseId) return;
+  $("browse-title").textContent = item.title || "";
+  $("browse-subtitle").textContent = "Загрузка…";
+  browseSections = [];
+  $("browse-body").textContent = "";
+  showMainView("browse");
+  try {
+    const page = await invoke(command, { browseId });
+    showBrowsePage(page, isAlbum);
+  } catch (e) {
+    $("browse-subtitle").textContent = "";
+    const box = document.createElement("div");
+    box.className = "s-error";
+    box.textContent = String(e);
+    const again = document.createElement("button");
+    again.className = "btn small";
+    again.textContent = "Повторить";
+    again.onclick = () => openBrowsePage(command, item, isAlbum);
+    box.appendChild(again);
+    $("browse-body").textContent = "";
+    $("browse-body").appendChild(box);
+  }
+}
+
+// Stage 3's search cards call these once the pages exist.
+window.openAlbumPage = (item) => openBrowsePage("open_album", item, true);
+window.openArtistPage = (item) => openBrowsePage("open_artist", item, false);
 
 async function runSearch(query) {
   const seq = ++searchSeq;
@@ -699,7 +789,7 @@ function shuffleYt() {
     thumbnail: t.thumbnail || "",
     durationSecs: t.duration_secs,
   }));
-  setMode("youtube");
+  applyMode("youtube");
   invoke("play_queue", { items, start: 0 }).catch((e) => showError(e));
 }
 

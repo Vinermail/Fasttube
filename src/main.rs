@@ -55,6 +55,16 @@ struct SearchSectionDto {
     items: Vec<SearchItemDto>,
 }
 
+/// Album/artist page as the browse view wants it.
+#[derive(Serialize)]
+struct BrowsePage {
+    title: String,
+    subtitle: String,
+    cover: String,
+    sections: Vec<SearchSectionDto>,
+    error: String,
+}
+
 #[derive(Serialize)]
 struct SearchPayload {
     sections: Vec<SearchSectionDto>,
@@ -836,6 +846,40 @@ async fn search_music(
             error: e.to_string(),
         }),
     }
+}
+
+#[tauri::command]
+async fn open_album(browse_id: String) -> Result<BrowsePage, String> {
+    let resp = grpc::get_album(&browse_id).await.map_err(|e| e.to_string())?;
+    Ok(BrowsePage {
+        title: resp.title,
+        subtitle: resp.subtitle,
+        cover: resp.thumbnail,
+        sections: resp
+            .tracks
+            .into_iter()
+            .filter(|section| !section.items.is_empty())
+            .map(SearchSectionDto::from)
+            .collect(),
+        error: resp.error,
+    })
+}
+
+#[tauri::command]
+async fn open_artist(browse_id: String) -> Result<BrowsePage, String> {
+    let resp = grpc::get_artist(&browse_id).await.map_err(|e| e.to_string())?;
+    Ok(BrowsePage {
+        title: resp.name,
+        subtitle: resp.subtitle,
+        cover: resp.thumbnail,
+        sections: resp
+            .sections
+            .into_iter()
+            .filter(|section| !section.items.is_empty())
+            .map(SearchSectionDto::from)
+            .collect(),
+        error: resp.error,
+    })
 }
 
 #[tauri::command]
@@ -2186,6 +2230,8 @@ fn main() {
             get_download_progress,
             search_music,
             search_suggestions,
+            open_album,
+            open_artist,
             set_search_filter,
             play_local_path,
             get_user_playlists,

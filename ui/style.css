@@ -1625,3 +1625,63 @@ input[type="range"]::-moz-range-thumb {
   100% { background-position: -200% 0; }
 }
 
+/* ---------- album / artist pages ---------- */
+.browse-head {
+  display: flex;
+  gap: 18px;
+  align-items: flex-end;
+  padding: 18px 26px 10px;
+  flex-shrink: 0;
+}
+
+.browse-cover {
+  width: 140px;
+  height: 140px;
+  border-radius: 12px;
+  object-fit: cover;
+  background: var(--bg3);
+}
+
+.browse-cover.hidden {
+  display: none;
+}
+
+.browse-meta {
+  min-width: 0;
+}
+
+.browse-title {
+  font-size: 24px;
+  font-weight: 700;
+  color: var(--fg);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.browse-sub {
+  margin-top: 4px;
+  color: var(--fg-dim);
+  font-size: 13px;
+}
+
+.browse-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.browse-actions .btn.hidden {
+  display: none;
+}
+
+#view-browse {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+#view-browse.hidden {
+  display: none;
+}
+
