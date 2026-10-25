@@ -10,28 +10,21 @@
   <aside id="sidebar">
     <div class="brand">Fasttube</div>
     <button id="mode-home" class="btn nav home-nav active">Главная</button>
-    <div class="nav-row">
-      <button id="mode-local" class="btn nav active">Local</button>
-      <button id="mode-youtube" class="btn nav">YouTube</button>
-    </div>
-
-    <div id="side-local">
-      <div class="side-label">Local library</div>
-      <div id="playlists" class="list"></div>
-      <button id="btn-favorites" class="btn side-action">♥ Favorites</button>
-    </div>
-
-    <div id="side-youtube" class="hidden">
+    <div id="side-library">
+      <div class="side-label">Плейлисты</div>
+      <div id="side-list">
+        <div id="playlists"></div>
+        <div id="yt-user-playlists"></div>
+      </div>
+      <div class="side-actions">
+        <button id="btn-favorites" class="btn side-action">♥ Favorites</button>
+        <button id="yt-liked-btn" class="btn side-action">Liked</button>
+        <button id="yt-history-btn" class="btn side-action">History</button>
+      </div>
       <div class="yt-progress hidden" id="yt-progress">
         <div class="bar-track"><div id="yt-progress-bar"></div></div>
         <span id="yt-progress-text"></span>
       </div>
-      <div class="yt-user-row">
-        <button id="yt-user-btn" class="btn">My playlists</button>
-        <button id="yt-liked-btn" class="btn">Liked</button>
-        <button id="yt-history-btn" class="btn">History</button>
-      </div>
-      <div id="yt-user-playlists" class="list sub"></div>
       <button id="yt-more-btn" class="btn hidden">Load more</button>
     </div>
 

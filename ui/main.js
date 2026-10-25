@@ -34,11 +34,9 @@ function hideError() {
 /* ---------- modes ---------- */
 
 function applyMode(m) {
+  // There is no Local/YouTube switch any more: the sidebar shows both kinds of
+  // playlist at once. The mode only decides whether a queue can be shuffled.
   mode = m;
-  $("side-local").classList.toggle("hidden", mode !== "local");
-  $("side-youtube").classList.toggle("hidden", mode !== "youtube");
-  $("mode-local").classList.toggle("active", mode === "local");
-  $("mode-youtube").classList.toggle("active", mode === "youtube");
   const showShuffle = mode === "youtube";
   $("btn-shuffle").style.display = showShuffle ? "" : "none";
   $("lh-shuffle").style.display = showShuffle ? "" : "none";
@@ -101,8 +99,6 @@ $("mode-home").onclick = () => {
   if (!homeLoaded) loadHome();
 };
 
-$("mode-local").onclick = () => setMode("local");
-$("mode-youtube").onclick = () => setMode("youtube");
 $("mode-settings").onclick = () => {
   if ($("view-settings").classList.contains("hidden")) showMainView("settings");
   else showMainView("player");
@@ -1079,6 +1075,9 @@ async function renderYtTrackList(invokeName) {
   try {
     hideError();
     const tracks = await invoke(invokeName);
+    // The list is a YouTube one: without the mode the player keeps painting the
+    // local rows and the header would lie about what is on screen.
+    setMode("youtube");
     setYtTracks(tracks, false, {
       title: invokeName === "get_liked_songs" ? "Liked songs" : "Tracks",
       subtitle: `${tracks.length} tracks`,
@@ -1092,10 +1091,21 @@ async function renderYtTrackList(invokeName) {
 
 $("yt-liked-btn").onclick = () => renderYtTrackList("get_liked_songs");
 
-$("yt-user-btn").onclick = async () => {
+let ytPlaylistsLoaded = false;
+
+/// The account's playlists are part of the sidebar from the start: they sit in
+/// the same list as the local folders, separated by a hairline.
+async function loadUserPlaylists() {
+  const el = $("yt-user-playlists");
   try {
+    const status = await invoke("get_api_status");
+    if ((status.session_state || "signed_out") !== "active") {
+      el.innerHTML = "";
+      ytPlaylistsLoaded = false;
+      return;
+    }
     const playlists = await invoke("get_user_playlists");
-    const el = $("yt-user-playlists");
+    ytPlaylistsLoaded = true;
     el.innerHTML = "";
     playlists.forEach((p) => {
       const div = document.createElement("div");
@@ -1108,6 +1118,7 @@ $("yt-user-btn").onclick = async () => {
         try {
           hideError();
           const tracks = await invoke("get_playlist_tracks", { playlistId: p.id });
+          setMode("youtube");
           setYtTracks(tracks, false, {
             title: p.name,
             subtitle: `${p.track_count} tracks`,
@@ -1121,9 +1132,13 @@ $("yt-user-btn").onclick = async () => {
       el.appendChild(div);
     });
   } catch (e) {
-    showError(e);
+    // No session (or the sidecar is down): the local folders still work, so a
+    // banner would be noise.
+    ytPlaylistsLoaded = false;
+    el.innerHTML = "";
+    console.warn("could not load the account playlists:", String(e));
   }
-};
+}
 
 /* ---------- auth ---------- */
 
@@ -1284,6 +1299,8 @@ event.listen("auth-expired", () => {
   // Personal shelves must disappear with the session.
   homeSession = "signed_out";
   homeLastKey = "";
+  ytPlaylistsLoaded = false;
+  $("yt-user-playlists").innerHTML = "";
   loadHome();
 });
 
@@ -1301,6 +1318,8 @@ event.listen("yt-auth-changed", (e) => {
     refresh();
     homeSession = p.state || "active";
     homeLastKey = "";
+    ytPlaylistsLoaded = false;
+    loadUserPlaylists();
     loadHome();
     if (ytModalIsOpen()) closeYtModal();
   } else if (p.cancelled) {
@@ -1324,6 +1343,7 @@ $("yt-logout-btn").onclick = async () => {
     $("yt-logout-note").classList.remove("hidden");
     currentYtTracks = [];
     $("yt-user-playlists").innerHTML = "";
+    ytPlaylistsLoaded = false;
     homeSession = "signed_out";
     homeLastKey = "";
     loadHome();
@@ -1750,6 +1770,7 @@ async function pollApiStatus() {
     // The sidecar finishes signing in after the window is up: the home page
     // has to follow, or a signed-in listener keeps seeing the guest banner.
     const session = status.session_state || "signed_out";
+    if (session === "active" && !ytPlaylistsLoaded) loadUserPlaylists();
     if (homeLoaded && session !== homeSession) {
       homeSession = session;
       homeLastKey = "";
@@ -2082,6 +2103,7 @@ try {
 
 refresh();
 loadLibrary();
+loadUserPlaylists();
 loadSettings();
 pollApiStatus();
 showMainView("home");
