@@ -1828,6 +1828,9 @@ input[type="range"]::-moz-range-thumb {
 
 .h-rail {
   display: flex;
+  /* Cards size to their cover: without this a flex item stretches to the
+     tallest neighbour and the shelf grows into a column of empty boxes. */
+  align-items: flex-start;
   gap: 14px;
   overflow-x: auto;
   overflow-y: hidden;
@@ -1839,6 +1842,11 @@ input[type="range"]::-moz-range-thumb {
 
 .h-card {
   flex: 0 0 168px;
+  /* flex-basis loses to the default min-width: auto, which is the min-content
+     width of a nowrap title — that is why long playlist names made the cards
+     wider than the shelf asked for. */
+  min-width: 0;
+  max-width: 168px;
   scroll-snap-align: start;
   padding: 10px;
   border: 1px solid var(--border);
