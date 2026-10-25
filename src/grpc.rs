@@ -63,11 +63,24 @@ pub fn set_endpoint(port: u16, token: String) -> Result<()> {
     Ok(())
 }
 
+/// The sidecar has not announced its port yet: the app started a moment ago or
+/// the process is being restarted. Callers that can wait retry this one.
+#[derive(Debug)]
+pub struct NotReady;
+
+impl std::fmt::Display for NotReady {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the sidecar endpoint is not configured yet")
+    }
+}
+
+impl std::error::Error for NotReady {}
+
 async fn connect() -> Result<Client> {
     let channel = CHANNEL
         .get()
         .cloned()
-        .ok_or_else(|| anyhow::anyhow!("sidecar endpoint is not configured yet"))?;
+        .ok_or_else(|| anyhow::Error::new(NotReady))?;
     let token = API_TOKEN.get().cloned().unwrap_or_default();
     Ok(PlayerApiClient::with_interceptor(
         channel,
@@ -174,9 +187,13 @@ pub async fn get_home(limit: i32) -> Result<Vec<Shelf>> {
     Ok(resp.shelves)
 }
 
-/// True for "the sidecar is not there yet" failures, which are worth retrying.
-/// An error the sidecar itself reported is not.
-pub fn is_transport_error(err: &anyhow::Error) -> bool {
+/// True for "the sidecar is not there yet" failures, which are worth retrying:
+/// no port announced yet, a refused connection, a restarting process. An error
+/// the sidecar itself reported is not retryable.
+pub fn is_retryable_failure(err: &anyhow::Error) -> bool {
+    if err.downcast_ref::<NotReady>().is_some() {
+        return true;
+    }
     if err.downcast_ref::<tonic::transport::Error>().is_some() {
         return true;
     }

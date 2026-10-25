@@ -732,6 +732,24 @@ fn play_local_path(path: String, state: tauri::State<AppState>) -> Result<(), St
     Ok(())
 }
 
+/// Plays one file that may not belong to the loaded library (a cached track
+/// from «Избранное», for instance): play_local_path only knows library files.
+#[tauri::command]
+fn play_local_file(path: String, state: tauri::State<AppState>) -> Result<(), String> {
+    let file = std::path::PathBuf::from(&path);
+    if !file.is_file() {
+        return Err("file not found".to_string());
+    }
+    let track = playlist::read_track(&file, &downloader::covers_dir());
+    let playlist = Playlist {
+        name: "File".to_string(),
+        tracks: vec![track],
+    };
+    load_local_playlist(playlist, &state);
+    state.engine.lock().send(Cmd::PlayTrack(0));
+    Ok(())
+}
+
 #[tauri::command]
 fn play_track(index: usize, state: tauri::State<AppState>) {
     // A local track replaces any active YouTube queue: otherwise the queue
@@ -2018,6 +2036,7 @@ fn shelf_from_pb(shelf: grpc::Shelf) -> home::Shelf {
                 browse_id: item.browse_id,
                 playlist_id: item.playlist_id,
                 path: None,
+                start_secs: 0.0,
             })
             .collect(),
     }
@@ -2052,7 +2071,7 @@ async fn fetch_home_shelves() -> Result<Vec<home::Shelf>, String> {
             }
             Err(e) => {
                 let message = e.to_string();
-                if !grpc::is_transport_error(&e) || started.elapsed() >= DEADLINE {
+                if !grpc::is_retryable_failure(&e) || started.elapsed() >= DEADLINE {
                     return Err(message);
                 }
                 tokio::time::sleep(PAUSE).await;
@@ -2061,11 +2080,28 @@ async fn fetch_home_shelves() -> Result<Vec<home::Shelf>, String> {
     }
 }
 
+/// The home page must reflect the account that is actually signed in. Restoring
+/// auth.bin happens right after the sidecar comes up, so asking GetHome before
+/// that would cache a guest page for a signed-in listener — and then overwrite
+/// the personal snapshot with public shelves.
+async fn wait_for_session_ready(state: &AppState) -> bool {
+    const LIMIT: std::time::Duration = std::time::Duration::from_secs(15);
+    let deadline = std::time::Instant::now() + LIMIT;
+    while state.session_checked.lock().is_none() {
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    true
+}
+
 #[tauri::command]
 async fn refresh_home(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<HomePage, String> {
+    wait_for_session_ready(&state).await;
     let network = fetch_home_shelves().await?;
     let signed_in = home_signed_in(&state);
     let personal = network
@@ -2594,6 +2630,7 @@ fn main() {
             open_artist,
             set_search_filter,
             play_local_path,
+            play_local_file,
             get_user_playlists,
             get_playlist_tracks,
             get_liked_songs,

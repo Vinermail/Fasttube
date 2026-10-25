@@ -42,6 +42,13 @@ pub struct Item {
     /// Set for local rows: the file to play instead of a video id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    /// Seconds to seek to once playback starts (the «Продолжить» card).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub start_secs: f64,
+}
+
+fn is_zero(value: &f64) -> bool {
+    *value <= 0.0
 }
 
 impl Item {
@@ -208,6 +215,7 @@ pub fn local_shelves(input: &LocalInput, limit: usize) -> Vec<Shelf> {
         };
         let mut item = item;
         item.subtitle = continue_subtitle(&resume.artist, resume.position_secs);
+        item.start_secs = resume.position_secs;
         shelves.push(Shelf::new(SHELF_CONTINUE, KIND_LOCAL, vec![item]));
     }
 
@@ -339,6 +347,7 @@ mod tests {
         assert_eq!(shelves[0].items.len(), 1);
         assert_eq!(shelves[0].items[0].subtitle, "Band • остановились на 1:23");
         assert_eq!(shelves[0].items[0].id, "vid1");
+        assert_eq!(shelves[0].items[0].start_secs, 83.0);
         // The resumed track is not repeated in "recent".
         assert_eq!(
             shelves[1].items.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(),

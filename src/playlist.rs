@@ -151,7 +151,9 @@ pub fn collect(root: &Path, cover_dir: &Path) -> Result<Vec<Playlist>> {
     Ok(playlists)
 }
 
-fn read_track(path: &Path, cover_dir: &Path) -> Track {
+/// One file with its tags: used by the folder scan and by playback of a
+/// single file that is not part of the loaded library.
+pub fn read_track(path: &Path, cover_dir: &Path) -> Track {
     let fallback_title = path
         .file_stem()
         .and_then(|s| s.to_str())

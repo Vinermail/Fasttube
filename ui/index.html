@@ -9,6 +9,7 @@
 <body>
   <aside id="sidebar">
     <div class="brand">Fasttube</div>
+    <button id="mode-home" class="btn nav home-nav active">Главная</button>
     <div class="nav-row">
       <button id="mode-local" class="btn nav active">Local</button>
       <button id="mode-youtube" class="btn nav">YouTube</button>
@@ -57,7 +58,19 @@
       </div>
       <button id="mode-settings" class="tbtn pb-settings" title="Settings">⚙</button>
     </div>
-    <div id="view-player" class="view">
+    <div id="view-home" class="view">
+      <div id="home-signin" class="home-signin hidden">
+        <span>Войдите, чтобы увидеть персональные подборки</span>
+        <button id="home-signin-btn" class="btn primary">Войти</button>
+      </div>
+      <div id="home-status" class="home-status hidden">
+        <span id="home-status-text"></span>
+        <button id="home-retry" class="btn small">Повторить</button>
+      </div>
+      <div id="home-body" class="home-body"></div>
+    </div>
+
+    <div id="view-player" class="view hidden">
       <div id="empty">
         <div class="empty-inner">
           <div class="empty-icon">♪</div>

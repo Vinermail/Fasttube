@@ -71,6 +71,7 @@ function applyView(name) {
   document.querySelectorAll(".view").forEach((v) => v.classList.add("hidden"));
   $("view-" + name).classList.remove("hidden");
   $("mode-settings").classList.toggle("active", name === "settings");
+  $("mode-home").classList.toggle("active", name === "home");
 }
 
 function goBack() {
@@ -94,6 +95,11 @@ function updateNavButtons() {
 
 $("btn-back").onclick = goBack;
 $("btn-forward").onclick = goForward;
+
+$("mode-home").onclick = () => {
+  showMainView("home");
+  if (!homeLoaded) loadHome();
+};
 
 $("mode-local").onclick = () => setMode("local");
 $("mode-youtube").onclick = () => setMode("youtube");
@@ -276,7 +282,13 @@ async function loadLibrary() {
   }
 }
 
-event.listen("library-loaded", () => loadLibrary());
+event.listen("library-loaded", () => {
+  loadLibrary();
+  // The local shelves depend on the library: «Избранное» and «Недавно
+  // добавленное» would otherwise stay as they were before the scan.
+  homeLastKey = "";
+  loadHome(false);
+});
 
 /* ---------- youtube lists ---------- */
 
@@ -457,9 +469,15 @@ function thumbSrc(item) {
 function playSectionItem(section, index) {
   const item = section.items[index];
   if (item.path) {
+    // Library files play inside their folder; a file that is not part of the
+    // library (a cached favourite, for instance) still has to start.
     invoke("play_local_path", { path: item.path })
       .then(() => applyMode("local"))
-      .catch((e) => showError(e));
+      .catch(() =>
+        invoke("play_local_file", { path: item.path })
+          .then(() => applyMode("local"))
+          .catch((e) => showError(e)),
+      );
     return;
   }
   const playable = section.items.filter(
@@ -643,6 +661,268 @@ function renderSearchSections(sections, error) {
   $("search-empty").classList.add("hidden");
   renderSectionsInto($("search-body"), sections, error);
 }
+
+/* ---------- home ---------- */
+
+let homeLoaded = false;
+let homeRefreshing = false;
+let homeSession = "signed_out";
+let homeLastKey = "";
+
+function homeSkeletonShelf() {
+  const shelf = document.createElement("div");
+  shelf.className = "h-shelf";
+  const head = document.createElement("div");
+  head.className = "h-shelf-head";
+  const title = document.createElement("div");
+  title.className = "h-shelf-title";
+  title.textContent = "Загрузка…";
+  head.appendChild(title);
+  shelf.appendChild(head);
+
+  const rail = document.createElement("div");
+  rail.className = "h-rail";
+  for (let i = 0; i < 6; i++) {
+    const card = document.createElement("div");
+    card.className = "h-card skeleton";
+    const cover = document.createElement("div");
+    cover.className = "h-card-cover";
+    const line = document.createElement("div");
+    line.className = "h-card-title";
+    const sub = document.createElement("div");
+    sub.className = "h-card-sub";
+    card.append(cover, line, sub);
+    rail.appendChild(card);
+  }
+  shelf.appendChild(rail);
+  return shelf;
+}
+
+/// Waits until the engine is actually playing before seeking: the stream is
+/// resolved and downloaded first, so a fixed delay is a guess. The seek also
+/// waits for the decoder to settle (a seek during start-up lands nowhere near
+/// the target), and is verified once.
+async function seekWhenPlaying(secs) {
+  if (!(secs > 1)) return;
+  for (let i = 0; i < 60; i++) {
+    await new Promise((r) => setTimeout(r, 500));
+    const state = await invoke("get_state").catch(() => null);
+    if (!state || state.status === "stopped") return;
+    if (state.status === "playing" && state.elapsed >= 1.5) {
+      await invoke("seek", { secs }).catch(() => {});
+      await new Promise((r) => setTimeout(r, 1200));
+      const after = await invoke("get_state").catch(() => null);
+      if (after && Math.abs((after.elapsed || 0) - secs) > 5) {
+        await invoke("seek", { secs }).catch(() => {});
+      }
+      return;
+    }
+  }
+}
+
+function homeCardClick(shelf, index) {
+  const item = shelf.items[index];
+  if (!item) return;
+  if (item.start_secs > 1) seekWhenPlaying(item.start_secs);
+  if (item.path || item.kind === "local") {
+    playSectionItem(shelf, index);
+  } else if (item.kind === "song" || item.kind === "video") {
+    playSectionItem(shelf, index);
+  } else if (item.kind === "album" && window.openAlbumPage) {
+    window.openAlbumPage(item);
+  } else if (item.kind === "artist" && window.openArtistPage) {
+    window.openArtistPage(item);
+  } else if (item.kind === "playlist") {
+    openSearchPlaylist(item);
+  }
+}
+
+function buildHomeCard(shelf, index) {
+  const item = shelf.items[index];
+  const card = document.createElement("div");
+  card.className = "h-card";
+  card.tabIndex = 0;
+  card.setAttribute("role", "button");
+
+  const src = thumbSrc(item);
+  if (src) {
+    const img = document.createElement("img");
+    img.className = "h-card-cover";
+    img.loading = "lazy";
+    img.alt = "";
+    img.src = src;
+    img.onerror = () => {
+      const fallback = document.createElement("div");
+      fallback.className = "h-card-cover";
+      fallback.textContent = "♪";
+      img.replaceWith(fallback);
+    };
+    card.appendChild(img);
+  } else {
+    const placeholder = document.createElement("div");
+    placeholder.className = "h-card-cover";
+    placeholder.textContent = "♪";
+    card.appendChild(placeholder);
+  }
+
+  const title = document.createElement("div");
+  title.className = "h-card-title";
+  title.textContent = item.title || "";
+  const sub = document.createElement("div");
+  sub.className = "h-card-sub";
+  sub.textContent = item.subtitle || "";
+  card.append(title, sub);
+
+  const activate = () => homeCardClick(shelf, index);
+  card.onclick = activate;
+  card.onkeydown = (e) => {
+    if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      activate();
+    }
+  };
+  return card;
+}
+
+function buildHomeShelf(shelf, shelfIndex) {
+  const wrap = document.createElement("div");
+  wrap.className = "h-shelf";
+
+  const head = document.createElement("div");
+  head.className = "h-shelf-head";
+  const title = document.createElement("div");
+  title.className = "h-shelf-title";
+  title.textContent = shelf.title || "";
+  const nav = document.createElement("div");
+  nav.className = "h-shelf-nav";
+  const rail = document.createElement("div");
+  rail.className = "h-rail";
+  rail.dataset.shelf = String(shelfIndex);
+
+  const makeNav = (glyph, dir) => {
+    const btn = document.createElement("button");
+    btn.className = "h-nav-btn";
+    btn.type = "button";
+    btn.textContent = glyph;
+    btn.tabIndex = -1;
+    btn.onclick = (e) => {
+      e.stopPropagation();
+      rail.scrollBy({ left: dir * Math.max(240, rail.clientWidth * 0.8), behavior: "smooth" });
+    };
+    return btn;
+  };
+  nav.append(makeNav("‹", -1), makeNav("›", 1));
+  head.append(title, nav);
+  wrap.appendChild(head);
+
+  shelf.items.forEach((_, i) => rail.appendChild(buildHomeCard(shelf, i)));
+  wrap.appendChild(rail);
+  return wrap;
+}
+
+function applyHomeSession() {
+  const signedOut = homeSession !== "active";
+  $("home-signin").classList.toggle("hidden", !signedOut);
+  // Personal shelves belong to the session that fetched them.
+  if (signedOut) {
+    document.querySelectorAll('#home-body .h-shelf[data-personal="1"]').forEach((el) => el.remove());
+  }
+}
+
+function renderHome(page, pending) {
+  const body = $("home-body");
+  const key = JSON.stringify([page.shelves || [], pending, homeSession]);
+  if (key === homeLastKey) return;
+  homeLastKey = key;
+
+  // Keep the reader's place: both the page and every carousel.
+  const scrollTop = body.scrollTop;
+  const rails = new Map();
+  body.querySelectorAll(".h-rail").forEach((rail) => {
+    rails.set(rail.dataset.shelf, rail.scrollLeft);
+  });
+
+  body.textContent = "";
+  const shelves = page.shelves || [];
+  shelves.forEach((shelf, i) => {
+    const el = buildHomeShelf(shelf, i);
+    if (shelf.kind === "personal") el.dataset.personal = "1";
+    body.appendChild(el);
+  });
+  if (pending && !shelves.some((s) => s.kind === "personal" || s.kind === "explore")) {
+    body.insertBefore(homeSkeletonShelf(), body.firstChild);
+  }
+  if (!body.childElementCount) {
+    const empty = document.createElement("div");
+    empty.className = "s-status";
+    empty.textContent = "Пусто. Включите папку с музыкой или войдите в аккаунт.";
+    body.appendChild(empty);
+  }
+
+  body.scrollTop = scrollTop;
+  rails.forEach((left, index) => {
+    const rail = body.querySelector(`.h-rail[data-shelf="${index}"]`);
+    if (rail && left > 0) rail.scrollLeft = left;
+  });
+  applyHomeSession();
+  homeLoaded = true;
+}
+
+function showHomeStatus(text) {
+  $("home-status-text").textContent = text;
+  $("home-status").classList.remove("hidden");
+}
+
+function hideHomeStatus() {
+  $("home-status").classList.add("hidden");
+}
+
+async function refreshHome() {
+  if (homeRefreshing) return;
+  homeRefreshing = true;
+  try {
+    const page = await invoke("refresh_home");
+    hideHomeStatus();
+    renderHome(page, false);
+  } catch (e) {
+    // The snapshot and the local shelves stay on screen: only the network part
+    // failed, so there is nothing to replace them with. The placeholder shelf
+    // must not keep pretending something is loading.
+    showHomeStatus("Не удалось обновить");
+    document
+      .querySelectorAll("#home-body .h-card.skeleton")
+      .forEach((card) => card.closest(".h-shelf")?.remove());
+    console.warn("home refresh failed:", String(e));
+  } finally {
+    homeRefreshing = false;
+  }
+}
+
+/// `withNetwork = false` re-reads only the local shelves (a library change does
+/// not need a round trip to YouTube).
+async function loadHome(withNetwork = true) {
+  try {
+    const status = await invoke("get_api_status");
+    homeSession = status.session_state || "signed_out";
+    const cached = await invoke("get_home_cached");
+    renderHome(cached, withNetwork);
+  } catch (e) {
+    showError(e);
+  }
+  if (!withNetwork) return;
+  hideHomeStatus();
+  refreshHome();
+}
+
+$("home-signin-btn").onclick = () => openYtModal();
+$("home-retry").onclick = () => {
+  hideHomeStatus();
+  refreshHome();
+};
+
+event.listen("home-updated", (e) => {
+  if (e.payload) renderHome(e.payload, false);
+});
 
 /* ---------- album / artist pages ---------- */
 
@@ -1001,6 +1281,10 @@ $("auth-banner-close").onclick = () => {
 
 event.listen("auth-expired", () => {
   if (!authBannerDismissed) showAuthBanner(AUTH_EXPIRED_TEXT, true, "expired");
+  // Personal shelves must disappear with the session.
+  homeSession = "signed_out";
+  homeLastKey = "";
+  loadHome();
 });
 
 event.listen("auth-notice", (e) => {
@@ -1015,6 +1299,9 @@ event.listen("yt-auth-changed", (e) => {
     hideError();
     applySessionInfo({ state: p.state || "active", account_name: p.account_name || "" });
     refresh();
+    homeSession = p.state || "active";
+    homeLastKey = "";
+    loadHome();
     if (ytModalIsOpen()) closeYtModal();
   } else if (p.cancelled) {
     refresh(); // the user closed the window: status comes from shared state
@@ -1037,6 +1324,9 @@ $("yt-logout-btn").onclick = async () => {
     $("yt-logout-note").classList.remove("hidden");
     currentYtTracks = [];
     $("yt-user-playlists").innerHTML = "";
+    homeSession = "signed_out";
+    homeLastKey = "";
+    loadHome();
   } catch (e) {
     showError(e);
   }
@@ -1118,6 +1408,8 @@ $("open-folder").onclick = async () => {
     if (!path) return;
     hideError();
     renderPlaylists(await invoke("open_folder", { path }));
+    homeLastKey = "";
+    loadHome(false);
     setMode("local");
   } catch (e) {
     showError(e);
@@ -1453,7 +1745,16 @@ function renderDownloadProgress(p) {
 
 async function pollApiStatus() {
   try {
-    renderApiStatus(await invoke("get_api_status"));
+    const status = await invoke("get_api_status");
+    renderApiStatus(status);
+    // The sidecar finishes signing in after the window is up: the home page
+    // has to follow, or a signed-in listener keeps seeing the guest banner.
+    const session = status.session_state || "signed_out";
+    if (homeLoaded && session !== homeSession) {
+      homeSession = session;
+      homeLastKey = "";
+      loadHome();
+    }
     renderDownloadProgress(await invoke("get_download_progress"));
     if (mode === "local") {
       isFav = await invoke("is_favorite");
@@ -1770,6 +2071,8 @@ try {
           .then((lib) => {
             renderPlaylists(lib);
             setMode("local");
+            homeLastKey = "";
+            loadHome(false);
           })
           .catch((e) => showError(e));
       }
@@ -1781,6 +2084,8 @@ refresh();
 loadLibrary();
 loadSettings();
 pollApiStatus();
+showMainView("home");
+loadHome();
 setInterval(refresh, 250);
 setInterval(pollApiStatus, 3000);
 setInterval(highlightLyrics, 250);
