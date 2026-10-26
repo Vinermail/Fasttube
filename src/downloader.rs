@@ -2,8 +2,11 @@ use anyhow::{Result, anyhow};
 use futures_util::StreamExt;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
+
+use parking_lot::Mutex;
 
 #[derive(Serialize, Clone, Default)]
 pub struct DownloadProgress {
@@ -269,18 +272,52 @@ fn evict_cache_in(dir: &Path, limit_bytes: u64, keep: &[PathBuf]) -> (usize, u64
 ///
 /// Large files are downloaded with several parallel byte-range connections,
 /// which is dramatically faster through latency-heavy proxies.
+/// One client for the whole process: its connection pool survives between
+/// tracks, which is most of the win for a sequential queue of downloads.
+static CLIENT: OnceLock<Mutex<Option<(Option<String>, reqwest::Client)>>> = OnceLock::new();
+
+/// The client for `proxy`, rebuilt only when the proxy changes.
+fn shared_client(proxy: Option<&str>) -> Result<reqwest::Client> {
+    let slot = CLIENT.get_or_init(|| Mutex::new(None));
+    let mut guard = slot.lock();
+    if let Some((key, client)) = guard.as_ref()
+        && key.as_deref() == proxy
+    {
+        return Ok(client.clone());
+    }
+    let client = build_client(proxy)?;
+    *guard = Some((proxy.map(str::to_string), client.clone()));
+    Ok(client)
+}
+
+/// Probe request: the total size, and whether the server honours ranges.
+/// A connection failure usually means the proxy came or went, so the cached
+/// answer is dropped and the request is repeated once.
+async fn probe(url: &str) -> Result<(reqwest::Client, reqwest::Response)> {
+    let mut retried = false;
+    loop {
+        let proxy = crate::net::detect_proxy_async().await;
+        let client = shared_client(proxy.as_deref())?;
+        let attempt = client
+            .get(url)
+            .header("User-Agent", USER_AGENT)
+            .header("Range", "bytes=0-")
+            .send()
+            .await;
+        match attempt {
+            Ok(response) => return Ok((client, response.error_for_status()?)),
+            Err(e) if !retried && (e.is_connect() || e.is_timeout()) => {
+                crate::net::invalidate_proxy_cache();
+                retried = true;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
+
 pub async fn download(url: &str, dest: &Path, handle: &ProgressHandle) -> Result<()> {
     let started = std::time::Instant::now();
-    let client = build_client()?;
-
-    // Probe request: obtains the total size (and confirms Range support).
-    let response = client
-        .get(url)
-        .header("User-Agent", USER_AGENT)
-        .header("Range", "bytes=0-")
-        .send()
-        .await?
-        .error_for_status()?;
+    let (client, response) = probe(url).await?;
 
     let total = response.content_length().unwrap_or(0);
     let probe_ms = started.elapsed().as_millis();
@@ -293,11 +330,12 @@ pub async fn download(url: &str, dest: &Path, handle: &ProgressHandle) -> Result
     std::fs::create_dir_all(parent)?;
     let tmp = dest.with_extension("part");
 
-    let parallel = total > PARALLEL_THRESHOLD
-        && response.status() == reqwest::StatusCode::PARTIAL_CONTENT;
+    let chunks = chunk_count(total);
+    let parallel =
+        total > PARALLEL_THRESHOLD && chunks >= 2 && response.status() == reqwest::StatusCode::PARTIAL_CONTENT;
     if parallel {
         drop(response);
-        parallel_download(&client, url, &tmp, total, handle, started).await?;
+        parallel_download(&client, url, &tmp, total, chunks, handle, started).await?;
     } else {
         sequential_download(response, &tmp, handle, started).await?;
     }
@@ -311,30 +349,51 @@ pub async fn download(url: &str, dest: &Path, handle: &ProgressHandle) -> Result
     let secs = elapsed.as_secs_f64().max(0.001);
     let bytes = handle.bytes.load(Ordering::Relaxed);
     eprintln!(
-        "[perf] download_ms={} probe_ms={} ttfb_ms={} bytes={} mbps={:.2} parallel={}",
+        "[perf] download_ms={} probe_ms={} ttfb_ms={} bytes={} mbps={:.2} parallel={} chunks={}",
         elapsed.as_millis(),
         probe_ms,
         handle.first_byte_ms.load(Ordering::Relaxed),
         bytes,
         bytes as f64 / secs / 1_000_000.0,
-        parallel
+        parallel,
+        if parallel { chunks } else { 1 }
     );
     Ok(())
 }
 
 const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)";
-const PARALLEL_THRESHOLD: u64 = 8 * 1024 * 1024;
-const MAX_CHUNKS: u64 = 6;
+/// Splitting a smaller transfer costs more in round trips than it saves.
+const PARALLEL_THRESHOLD: u64 = 1024 * 1024;
+const CHUNK_UNIT: u64 = 1024 * 1024;
+const MAX_CHUNKS: u64 = 4;
+/// Writes go out in 256 KiB blocks instead of whatever the socket delivers.
+const WRITE_BUFFER: usize = 256 * 1024;
 
-fn build_client() -> Result<reqwest::Client> {
+fn chunk_count(total: u64) -> u64 {
+    // A 1.5 MiB file is two pieces, not one: the unit is the *chunk size*,
+    // so the threshold and the first split fall together at 1 MiB.
+    total.div_ceil(CHUNK_UNIT).clamp(1, MAX_CHUNKS)
+}
+
+fn build_client(proxy: Option<&str>) -> Result<reqwest::Client> {
     let mut builder = reqwest::Client::builder().http1_only();
-    if let Some(proxy) = crate::net::detect_proxy() {
+    if let Some(proxy) = proxy {
         builder = builder.proxy(reqwest::Proxy::all(proxy)?);
     }
     Ok(builder
-        .timeout(std::time::Duration::from_secs(300))
-        .connect_timeout(std::time::Duration::from_secs(15))
+        .timeout(Duration::from_secs(300))
+        .connect_timeout(Duration::from_secs(15))
         .build()?)
+}
+
+/// A buffered writer positioned at `start`: each chunk task writes one
+/// contiguous range, so the buffer never has to seek.
+async fn seek_for_write(start: u64, file: tokio::fs::File) -> Result<tokio::io::BufWriter<tokio::fs::File>> {
+    use tokio::io::AsyncSeekExt;
+
+    let mut file = file;
+    file.seek(std::io::SeekFrom::Start(start)).await?;
+    Ok(tokio::io::BufWriter::with_capacity(WRITE_BUFFER, file))
 }
 
 async fn sequential_download(
@@ -344,16 +403,18 @@ async fn sequential_download(
     started: std::time::Instant,
 ) -> Result<()> {
     let file = tokio::fs::File::create(tmp).await?;
-    let mut sink = CountingSink {
+    let sink = CountingSink {
         inner: file,
         bytes: handle.bytes.clone(),
     };
+    let mut writer = tokio::io::BufWriter::with_capacity(WRITE_BUFFER, sink);
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
         handle.mark_first_byte(started);
-        tokio::io::AsyncWriteExt::write_all(&mut sink, &chunk).await?;
+        tokio::io::AsyncWriteExt::write_all(&mut writer, &chunk).await?;
     }
+    tokio::io::AsyncWriteExt::flush(&mut writer).await?;
     Ok(())
 }
 
@@ -362,16 +423,16 @@ async fn parallel_download(
     url: &str,
     tmp: &Path,
     total: u64,
+    chunks: u64,
     handle: &ProgressHandle,
     started: std::time::Instant,
 ) -> Result<()> {
-    use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+    use tokio::io::AsyncWriteExt;
 
     let file = tokio::fs::File::create(tmp).await?;
     file.set_len(total).await?;
     drop(file);
 
-    let chunks = MAX_CHUNKS.min(total);
     let chunk_size = total.div_ceil(chunks);
     let mut tasks = Vec::new();
     for i in 0..chunks {
@@ -396,9 +457,9 @@ async fn parallel_download(
             if resp.status() != reqwest::StatusCode::PARTIAL_CONTENT {
                 anyhow::bail!("chunk request returned {}", resp.status());
             }
-            let mut file = tokio::fs::OpenOptions::new().write(true).open(&tmp).await?;
+            let file = tokio::fs::OpenOptions::new().write(true).open(&tmp).await?;
+            let mut writer = seek_for_write(start, file).await?;
             let mut stream = resp.bytes_stream();
-            let mut pos = start;
             while let Some(chunk) = stream.next().await {
                 let chunk = chunk?;
                 // First byte from any chunk task wins.
@@ -408,11 +469,10 @@ async fn parallel_download(
                     Ordering::Relaxed,
                     Ordering::Relaxed,
                 );
-                file.seek(std::io::SeekFrom::Start(pos)).await?;
-                file.write_all(&chunk).await?;
-                pos += chunk.len() as u64;
+                writer.write_all(&chunk).await?;
                 bytes.fetch_add(chunk.len() as u64, Ordering::Relaxed);
             }
+            writer.flush().await?;
             Ok::<(), anyhow::Error>(())
         }));
     }
@@ -430,6 +490,63 @@ struct CountingSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sample(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i % 251) as u8).collect()
+    }
+
+    /// The parallel path hands each chunk its own handle and offset, so the
+    /// pieces may land in any order; this checks the assembly itself.
+    #[tokio::test]
+    async fn chunks_written_out_of_order_rebuild_the_file() {
+        let dir = std::env::temp_dir().join(format!("ft_chunks_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("assembled.bin");
+        let data = sample(64 * 1024);
+        std::fs::write(&path, vec![0u8; data.len()]).expect("seed file");
+
+        let ranges = [
+            (0usize, 20_000usize),
+            (20_000, 40_000),
+            (40_000, 50_000),
+            (50_000, data.len()),
+        ];
+        let mut tasks = Vec::new();
+        for (i, (start, end)) in ranges.iter().enumerate() {
+            let path = path.clone();
+            let slice = data[*start..*end].to_vec();
+            let start = *start as u64;
+            // Reverse order: the last chunk finishes first.
+            let delay = (ranges.len() - i) as u64 * 30;
+            tasks.push(tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+                let file = tokio::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&path)
+                    .await?;
+                let mut writer = seek_for_write(start, file).await?;
+                tokio::io::AsyncWriteExt::write_all(&mut writer, &slice).await?;
+                tokio::io::AsyncWriteExt::flush(&mut writer).await?;
+                Ok::<(), anyhow::Error>(())
+            }));
+        }
+        for task in tasks {
+            task.await.expect("join").expect("write");
+        }
+
+        assert_eq!(std::fs::read(&path).expect("read back"), data);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn chunk_count_follows_the_size() {
+        assert_eq!(chunk_count(1024), 1, "below a megabyte stays sequential");
+        assert_eq!(chunk_count(1536 * 1024), 2, "1.5 MiB is two pieces");
+        assert_eq!(chunk_count(2 * 1024 * 1024), 2);
+        assert_eq!(chunk_count(3 * 1024 * 1024), 3);
+        assert_eq!(chunk_count(12 * 1024 * 1024), MAX_CHUNKS);
+        assert_eq!(chunk_count(u64::MAX), MAX_CHUNKS);
+    }
 
     /// Fake id, never a real video: keeps the test away from user cache files.
     const ID: &str = "testVid0001";

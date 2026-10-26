@@ -29,6 +29,16 @@ if _PROXY:
     YT_DLP_OPTS["proxy"] = _PROXY
     net.apply_env_proxy()
 
+# The resolve options do not depend on the request: the proxy is decided once at
+# import (`_PROXY` above, same list as the Rust side probes). yt-dlp keeps the
+# dict it is handed, so every resolve passes a copy instead of rebuilding it.
+_RESOLVE_OPTS = dict(YT_DLP_OPTS)
+
+
+def _resolve_opts() -> dict:
+    return dict(_RESOLVE_OPTS)
+
+
 _VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 
 
@@ -186,8 +196,7 @@ def _resolve_url_impl(
 
     import yt_dlp
 
-    opts = dict(YT_DLP_OPTS)
-    with yt_dlp.YoutubeDL(opts) as ydl:
+    with yt_dlp.YoutubeDL(_resolve_opts()) as ydl:
         if cookie_header:
             _attach_cookies(ydl, cookie_header)
         info = ydl.extract_info(video_id, download=False)
