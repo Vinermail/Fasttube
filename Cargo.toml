@@ -26,6 +26,16 @@ replaygain = "1.0.1"
 tower = "0.5"
 http = "1"
 
+# Release: a faster, smaller binary. `panic = "abort"` is safe here - nothing
+# in this crate unwinds on purpose (no catch_unwind), and a crash still takes the
+# sidecar down with it: the child watches its stdin pipe and exits when it
+# closes, which is exactly what happens when the process dies.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"
+
 [build-dependencies]
 protoc-bin-vendored = "3.2.0"
 tauri-build = "2"

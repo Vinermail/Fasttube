@@ -41,6 +41,47 @@ function hideError() {
   $("sidebar-error").classList.add("hidden");
 }
 
+/* ---------- cheap DOM writes ---------- */
+// The status poll used to rewrite the same strings four times a second. These
+// helpers remember the last value and touch the DOM only when it differs.
+
+const textCache = new WeakMap();
+
+function setText(el, value) {
+  const text = value == null ? "" : String(value);
+  if (textCache.get(el) === text) return;
+  textCache.set(el, text);
+  el.textContent = text;
+}
+
+function setClass(el, cls) {
+  if (el.className !== cls) el.className = cls;
+}
+
+function setValue(el, value) {
+  if (el.value !== String(value)) el.value = value;
+}
+
+function setSrc(el, src) {
+  if (el.getAttribute("src") !== src) {
+    if (src) el.setAttribute("src", src);
+    else el.removeAttribute("src");
+  }
+}
+
+/* ---------- where the clock is ---------- */
+// Between polls the position is extrapolated from the last snapshot, so the
+// progress bar still moves while the app asks the engine only once a second.
+
+let lastStateAt = 0;
+
+function interpolatedElapsed() {
+  if (!lastState) return 0;
+  const base = lastState.elapsed || 0;
+  if (lastState.status !== "playing") return base;
+  return base + (performance.now() - lastStateAt) / 1000;
+}
+
 /* ---------- modes ---------- */
 
 function applyMode(m) {
@@ -80,6 +121,8 @@ function applyView(name) {
   $("view-" + name).classList.remove("hidden");
   $("mode-settings").classList.toggle("active", name === "settings");
   $("mode-home").classList.toggle("active", name === "home");
+  if (name === "lyrics") startLyricsTicker();
+  else stopLyricsTicker();
 }
 
 function goBack() {
@@ -217,19 +260,33 @@ $("lh-shuffle").onclick = () => {
 
 /* ---------- filter + sort ---------- */
 
-function applyFilterSort(rows) {
-  let out = rows.map((r, i) => ({ ...r, orig: i }));
-  if (filterText) {
-    const q = filterText.toLowerCase();
-    out = out.filter(
-      (r) =>
-        r.title.toLowerCase().includes(q) ||
-        (r.artist || "").toLowerCase().includes(q)
-    );
-  }
-  if (sortMode === 1) out.sort((a, b) => a.title.localeCompare(b.title));
-  else if (sortMode === 2) out.sort((a, b) => (a.artist || "").localeCompare(b.artist || ""));
-  else if (sortMode === 3) out.sort((a, b) => a.duration - b.duration);
+// The result is keyed by the list version, the filter text and the sort mode,
+// so a poll that changes nothing reuses the previous array: no copies, no
+// sorting. Entries keep the row and its original index instead of copying the
+// row itself.
+let filterSortCache = { key: null, out: [] };
+
+function applyFilterSort(rows, version) {
+  const key = version + "|" + filterText + "|" + sortMode + "|" + rows.length;
+  if (filterSortCache.key === key) return filterSortCache.out;
+
+  const out = [];
+  const q = filterText ? filterText.toLowerCase() : "";
+  rows.forEach((row, i) => {
+    if (q) {
+      const hit =
+        (row.title || "").toLowerCase().includes(q) ||
+        (row.artist || "").toLowerCase().includes(q);
+      if (!hit) return;
+    }
+    out.push({ row, orig: i });
+  });
+  if (sortMode === 1) out.sort((a, b) => a.row.title.localeCompare(b.row.title));
+  else if (sortMode === 2)
+    out.sort((a, b) => (a.row.artist || "").localeCompare(b.row.artist || ""));
+  else if (sortMode === 3) out.sort((a, b) => a.row.duration - b.row.duration);
+
+  filterSortCache = { key, out };
   return out;
 }
 
@@ -1512,9 +1569,10 @@ let trackActive = -1;
 let lastFirst = -1;
 let trackListEl = null;
 
-function buildRow(row, i) {
+function buildRow(entry, i) {
+  const row = entry.row;
   const div = document.createElement("div");
-  const isActive = row.orig === trackActive;
+  const isActive = entry.orig === trackActive;
   div.className = "trow" + (isActive ? " active" : "");
   const dur = row.duration > 0 ? fmt(row.duration) : "";
   div.innerHTML =
@@ -1525,7 +1583,7 @@ function buildRow(row, i) {
     `<div class="t-artist">${escapeHtml(row.artist || "")}</div>` +
     `<div class="t-dur">${dur}</div>`;
   div.onclick = () => {
-    const orig = row.orig;
+    const orig = entry.orig;
     if (mode === "youtube") {
       playYtAt(orig);
     } else {
@@ -1592,7 +1650,7 @@ function renderTracks(el, rows, activeIndex, key) {
 
 async function refreshTracks(key, activeIndex) {
   if (key === trackListKey) {
-    renderTracks($("tracks"), applyFilterSort(trackList), activeIndex, key + ":" + filterText + ":" + sortMode);
+    renderTracks($("tracks"), applyFilterSort(trackList, key), activeIndex, key + ":" + filterText + ":" + sortMode);
     return;
   }
   try {
@@ -1603,7 +1661,7 @@ async function refreshTracks(key, activeIndex) {
       duration: t.duration,
     }));
     trackListKey = key;
-    renderTracks($("tracks"), applyFilterSort(trackList), activeIndex, key + ":" + filterText + ":" + sortMode);
+    renderTracks($("tracks"), applyFilterSort(trackList, key), activeIndex, key + ":" + filterText + ":" + sortMode);
   } catch (e) {
     showError(e);
   }
@@ -1611,6 +1669,7 @@ async function refreshTracks(key, activeIndex) {
 
 function renderState(state) {
   lastState = state;
+  lastStateAt = performance.now();
   const hasYtList = mode === "youtube" && currentYtTracks.length > 0;
   if (state || hasYtList) {
     $("empty").classList.add("hidden");
@@ -1646,20 +1705,20 @@ function renderState(state) {
     npTitle = state.playlist_name || "Nothing playing";
   }
 
-  $("np-title").textContent = npTitle;
-  $("np-artist").textContent = npArtist;
+  setText($("np-title"), npTitle);
+  setText($("np-artist"), npArtist);
 
   const status = state ? state.status : "stopped";
   const statusEl = $("np-status");
-  statusEl.textContent = status;
-  statusEl.className = "np-status" + (status !== "stopped" ? " " + status : "");
+  setText(statusEl, status);
+  setClass(statusEl, "np-status" + (status !== "stopped" ? " " + status : ""));
 
-  $("btn-play").textContent = status === "playing" ? "⏸" : "▶";
+  setText($("btn-play"), status === "playing" ? "⏸" : "▶");
 
   if (state && state.speed) {
     const idx = SPEEDS.indexOf(state.speed);
     if (idx >= 0) speedIdx = idx;
-    $("btn-speed").textContent = state.speed + "x";
+    setText($("btn-speed"), state.speed + "x");
   }
 
   const cover = $("np-cover");
@@ -1678,16 +1737,18 @@ function renderState(state) {
 
   const total = state ? state.total : 0;
   const elapsed = state ? state.elapsed : 0;
-  $("time-total").textContent = fmt(total);
+  setText($("time-total"), fmt(total));
   if (!seekDragging) {
-    seekEl.max = total > 0 ? total : 100;
-    seekEl.value = elapsed;
-    $("time-elapsed").textContent = fmt(elapsed);
+    const max = total > 0 ? total : 100;
+    if (seekEl.max !== String(max)) seekEl.max = max;
+    setValue(seekEl, elapsed);
+    setText($("time-elapsed"), fmt(elapsed));
   }
 
   if (state && !volumeDragging) {
-    volumeEl.value = Math.round(state.volume * 100);
-    $("volume-value").textContent = Math.round(state.volume * 100) + "%";
+    const pct = Math.round(state.volume * 100);
+    setValue(volumeEl, pct);
+    setText($("volume-value"), pct + "%");
   }
 
   if (mode === "youtube") {
@@ -1703,7 +1764,7 @@ function renderState(state) {
     $("lh-related").classList.toggle("hidden", !queueActive);
     renderTracks(
       $("tracks"),
-      applyFilterSort(ytRows),
+      applyFilterSort(ytRows, "y:" + ytListVersion),
       activeIdx,
       "y:" + ytListVersion + ":" + filterText + ":" + sortMode
     );
@@ -1729,6 +1790,29 @@ async function refreshQueue() {
   }
 }
 
+// Polling is adaptive: once a second while a track plays, once every two
+// seconds otherwise, and not at all while the window is hidden - the progress
+// bar keeps moving from the snapshot it already has.
+const POLL_PLAYING_MS = 1000;
+const POLL_IDLE_MS = 2000;
+
+let pollTimer = null;
+
+function pollDelay() {
+  return lastState && lastState.status === "playing" ? POLL_PLAYING_MS : POLL_IDLE_MS;
+}
+
+function schedulePoll(delay) {
+  if (pollTimer) clearTimeout(pollTimer);
+  pollTimer = null;
+  if (document.hidden) return;
+  pollTimer = setTimeout(async () => {
+    pollTimer = null;
+    await refresh();
+    schedulePoll();
+  }, delay === undefined ? pollDelay() : delay);
+}
+
 async function refresh() {
   try {
     await refreshQueue();
@@ -1736,6 +1820,30 @@ async function refresh() {
   } catch (e) {
     showError(e);
   }
+}
+
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) {
+    if (pollTimer) {
+      clearTimeout(pollTimer);
+      pollTimer = null;
+    }
+    return;
+  }
+  refresh();
+  pollApiStatus();
+  schedulePoll();
+});
+
+// Local interpolation between polls: only the progress bar and the clock move,
+// no IPC, no layout of the list.
+function tickProgress() {
+  if (document.hidden || seekDragging || !lastState) return;
+  if (lastState.status !== "playing") return;
+  const total = lastState.total || 0;
+  if (!(total > 0)) return;
+  setValue(seekEl, Math.min(total, interpolatedElapsed()));
+  setText($("time-elapsed"), fmt(interpolatedElapsed()));
 }
 
 function renderApiStatus(s) {
@@ -1774,6 +1882,7 @@ function renderDownloadProgress(p) {
 }
 
 async function pollApiStatus() {
+  if (document.hidden) return;
   try {
     const status = await invoke("get_api_status");
     renderApiStatus(status);
@@ -1915,7 +2024,7 @@ async function loadLyricsForCurrent() {
 function highlightLyrics() {
   const view = $("view-lyrics");
   if (view.classList.contains("hidden") || !lyricsLines.length || !lastState) return;
-  const elapsed = lastState.elapsed;
+  const elapsed = interpolatedElapsed();
   let idx = -1;
   for (let i = 0; i < lyricsLines.length; i++) {
     if (lyricsLines[i].time <= elapsed) idx = i;
@@ -1927,6 +2036,22 @@ function highlightLyrics() {
   lines.forEach((el, i) => el.classList.toggle("active", i === idx));
   if (idx >= 0 && lines[idx]) {
     lines[idx].scrollIntoView({ block: "center", behavior: "smooth" });
+  }
+}
+
+// The lyrics ticker only exists while the lyrics view is on screen.
+let lyricsTicker = null;
+
+function startLyricsTicker() {
+  if (lyricsTicker) return;
+  highlightLyrics();
+  lyricsTicker = setInterval(highlightLyrics, 250);
+}
+
+function stopLyricsTicker() {
+  if (lyricsTicker) {
+    clearInterval(lyricsTicker);
+    lyricsTicker = null;
   }
 }
 
@@ -2118,7 +2243,7 @@ loadSettings();
 pollApiStatus();
 showMainView("home");
 loadHome();
-setInterval(refresh, 250);
+schedulePoll();
 setInterval(pollApiStatus, 3000);
-setInterval(highlightLyrics, 250);
+setInterval(tickProgress, 250);
 

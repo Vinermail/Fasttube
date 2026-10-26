@@ -558,8 +558,9 @@ body:has(#player-bar:not(.hidden)) {
   align-items: center;
   gap: 22px;
   padding: 0 18px;
+  /* 0.97 is opaque enough on its own; a blur under it costs a full-panel
+     composition on every frame. */
   background: rgba(19, 22, 28, 0.97);
-  backdrop-filter: blur(14px);
   border-top: 1px solid var(--border);
   box-shadow: 0 -8px 30px rgba(0, 0, 0, 0.35);
 }
@@ -1688,8 +1689,20 @@ input[type="range"]::-moz-range-thumb {
 
 .s-row.skeleton .s-art,
 .s-row.skeleton .s-lines i {
-  background: linear-gradient(90deg, var(--bg3), var(--bg4), var(--bg3));
-  background-size: 200% 100%;
+  /* The shimmer slides a highlight with transform instead of moving the
+     background: no repaint, so an idle skeleton costs nothing but a composite. */
+  position: relative;
+  overflow: hidden;
+  background: var(--bg3);
+}
+
+.s-row.skeleton .s-art::after,
+.s-row.skeleton .s-lines i::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(90deg, transparent, var(--bg4), transparent);
+  transform: translateX(-100%);
   animation: s-shimmer 1.2s linear infinite;
 }
 
@@ -1705,8 +1718,8 @@ input[type="range"]::-moz-range-thumb {
 }
 
 @keyframes s-shimmer {
-  0% { background-position: 200% 0; }
-  100% { background-position: -200% 0; }
+  from { transform: translateX(-100%); }
+  to { transform: translateX(100%); }
 }
 
 /* ---------- album / artist pages ---------- */
@@ -1940,8 +1953,19 @@ input[type="range"]::-moz-range-thumb {
 .h-card.skeleton .h-card-cover,
 .h-card.skeleton .h-card-title,
 .h-card.skeleton .h-card-sub {
-  background: linear-gradient(90deg, var(--bg3), var(--bg4), var(--bg3));
-  background-size: 200% 100%;
+  position: relative;
+  overflow: hidden;
+  background: var(--bg3);
+}
+
+.h-card.skeleton .h-card-cover::after,
+.h-card.skeleton .h-card-title::after,
+.h-card.skeleton .h-card-sub::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(90deg, transparent, var(--bg4), transparent);
+  transform: translateX(-100%);
   animation: s-shimmer 1.2s linear infinite;
 }
 

@@ -448,6 +448,20 @@ fn run(
     let mut seen_starts: u64 = 0;
 
     loop {
+        // While playing the loop has to look at the decoder (end of track) and
+        // refresh the position a few times a second; once playback is over
+        // there is nothing to watch, so it sleeps on the channel instead of
+        // waking up twenty times a second for nothing.
+        let playing = matches!(
+            engine.as_ref().map(|e| e.status),
+            Some(Status::Playing)
+        );
+        let wait = if playing {
+            Duration::from_millis(150)
+        } else {
+            Duration::from_millis(500)
+        };
+
         if let Some(e) = engine.as_mut()
             && e.status == Status::Playing
             && e.player.empty()
@@ -458,7 +472,7 @@ fn run(
             e.advance();
         }
 
-        match rx.recv_timeout(Duration::from_millis(50)) {
+        match rx.recv_timeout(wait) {
             Ok(cmd) => match cmd {
                 Cmd::SetPlaylist(pl) => {
                     if engine.is_none() {
@@ -565,7 +579,11 @@ fn run(
                 seen_starts = e.started;
                 let _ = events.send(Event::TrackStarted);
             }
-            let due = e.dirty || last_publish.elapsed() >= Duration::from_millis(100);
+            // Only a running engine has a position worth republishing; a
+            // paused or stopped one changes solely through commands, which set
+            // `dirty` themselves.
+            let running = e.status == Status::Playing;
+            let due = e.dirty || (running && last_publish.elapsed() >= Duration::from_millis(150));
             if due {
                 *snapshot.write() = Some(e.snapshot());
                 last_publish = Instant::now();
