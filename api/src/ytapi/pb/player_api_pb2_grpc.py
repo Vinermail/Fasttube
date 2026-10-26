@@ -91,7 +91,7 @@ class PlayerApiStub:
                 _registered_method=True)
         self.GetLikedSongs = channel.unary_unary(
                 '/player.PlayerApi/GetLikedSongs',
-                request_serializer=player__api__pb2.Empty.SerializeToString,
+                request_serializer=player__api__pb2.LikedSongsRequest.SerializeToString,
                 response_deserializer=player__api__pb2.PlaylistTracksResponse.FromString,
                 _registered_method=True)
         self.GetLyrics = channel.unary_unary(
@@ -286,7 +286,7 @@ def add_PlayerApiServicer_to_server(servicer, server):
             ),
             'GetLikedSongs': grpc.unary_unary_rpc_method_handler(
                     servicer.GetLikedSongs,
-                    request_deserializer=player__api__pb2.Empty.FromString,
+                    request_deserializer=player__api__pb2.LikedSongsRequest.FromString,
                     response_serializer=player__api__pb2.PlaylistTracksResponse.SerializeToString,
             ),
             'GetLyrics': grpc.unary_unary_rpc_method_handler(
@@ -637,7 +637,7 @@ class PlayerApi:
             request,
             target,
             '/player.PlayerApi/GetLikedSongs',
-            player__api__pb2.Empty.SerializeToString,
+            player__api__pb2.LikedSongsRequest.SerializeToString,
             player__api__pb2.PlaylistTracksResponse.FromString,
             options,
             channel_credentials,

@@ -97,7 +97,7 @@ impl From<grpc::SearchSection> for SearchSectionDto {
     }
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
 struct SearchTrack {
     video_id: String,
     title: String,
@@ -410,13 +410,51 @@ fn apply_gains(playlist: &mut Playlist, cache: &LoudnessCache, normalize: bool) 
 
 /// Scans uncached tracks in the background (two parallel workers) and pushes
 /// fresh gains into the engine, which ramps them in smoothly.
+/// How many tracks from the current one get their gain computed. Scanning a
+/// whole 350-track playlist meant decoding hundreds of megabytes on open, for
+/// tracks the listener may never reach.
+const LOUDNESS_WINDOW: usize = 6;
+
+/// The tracks worth scanning now: the one about to play and the next few.
+fn loudness_window(
+    paths: Vec<std::path::PathBuf>,
+    start: usize,
+) -> Vec<std::path::PathBuf> {
+    paths
+        .into_iter()
+        .skip(start)
+        .take(LOUDNESS_WINDOW)
+        .collect()
+}
+
+/// ReplayGain is a background chore: keep it below the audio callback and the
+/// UI instead of competing with them for a core.
+fn lower_thread_priority() {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL,
+        };
+        // SAFETY: the pseudo handle refers to this thread and needs no cleanup.
+        unsafe {
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+        }
+    }
+}
+
 fn spawn_loudness_scan(
     paths: Vec<std::path::PathBuf>,
+    start: usize,
     cache: LoudnessCache,
     engine: EngineHandle,
     target: f64,
 ) {
     use std::collections::VecDeque;
+
+    let paths = loudness_window(paths, start);
+    if paths.is_empty() {
+        return;
+    }
 
     static SCANNING: std::sync::OnceLock<Arc<Mutex<std::collections::HashSet<String>>>> =
         std::sync::OnceLock::new();
@@ -433,6 +471,7 @@ fn spawn_loudness_scan(
         std::thread::Builder::new()
             .name("loudness-scan".to_string())
             .spawn(move || {
+                lower_thread_priority();
                 loop {
                     let path = queue.lock().pop_front();
                     let Some(path) = path else { break };
@@ -668,6 +707,7 @@ async fn open_folder(
         state.engine.lock().send(Cmd::SetPlaylist(pl));
         spawn_loudness_scan(
             scan_paths,
+            0,
             state.loudness.clone(),
             state.engine.lock().clone(),
             target_rms(&state.settings.lock().normalize_level).unwrap_or(0.12),
@@ -689,12 +729,12 @@ fn open_playlist(
         .get(index)
         .cloned()
         .ok_or("playlist not found")?;
-    Ok(load_local_playlist(pl, &state))
+    Ok(load_local_playlist(pl, 0, &state))
 }
 
 /// Hands a local playlist to the engine without starting playback, and
 /// publishes its track list to the UI. The queue stops driving playback.
-fn load_local_playlist(pl: Playlist, state: &AppState) -> Vec<engine::TrackInfo> {
+fn load_local_playlist(pl: Playlist, start: usize, state: &AppState) -> Vec<engine::TrackInfo> {
     let infos: Vec<engine::TrackInfo> = pl.tracks.iter().map(track_to_info).collect();
     *state.local_current.lock() = Some(infos.clone());
     state.queue.lock().deactivate();
@@ -705,6 +745,7 @@ fn load_local_playlist(pl: Playlist, state: &AppState) -> Vec<engine::TrackInfo>
     state.engine.lock().send(Cmd::OpenPlaylist(pl));
     spawn_loudness_scan(
         scan_paths,
+        start,
         state.loudness.clone(),
         state.engine.lock().clone(),
         target_rms(&state.settings.lock().normalize_level).unwrap_or(0.12),
@@ -727,7 +768,7 @@ fn play_local_path(path: String, state: tauri::State<AppState>) -> Result<(), St
         }
         found.ok_or("track is not in the library")?
     };
-    load_local_playlist(playlist, &state);
+    load_local_playlist(playlist, index, &state);
     state.engine.lock().send(Cmd::PlayTrack(index));
     Ok(())
 }
@@ -745,7 +786,7 @@ fn play_local_file(path: String, state: tauri::State<AppState>) -> Result<(), St
         name: "File".to_string(),
         tracks: vec![track],
     };
-    load_local_playlist(playlist, &state);
+    load_local_playlist(playlist, 0, &state);
     state.engine.lock().send(Cmd::PlayTrack(0));
     Ok(())
 }
@@ -761,21 +802,29 @@ fn play_track(index: usize, state: tauri::State<AppState>) {
             q.bump_version();
         }
     }
-    // Prioritize loudness scanning of the clicked track.
-    if normalize_enabled(&state.settings.lock())
-        && let Some(track) = state
+    // The clicked track and the five after it, so "next" stays gapless in
+    // level as well.
+    if normalize_enabled(&state.settings.lock()) {
+        let paths: Vec<std::path::PathBuf> = state
             .local_current
             .lock()
             .as_ref()
-            .and_then(|tracks| tracks.get(index))
-        && let Some(path) = track.path.as_ref()
-    {
-        spawn_loudness_scan(
-            vec![std::path::PathBuf::from(path)],
-            state.loudness.clone(),
-            state.engine.lock().clone(),
-            target_rms(&state.settings.lock().normalize_level).unwrap_or(0.12),
-        );
+            .map(|tracks| {
+                tracks
+                    .iter()
+                    .filter_map(|t| t.path.as_ref().map(std::path::PathBuf::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !paths.is_empty() {
+            spawn_loudness_scan(
+                paths,
+                index,
+                state.loudness.clone(),
+                state.engine.lock().clone(),
+                target_rms(&state.settings.lock().normalize_level).unwrap_or(0.12),
+            );
+        }
     }
     state.engine.lock().send(Cmd::PlayTrack(index));
 }
@@ -960,27 +1009,181 @@ async fn search_suggestions(query: String) -> Result<Vec<String>, String> {
     grpc::suggest(&query).await.map_err(|e| e.to_string())
 }
 
+/// One page of a long list plus what the UI needs to keep paging.
+#[derive(Serialize, Clone)]
+struct TrackPage {
+    tracks: Vec<SearchTrack>,
+    /// 0 = unknown, keep asking until a short page comes back.
+    total: i32,
+    /// "disk" when this answer came from the cache, "net" otherwise.
+    source: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Default)]
+struct CachedTracks {
+    #[serde(default)]
+    saved_at: f64,
+    #[serde(default)]
+    total: i32,
+    #[serde(default)]
+    tracks: Vec<SearchTrack>,
+}
+
+/// Playlists and likes are re-read at most once every four hours from disk; the
+/// sidecar revalidates them by track count anyway.
+const TRACK_CACHE_TTL: f64 = 4.0 * 3600.0;
+
+fn track_cache_file(key: &str) -> std::path::PathBuf {
+    // A colon is legal in the key but not in a Windows file name ("playlist:UC…"
+    // turns into an alternate-data-stream path and the write fails with 87).
+    let safe: String = key
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    downloader::data_dir()
+        .join("playlists")
+        .join(format!("{safe}.json"))
+}
+
+fn load_track_cache(key: &str) -> Option<CachedTracks> {
+    let path = track_cache_file(key);
+    let raw = std::fs::read_to_string(&path).ok()?;
+    let cached: CachedTracks = serde_json::from_str(&raw).ok()?;
+    if cached.tracks.is_empty() || now_secs() - cached.saved_at > TRACK_CACHE_TTL {
+        return None;
+    }
+    Some(cached)
+}
+
+/// Merges one page into the cache file: pages arrive in order, so the file
+/// grows to `offset + tracks.len()`.
+fn save_track_page(key: &str, offset: i32, tracks: &[SearchTrack], total: i32) {
+    let path = track_cache_file(key);
+    let mut cached = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<CachedTracks>(&raw).ok())
+        .unwrap_or_default();
+    let offset = offset.max(0) as usize;
+    if cached.tracks.len() < offset {
+        return; // a gap: keep what we have instead of writing holes
+    }
+    cached.tracks.truncate(offset);
+    cached.tracks.extend(tracks.iter().cloned());
+    if total > 0 {
+        cached.total = total;
+    }
+    cached.saved_at = now_secs();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Err(e) = fsutil::write_json_atomic(&path, &cached, false) {
+        eprintln!("[store] cannot save the playlist cache: {e}");
+    }
+}
+
+/// The cached lists belong to the account that fetched them.
+fn drop_track_cache() {
+    let dir = downloader::data_dir().join("playlists");
+    if let Err(e) = std::fs::remove_dir_all(&dir)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!("[store] cannot drop the playlist cache: {e}");
+    }
+}
+
+fn to_search_track(t: grpc::Track) -> SearchTrack {
+    SearchTrack {
+        video_id: t.video_id,
+        title: t.title,
+        artist: t.artist,
+        duration_secs: t.duration_secs,
+        thumbnail: t.thumbnail,
+    }
+}
+
+/// Compares the cached track count with the one the account has now, and drops
+/// the file when they differ. Runs in the background: the first page is already
+/// on screen by then.
+fn revalidate_track_cache(app: tauri::AppHandle, key: String, playlist_id: Option<String>) {
+    tauri::async_runtime::spawn(async move {
+        let state = app.state::<AppState>();
+        let _ = ensure_session_fresh(&app, &state).await;
+        let fresh = match playlist_id {
+            Some(id) => grpc::get_playlist_tracks(&id, 0, 1).await,
+            None => grpc::get_liked_songs(0, 1).await,
+        };
+        let Ok(resp) = fresh else {
+            return; // offline: keep serving the cache
+        };
+        if let Some(cached) = load_track_cache(&key)
+            && resp.total > 0
+            && resp.total != cached.total
+        {
+            eprintln!(
+                "[cache] {key} changed: {} tracks cached, {} now",
+                cached.total, resp.total
+            );
+            let _ = std::fs::remove_file(track_cache_file(&key));
+        }
+    });
+}
+
+async fn fetch_track_page(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    key: &str,
+    playlist_id: Option<&str>,
+    offset: i32,
+    limit: i32,
+) -> Result<TrackPage, String> {
+    if offset == 0
+        && let Some(cached) = load_track_cache(key)
+    {
+        revalidate_track_cache(app.clone(), key.to_string(), playlist_id.map(str::to_string));
+        let end = (limit.max(1) as usize).min(cached.tracks.len());
+        return Ok(TrackPage {
+            tracks: cached.tracks[..end].to_vec(),
+            total: cached.total,
+            source: "disk".to_string(),
+        });
+    }
+
+    ensure_session_fresh(app, state).await;
+    let resp = match playlist_id {
+        Some(id) => grpc::get_playlist_tracks(id, offset, limit).await,
+        None => grpc::get_liked_songs(offset, limit).await,
+    }
+    .map_err(|e| e.to_string())?;
+    if !resp.error.is_empty() {
+        return Err(resp.error);
+    }
+    let tracks: Vec<SearchTrack> = resp.tracks.into_iter().map(to_search_track).collect();
+    if !tracks.is_empty() {
+        save_track_page(key, offset, &tracks, resp.total);
+    }
+    Ok(TrackPage {
+        tracks,
+        total: resp.total,
+        source: "net".to_string(),
+    })
+}
+
 #[tauri::command]
 async fn get_liked_songs(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
-) -> Result<Vec<SearchTrack>, String> {
-    ensure_session_fresh(&app, &state).await;
-    let resp = grpc::get_liked_songs().await.map_err(|e| e.to_string())?;
-    if !resp.error.is_empty() {
-        return Err(resp.error);
-    }
-    Ok(resp
-        .tracks
-        .into_iter()
-        .map(|t| SearchTrack {
-            video_id: t.video_id,
-            title: t.title,
-            artist: t.artist,
-            duration_secs: t.duration_secs,
-            thumbnail: t.thumbnail,
-        })
-        .collect())
+    offset: Option<i32>,
+    limit: Option<i32>,
+) -> Result<TrackPage, String> {
+    let offset = offset.unwrap_or(0).max(0);
+    let limit = limit.unwrap_or(100).clamp(1, 500);
+    fetch_track_page(&app, &state, "liked", None, offset, limit).await
 }
 
 #[derive(Serialize, Clone)]
@@ -1047,6 +1250,7 @@ pub(crate) async fn install_session(
     }
 
     secrets::save(&bundle)?;
+    drop_track_cache();
     // A snapshot from another account must not be shown to this one.
     if let Err(e) = std::fs::remove_file(home_file())
         && e.kind() != std::io::ErrorKind::NotFound
@@ -1282,6 +1486,7 @@ async fn logout(state: tauri::State<'_, AppState>) -> Result<(), String> {
         eprintln!("[auth] clear_session failed: {e}");
     }
     secrets::clear()?;
+    drop_track_cache();
     // The snapshot may hold this account's picks: it must not outlive the
     // session that fetched it.
     if let Err(e) = std::fs::remove_file(home_file())
@@ -1334,25 +1539,13 @@ async fn get_playlist_tracks(
     playlist_id: String,
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
-) -> Result<Vec<SearchTrack>, String> {
-    ensure_session_fresh(&app, &state).await;
-    let resp = grpc::get_playlist_tracks(&playlist_id)
-        .await
-        .map_err(|e| e.to_string())?;
-    if !resp.error.is_empty() {
-        return Err(resp.error);
-    }
-    Ok(resp
-        .tracks
-        .into_iter()
-        .map(|t| SearchTrack {
-            video_id: t.video_id,
-            title: t.title,
-            artist: t.artist,
-            duration_secs: t.duration_secs,
-            thumbnail: t.thumbnail,
-        })
-        .collect())
+    offset: Option<i32>,
+    limit: Option<i32>,
+) -> Result<TrackPage, String> {
+    let offset = offset.unwrap_or(0).max(0);
+    let limit = limit.unwrap_or(100).clamp(1, 500);
+    let key = format!("playlist:{playlist_id}");
+    fetch_track_page(&app, &state, &key, Some(&playlist_id), offset, limit).await
 }
 
 #[tauri::command]
@@ -1530,6 +1723,7 @@ async fn play_current(state: &AppState) -> Result<(), String> {
     if normalize_enabled(&state.settings.lock()) {
         spawn_loudness_scan(
             vec![dest],
+            0,
             state.loudness.clone(),
             state.engine.lock().clone(),
             target_rms(&state.settings.lock().normalize_level).unwrap_or(0.12),
@@ -1796,8 +1990,15 @@ fn set_normalize_level(level: String, state: tauri::State<AppState>) -> Result<(
                 paths.push(downloader::cached_file(&item.id, &current_quality(&state)));
             }
         }
+        let current = state
+            .engine
+            .lock()
+            .snapshot()
+            .map(|snapshot| snapshot.idx)
+            .unwrap_or(0);
         spawn_loudness_scan(
             paths,
+            current,
             state.loudness.clone(),
             state.engine.lock().clone(),
             target,
@@ -2316,6 +2517,7 @@ fn open_favorites(state: tauri::State<AppState>) -> Result<Vec<engine::TrackInfo
         .send(Cmd::OpenPlaylist(playlist));
     spawn_loudness_scan(
         scan_paths,
+        0,
         state.loudness.clone(),
         state.engine.lock().clone(),
         target_rms(&state.settings.lock().normalize_level).unwrap_or(0.12),
@@ -2610,6 +2812,7 @@ fn main() {
                                     state.engine.lock().send(Cmd::SetPlaylist(pl));
                                     spawn_loudness_scan(
                                         scan_paths,
+                                        0,
                                         state.loudness.clone(),
                                         state.engine.lock().clone(),
                                         target_rms(&state.settings.lock().normalize_level)
@@ -2733,5 +2936,33 @@ mod tests {
         assert!(!map.contains_key(&legacy));
         assert_eq!(map.get(&already), Some(&2.0));
         assert_eq!(map.get(&outside), Some(&3.0));
+    }
+
+    use super::loudness_window;
+
+    fn paths(count: usize) -> Vec<std::path::PathBuf> {
+        (0..count)
+            .map(|i| std::path::PathBuf::from(format!("{i}.mp3")))
+            .collect()
+    }
+
+    #[test]
+    fn loudness_scans_the_current_track_and_the_next_five() {
+        let window = loudness_window(paths(50), 10);
+        assert_eq!(window.len(), 6);
+        assert_eq!(window[0], std::path::PathBuf::from("10.mp3"));
+        assert_eq!(window[5], std::path::PathBuf::from("15.mp3"));
+    }
+
+    #[test]
+    fn loudness_stops_at_the_end_of_a_playlist() {
+        let window = loudness_window(paths(8), 6);
+        assert_eq!(window.len(), 2);
+    }
+
+    #[test]
+    fn loudness_ignores_a_start_past_the_end() {
+        assert!(loudness_window(paths(3), 9).is_empty());
+        assert!(loudness_window(Vec::new(), 0).is_empty());
     }
 }

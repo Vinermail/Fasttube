@@ -117,6 +117,8 @@ def invalidate_account_caches() -> None:
         _LIB_CACHE.clear()
     with _home_lock:
         _HOME_CACHE.clear()
+    with _playlist_lock:
+        _PLAYLISTS.clear()
 
 
 _load_resolve_cache()
@@ -284,6 +286,39 @@ _DEFAULT_SECTION_TITLES = {
 }
 
 
+# Thumbnail targets: what the app actually draws, with room for a high-DPI
+# screen. YouTube offers 60/120/180/320/480/640…
+THUMB_ROW = 120
+THUMB_CARD = 320
+THUMB_PLAYER = 544
+
+
+def pick_thumbnail(thumbnails, target_px: int) -> str:
+    """Smallest thumbnail at least `target_px` wide, otherwise the biggest one.
+
+    Blindly taking the last entry meant downloading 640 px covers for 40 px rows.
+    Entries without dimensions are only used when nothing else is available.
+    """
+    candidates = []
+    for entry in thumbnails or []:
+        if not isinstance(entry, dict):
+            continue
+        url = entry.get("url") or ""
+        if not url:
+            continue
+        size = max(int(entry.get("width") or 0), int(entry.get("height") or 0))
+        candidates.append((size, url))
+    if not candidates:
+        return ""
+    if not any(size for size, _ in candidates):
+        # No metadata at all: keep the old "last one is the biggest" guess.
+        return candidates[-1][1]
+    big_enough = [c for c in candidates if c[0] >= target_px]
+    if big_enough:
+        return min(big_enough, key=lambda c: c[0])[1]
+    return max(candidates, key=lambda c: c[0])[1]
+
+
 def _item_from_result(result: dict) -> dict | None:
     """One ytmusicapi search result -> SearchItem dict.
 
@@ -304,7 +339,9 @@ def _item_from_result(result: dict) -> dict | None:
         "id": "",
         "title": "",
         "subtitle": "",
-        "thumbnail": thumbnails[-1].get("url", "") if thumbnails else "",
+        "thumbnail": pick_thumbnail(
+            thumbnails, THUMB_ROW if kind in ("song", "video") else THUMB_CARD
+        ),
         "duration_secs": 0.0,
         "video_type": video_type,
         "browse_id": "",
@@ -533,7 +570,6 @@ def _song_item(result: dict, fallback_thumbnail: str = "") -> dict | None:
     video_id = result.get("videoId") or ""
     if not video_id:
         return None
-    thumbnails = result.get("thumbnails") or []
     artist = ", ".join(
         a.get("name", "") for a in (result.get("artists") or []) if a.get("name")
     )
@@ -542,7 +578,7 @@ def _song_item(result: dict, fallback_thumbnail: str = "") -> dict | None:
         "id": video_id,
         "title": result.get("title") or "",
         "subtitle": artist,
-        "thumbnail": thumbnails[-1].get("url", "") if thumbnails else fallback_thumbnail,
+        "thumbnail": pick_thumbnail(result.get("thumbnails"), THUMB_ROW) or fallback_thumbnail,
         "duration_secs": float(result.get("duration_seconds") or 0.0),
         "video_type": result.get("videoType") or "",
         "browse_id": "",
@@ -564,8 +600,7 @@ def album(browse_id: str) -> dict:
         log.warning("get_album failed: %s", e)
         return {"title": "", "subtitle": "", "thumbnail": "", "sections": [], "error": str(e)}
 
-    thumbnails = data.get("thumbnails") or []
-    cover = thumbnails[-1].get("url", "") if thumbnails else ""
+    cover = pick_thumbnail(data.get("thumbnails"), THUMB_PLAYER)
     tracks = []
     for entry in data.get("tracks") or []:
         item = _song_item(entry, cover)
@@ -601,8 +636,7 @@ def artist(browse_id: str) -> dict:
         log.warning("get_artist failed: %s", e)
         return {"name": "", "subtitle": "", "thumbnail": "", "sections": [], "error": str(e)}
 
-    thumbnails = data.get("thumbnails") or []
-    cover = thumbnails[-1].get("url", "") if thumbnails else ""
+    cover = pick_thumbnail(data.get("thumbnails"), THUMB_PLAYER)
 
     songs = []
     for entry in (data.get("songs") or {}).get("results") or []:
@@ -615,7 +649,6 @@ def artist(browse_id: str) -> dict:
         album_id = entry.get("browseId") or ""
         if not album_id:
             continue
-        thumbs = entry.get("thumbnails") or []
         albums.append(
             {
                 "kind": "album",
@@ -624,7 +657,7 @@ def artist(browse_id: str) -> dict:
                 "subtitle": " • ".join(
                     str(part) for part in (entry.get("year"), entry.get("type")) if part
                 ),
-                "thumbnail": thumbs[-1].get("url", "") if thumbs else "",
+                "thumbnail": pick_thumbnail(entry.get("thumbnails"), THUMB_CARD),
                 "duration_secs": 0.0,
                 "video_type": "",
                 "browse_id": album_id,
@@ -674,8 +707,7 @@ def _item_from_home(entry: dict) -> dict | None:
     and artists (browseId), playlists (playlistId). Podcast episodes and
     anything without a usable id are skipped.
     """
-    thumbnails = entry.get("thumbnails") or []
-    thumbnail = thumbnails[-1].get("url", "") if thumbnails else ""
+    thumbnail = pick_thumbnail(entry.get("thumbnails"), THUMB_CARD)
 
     video_id = entry.get("videoId") or ""
     if video_id:
@@ -976,7 +1008,7 @@ def related_tracks(video_id: str, limit: int = 20) -> dict:
                     "artist": ", ".join(a.get("name", "") for a in (r.get("artists") or [])),
                     "album": (r.get("album") or {}).get("name") or "",
                     "duration_secs": float(r.get("duration_seconds") or 0.0),
-                    "thumbnail": (r.get("thumbnails") or [{}])[-1].get("url") or "",
+                    "thumbnail": pick_thumbnail(r.get("thumbnails"), THUMB_ROW),
                 }
             )
             if len(tracks) >= limit:
@@ -1342,7 +1374,7 @@ def user_playlists() -> dict:
                     "id": p.get("playlistId") or "",
                     "name": p.get("title") or "",
                     "track_count": int(p.get("count") or 0),
-                    "thumbnail": (p.get("thumbnails") or [{}])[-1].get("url") or "",
+                    "thumbnail": pick_thumbnail(p.get("thumbnails"), THUMB_ROW),
                 }
                 for p in items
                 if p.get("playlistId")
@@ -1358,6 +1390,88 @@ def user_playlists() -> dict:
 # A mix is endless by nature: the app takes the first N and stops there.
 MIX_TRACK_LIMIT = 100
 
+# One page is what the UI needs to start drawing; the rest of a long playlist is
+# fetched by a background thread and served from memory afterwards.
+PLAYLIST_PAGE = 100
+_PLAYLIST_TTL = 4 * 3600
+
+_playlist_lock = threading.Lock()
+# "playlist:<id>" / "liked" -> {"tracks", "total", "complete", "at", "loading"}
+_PLAYLISTS: dict[str, dict] = {}
+
+
+def _playlist_state(key: str) -> dict | None:
+    with _playlist_lock:
+        entry = _PLAYLISTS.get(key)
+        if entry is not None and time.time() - entry["at"] < _PLAYLIST_TTL:
+            return entry
+        return None
+
+
+def _store_playlist(key: str, tracks: list[dict], total: int, complete: bool) -> None:
+    with _playlist_lock:
+        previous = _PLAYLISTS.get(key)
+        # Keep the same event across a replacement: a request already waiting on
+        # it must be woken by the background load, not by a copy.
+        done = (previous or {}).get("done") or threading.Event()
+        if complete:
+            done.set()
+        _PLAYLISTS[key] = {
+            "tracks": tracks,
+            "total": total,
+            "complete": complete,
+            "at": time.time(),
+            "loading": False,
+            "done": done,
+        }
+
+
+def _ensure_full_load(key: str, fetch_all) -> None:
+    """Fetch the remaining pages once, in the background."""
+    with _playlist_lock:
+        entry = _PLAYLISTS.get(key)
+        if entry is None or entry["complete"] or entry["loading"]:
+            return
+        entry["loading"] = True
+
+    def run() -> None:
+        try:
+            tracks, total = fetch_all()
+        except Exception as e:  # keep the first page usable, cache nothing
+            log.warning("full playlist load failed (%s): %s", key, e)
+            with _playlist_lock:
+                entry = _PLAYLISTS.get(key)
+                if entry is not None:
+                    entry["loading"] = False
+                    entry["done"].set()
+            return
+        _store_playlist(key, tracks, total, True)
+
+    threading.Thread(target=run, name="playlist-load", daemon=True).start()
+
+
+def _page(tracks: list[dict], offset: int, limit: int) -> list[dict]:
+    return tracks[offset : offset + limit]
+
+
+def _wait_for_more(key: str, page: list[dict], offset: int, limit: int, timeout: float = 3.0):
+    """A short page while the background fetch is still running would look like
+    the end of the list: wait for it instead of handing over a truncated page."""
+    entry = _playlist_state(key)
+    if entry is None or entry["complete"] or len(page) >= limit:
+        return page
+    done = entry.get("done")
+    if done is not None and done.wait(timeout):
+        entry = _playlist_state(key) or entry
+        return _page(entry["tracks"], offset, limit)
+    return page
+
+
+def invalidate_playlists() -> None:
+    """Drop the paged caches (a session change means other lists)."""
+    with _playlist_lock:
+        _PLAYLISTS.clear()
+
 
 def _is_mix(playlist_id: str) -> bool:
     """Auto-generated mixes and radios (RDTMAK…, RDCLAK…, RDAMVM…).
@@ -1369,88 +1483,128 @@ def _is_mix(playlist_id: str) -> bool:
     return playlist_id.startswith("RD")
 
 
-def playlist_tracks(playlist_id: str) -> dict:
-    if _session_client() is None:
-        return {
-            "tracks": [],
-            "error": "sign in to YouTube in the app",
-        }
+def _playlist_rows(data: dict) -> list[dict]:
+    tracks = []
+    for t in data.get("tracks") or []:
+        vid = t.get("videoId")
+        if not vid:
+            continue
+        artists = ", ".join(a.get("name", "") for a in (t.get("artists") or []))
+        tracks.append(
+            {
+                "video_id": vid,
+                "title": t.get("title") or "",
+                "artist": artists,
+                "album": (t.get("album") or {}).get("name") or "",
+                "duration_secs": float(t.get("duration_seconds") or 0.0),
+                "thumbnail": pick_thumbnail(t.get("thumbnails"), THUMB_ROW),
+            }
+        )
+    return tracks
 
-    def load() -> dict:
+
+def _fetch_playlist_page(ytm, playlist_id: str, limit: int) -> tuple[list[dict], int]:
+    """One request: `limit` tracks plus the playlist's own track count."""
+    if _is_mix(playlist_id):
+        try:
+            data = ytm.get_watch_playlist(playlistId=playlist_id, limit=MIX_TRACK_LIMIT) or {}
+        except Exception as e:
+            log.warning("mix %s via watch_playlist failed: %s", playlist_id, e)
+            data = {}
+        tracks = _playlist_rows(data)
+        if not tracks:
+            # Some mixes answer the watch endpoint with nothing usable.
+            data = ytm.get_playlist(playlist_id, limit=limit) or {}
+            tracks = _playlist_rows(data)
+        return tracks, len(tracks)
+    data = ytm.get_playlist(playlist_id, limit=limit) or {}
+    tracks = _playlist_rows(data)
+    total = int(data.get("trackCount") or 0) or len(tracks)
+    return tracks, max(total, len(tracks))
+
+
+def _fetch_playlist_all(ytm, playlist_id: str) -> tuple[list[dict], int]:
+    if _is_mix(playlist_id):
+        return _fetch_playlist_page(ytm, playlist_id, MIX_TRACK_LIMIT)
+    data = ytm.get_playlist(playlist_id, limit=None) or {}
+    tracks = _playlist_rows(data)
+    return tracks, max(int(data.get("trackCount") or 0), len(tracks))
+
+
+def playlist_tracks(playlist_id: str, offset: int = 0, limit: int = PLAYLIST_PAGE) -> dict:
+    """One page of a playlist.
+
+    The first call asks YouTube for a single page and starts a background fetch
+    of the rest, so the UI can draw immediately; later calls slice memory.
+    """
+    if _session_client() is None:
+        return {"tracks": [], "error": "sign in to YouTube in the app", "total": 0}
+
+    offset = max(0, int(offset or 0))
+    limit = max(1, min(int(limit or PLAYLIST_PAGE), 500))
+    key = f"playlist:{playlist_id}"
+    entry = _playlist_state(key)
+    if entry is None:
         try:
             ytm = _session_client()
             if ytm is None:
-                return {"tracks": [], "error": "not signed in"}
-            if _is_mix(playlist_id):
-                try:
-                    data = (
-                        ytm.get_watch_playlist(playlistId=playlist_id, limit=MIX_TRACK_LIMIT)
-                        or {}
-                    )
-                except Exception as e:
-                    log.warning("mix %s via watch_playlist failed: %s", playlist_id, e)
-                    data = {}
-                if not data.get("tracks"):
-                    data = ytm.get_playlist(playlist_id, limit=None) or {}
-            else:
-                # limit=None fetches every track (paginated via continuations)
-                data = ytm.get_playlist(playlist_id, limit=None) or {}
-            tracks = []
-            for t in data.get("tracks") or []:
-                vid = t.get("videoId")
-                if not vid:
-                    continue
-                artists = ", ".join(a.get("name", "") for a in (t.get("artists") or []))
-                tracks.append(
-                    {
-                        "video_id": vid,
-                        "title": t.get("title") or "",
-                        "artist": artists,
-                        "album": (t.get("album") or {}).get("name") or "",
-                        "duration_secs": float(t.get("duration_seconds") or 0.0),
-                        "thumbnail": (t.get("thumbnails") or [{}])[-1].get("url") or "",
-                    }
-                )
-            return {"tracks": tracks, "error": ""}
+                return {"tracks": [], "error": "not signed in", "total": 0}
+            tracks, total = _fetch_playlist_page(ytm, playlist_id, PLAYLIST_PAGE)
         except Exception as e:
             log.exception("get_playlist failed")
-            return {"tracks": [], "error": str(e)}
+            return {"tracks": [], "error": str(e), "total": 0}
+        complete = len(tracks) >= total
+        _store_playlist(key, tracks, total, complete)
+        if not complete:
+            _ensure_full_load(key, lambda: _fetch_playlist_all(ytm, playlist_id))
+        entry = _playlist_state(key) or {"tracks": tracks, "total": total}
 
-    return _cached_lib(f"playlist:{playlist_id}", 600, load)
+    page = _page(entry["tracks"], offset, limit)
+    return {
+        "tracks": _wait_for_more(key, page, offset, limit),
+        "error": "",
+        "total": int(entry["total"]),
+    }
 
 
-def liked_songs() -> dict:
+def liked_songs(offset: int = 0, limit: int = PLAYLIST_PAGE) -> dict:
+    """Same paging as playlists, over the account's liked songs."""
     if _session_client() is None:
-        return {
-            "tracks": [],
-            "error": "sign in to YouTube in the app",
-        }
+        return {"tracks": [], "error": "sign in to YouTube in the app", "total": 0}
 
-    def load() -> dict:
+    offset = max(0, int(offset or 0))
+    limit = max(1, min(int(limit or PLAYLIST_PAGE), 500))
+    key = "liked"
+    entry = _playlist_state(key)
+    if entry is None:
         try:
             ytm = _session_client()
             if ytm is None:
-                return {"tracks": [], "error": "not signed in"}
-            items = ytm.get_liked_songs(limit=None) or {}
-            tracks = []
-            for t in items.get("tracks") or []:
-                vid = t.get("videoId")
-                if not vid:
-                    continue
-                artists = ", ".join(a.get("name", "") for a in (t.get("artists") or []))
-                tracks.append(
-                    {
-                        "video_id": vid,
-                        "title": t.get("title") or "",
-                        "artist": artists,
-                        "album": (t.get("album") or {}).get("name") or "",
-                        "duration_secs": float(t.get("duration_seconds") or 0.0),
-                        "thumbnail": (t.get("thumbnails") or [{}])[-1].get("url") or "",
-                    }
-                )
-            return {"tracks": tracks, "error": ""}
+                return {"tracks": [], "error": "not signed in", "total": 0}
+            first = ytm.get_liked_songs(limit=PLAYLIST_PAGE) or {}
+            tracks = _playlist_rows(first)
+            total = int(first.get("trackCount") or 0)
         except Exception as e:
             log.exception("get_liked_songs failed")
-            return {"tracks": [], "error": str(e)}
+            return {"tracks": [], "error": str(e), "total": 0}
+        # YouTube does not always report a count here: 0 means "keep asking
+        # until a short page comes back".
+        _store_playlist(key, tracks, max(total, len(tracks)), False)
 
-    return _cached_lib("liked_songs", 600, load)
+        def fetch_all() -> tuple[list[dict], int]:
+            ytm2 = _session_client()
+            if ytm2 is None:
+                raise RuntimeError("not signed in")
+            data = ytm2.get_liked_songs(limit=None) or {}
+            rows = _playlist_rows(data)
+            return rows, len(rows)
+
+        _ensure_full_load(key, fetch_all)
+        entry = _playlist_state(key) or {"tracks": tracks, "total": total}
+
+    page = _page(entry["tracks"], offset, limit)
+    return {
+        "tracks": _wait_for_more(key, page, offset, limit),
+        "error": "",
+        "total": int(entry["total"]),
+    }

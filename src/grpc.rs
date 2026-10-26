@@ -11,7 +11,7 @@ pub mod proto {
 
 pub use proto::{
     AlbumRequest, AlbumResponse, ArtistRequest, ArtistResponse, Empty, HealthResponse,
-    HomeRequest, LyricsRequest, LyricsResponse, ParseAuthHeadersRequest,
+    HomeRequest, LikedSongsRequest, LyricsRequest, LyricsResponse, ParseAuthHeadersRequest,
     Shelf,
     PlaylistTracksRequest, PlaylistTracksResponse, PrefetchResolveRequest, RecommendRequest,
     ResolveRequest, ResolveResponse, SearchRequest, SearchSection, SessionState, SessionStatus,
@@ -265,12 +265,19 @@ pub async fn get_user_playlists() -> Result<UserPlaylistsResponse> {
     Ok(resp.into_inner())
 }
 
-pub async fn get_playlist_tracks(playlist_id: &str) -> Result<PlaylistTracksResponse> {
+/// One page of a playlist. `limit == 0` means "the default page".
+pub async fn get_playlist_tracks(
+    playlist_id: &str,
+    offset: i32,
+    limit: i32,
+) -> Result<PlaylistTracksResponse> {
     let mut client = connect().await?;
     let resp = client
         .get_playlist_tracks(with_timeout(
             PlaylistTracksRequest {
                 id: playlist_id.to_string(),
+                offset,
+                limit,
             },
             PLAYLIST_TIMEOUT,
         ))
@@ -278,10 +285,10 @@ pub async fn get_playlist_tracks(playlist_id: &str) -> Result<PlaylistTracksResp
     Ok(resp.into_inner())
 }
 
-pub async fn get_liked_songs() -> Result<PlaylistTracksResponse> {
+pub async fn get_liked_songs(offset: i32, limit: i32) -> Result<PlaylistTracksResponse> {
     let mut client = connect().await?;
     let resp = client
-        .get_liked_songs(with_timeout(Empty {}, PLAYLIST_TIMEOUT))
+        .get_liked_songs(with_timeout(LikedSongsRequest { offset, limit }, PLAYLIST_TIMEOUT))
         .await?;
     Ok(resp.into_inner())
 }

@@ -251,17 +251,21 @@ class PlayerApiServicer(player_api_pb2_grpc.PlayerApiServicer):
         )
 
     def GetPlaylistTracks(self, request, context):
-        result = youtube.playlist_tracks(request.id)
+        result = youtube.playlist_tracks(
+            request.id, offset=request.offset, limit=request.limit
+        )
         return player_api_pb2.PlaylistTracksResponse(
             tracks=[_to_pb_track(t) for t in result.get("tracks", [])],
             error=result.get("error", ""),
+            total=result.get("total", 0),
         )
 
     def GetLikedSongs(self, request, context):
-        result = youtube.liked_songs()
+        result = youtube.liked_songs(offset=request.offset, limit=request.limit)
         return player_api_pb2.PlaylistTracksResponse(
             tracks=[_to_pb_track(t) for t in result.get("tracks", [])],
             error=result.get("error", ""),
+            total=result.get("total", 0),
         )
 
     def SetSession(self, request, context):

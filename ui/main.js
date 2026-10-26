@@ -399,6 +399,55 @@ function setYtTracks(tracks, append, meta) {
   refresh();
 }
 
+/// How many rows the backend hands over per request.
+const TRACK_PAGE = 100;
+
+/// Appends a page of tracks to the list already on screen. The list is
+/// virtualised, so this repaints only the visible window and keeps the scroll
+/// position — a page arriving must not throw the user back to the top.
+function appendYtTracks(tracks) {
+  currentYtTracks = currentYtTracks.concat(tracks);
+  ytRows = currentYtTracks.map((t) => ({
+    id: t.video_id,
+    title: t.title,
+    artist: t.artist,
+    duration: t.duration_secs,
+  }));
+  ytListVersion++;
+  trackListEl = $("tracks");
+  trackRows = applyFilterSort(ytRows, "y:" + ytListVersion);
+  renderedTracksKey = "y:" + ytListVersion + ":" + filterText + ":" + sortMode;
+  updateTracks();
+}
+
+/// Draws the first page at once, then keeps asking for the rest (and appending
+/// it) while the user is already reading the top of the list.
+async function loadTrackPages(command, args, meta) {
+  let offset = 0;
+  let total = 0;
+  let seen = 0;
+  let first = true;
+  for (let guard = 0; guard < 200; guard++) {
+    const page = await invoke(command, { ...args, offset, limit: TRACK_PAGE });
+    if (page.error) throw new Error(page.error);
+    const tracks = page.tracks || [];
+    if (page.total > 0) total = page.total;
+    if (first) {
+      setMode("youtube");
+      setYtTracks(tracks, false, meta(tracks, total));
+      first = false;
+    } else if (tracks.length) {
+      appendYtTracks(tracks);
+    }
+    seen += tracks.length;
+    offset += tracks.length;
+    if (!tracks.length) break;
+    if (total > 0 && seen >= total) break;
+    if (tracks.length < TRACK_PAGE) break;
+  }
+  return seen;
+}
+
 /* ---------- music search: chips, suggestions, sections ---------- */
 
 const SEARCH_FILTERS = ["", "songs", "videos", "albums", "artists", "playlists"];
@@ -631,16 +680,16 @@ function buildSearchRow(section, index) {
 }
 
 function openSearchPlaylist(item) {
-  invoke("get_playlist_tracks", { playlistId: item.playlist_id || item.id })
-    .then((tracks) => {
-      setMode("youtube");
-      setYtTracks(tracks, false, {
-        title: item.title,
-        subtitle: `${tracks.length} tracks`,
-        cover: item.thumbnail || (tracks[0] ? tracks[0].thumbnail || "" : ""),
-      });
+  hideError();
+  loadTrackPages(
+    "get_playlist_tracks",
+    { playlistId: item.playlist_id || item.id },
+    (tracks, total) => ({
+      title: item.title,
+      subtitle: `${total || tracks.length} tracks`,
+      cover: item.thumbnail || (tracks[0] ? tracks[0].thumbnail || "" : ""),
     })
-    .catch((e) => showError(playlistError(e)));
+  ).catch((e) => showError(playlistError(e)));
 }
 
 function buildSearchCard(item) {
@@ -1141,6 +1190,15 @@ $("btn-shuffle").onclick = shuffleYt;
 async function renderYtTrackList(invokeName) {
   try {
     hideError();
+    if (invokeName === "get_liked_songs") {
+      await loadTrackPages("get_liked_songs", {}, (tracks, total) => ({
+        title: "Liked songs",
+        subtitle: `${total || tracks.length} tracks`,
+        cover: tracks[0] ? tracks[0].thumbnail || "" : "",
+      }));
+      $("yt-more-btn").classList.add("hidden");
+      return;
+    }
     const tracks = await invoke(invokeName);
     // The list is a YouTube one: without the mode the player keeps painting the
     // local rows and the header would lie about what is on screen.
@@ -1184,13 +1242,15 @@ async function loadUserPlaylists() {
       div.onclick = async () => {
         try {
           hideError();
-          const tracks = await invoke("get_playlist_tracks", { playlistId: p.id });
-          setMode("youtube");
-          setYtTracks(tracks, false, {
-            title: p.name,
-            subtitle: `${p.track_count} tracks`,
-            cover: p.thumbnail || (tracks[0] ? tracks[0].thumbnail || "" : ""),
-          });
+          await loadTrackPages(
+            "get_playlist_tracks",
+            { playlistId: p.id },
+            (tracks, total) => ({
+              title: p.name,
+              subtitle: `${total || p.track_count || tracks.length} tracks`,
+              cover: p.thumbnail || (tracks[0] ? tracks[0].thumbnail || "" : ""),
+            })
+          );
           $("yt-more-btn").classList.add("hidden");
         } catch (e) {
           showError(playlistError(e));

@@ -96,7 +96,8 @@ def test_a_real_playlist_still_uses_get_playlist(monkeypatch):
 
     youtube.playlist_tracks("PLtestPlaylistAaaaaaaaaaaaaaaa")
 
-    assert client.calls == [("playlist", "PLtestPlaylistAaaaaaaaaaaaaaaa", None)]
+    # The first page only: the rest is fetched in the background.
+    assert client.calls == [("playlist", "PLtestPlaylistAaaaaaaaaaaaaaaa", 100)]
 
 
 def test_a_failing_playlist_reports_the_error(monkeypatch):
