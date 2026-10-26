@@ -137,6 +137,48 @@ Premium-битрейт и контент с возрастными ограни�
 | `↑` / `↓` | Громкость ±5% |
 | `Ctrl+←` / `Ctrl+→` | Предыдущий/следующий трек |
 
+## Замеры
+
+Тайминги пишутся в stdout приложения (строки `[perf] …`) и в лог сайдкара
+(`%LOCALAPPDATA%\fasttube\logs\sidecar.log`, уровень INFO):
+
+- `[perf] resolve_ms=…` — сколько заняло извлечение ссылки на поток (в сайдкаре,
+  `cached=true` значит ответ пришёл из кэша резолва);
+- `[perf] download_ms=… probe_ms=… ttfb_ms=… mbps=…` — загрузка файла: полное
+  время, время до заголовков пробного запроса, время до первого байта тела и
+  средняя скорость;
+- `[perf] time_to_audio_ms=… cached=…` — от запроса трека очередью до отправки
+  `SetPlaylist` в аудио-движок.
+
+Запуск dev-сборки с сохранением этих строк в файл:
+
+```powershell
+.\target\debug\fasttube.exe *> "$env:TEMP\fasttube-perf.log"
+Get-Content "$env:TEMP\fasttube-perf.log" -Wait | Select-String "\[perf\]"
+```
+
+Память по процессам (приложение и python-сайдкар отдельными строками):
+
+```powershell
+Get-Process fasttube, python -ErrorAction SilentlyContinue |
+  Where-Object { $_.Path -like "*player_llm*" -or $_.ProcessName -eq "fasttube" } |
+  Select-Object ProcessName, Id,
+    @{n = "WorkingSetMB"; e = { [math]::Round($_.WorkingSet64 / 1MB, 1) } },
+    @{n = "PrivateMB";    e = { [math]::Round($_.PrivateMemorySize64 / 1MB, 1) } },
+    @{n = "CpuSec";       e = { [math]::Round($_.CPU, 1) } } |
+  Sort-Object WorkingSetMB -Descending | Format-Table -AutoSize
+```
+
+Сумма по приложению целиком (Rust + WebView2 + сайдкар):
+
+```powershell
+$pids = (Get-Process fasttube).Id
+Get-CimInstance Win32_Process |
+  Where-Object { $_.ProcessId -in $pids -or $_.ParentProcessId -in $pids -or $_.Name -eq "python.exe" } |
+  ForEach-Object { [pscustomobject]@{ Name = $_.Name; Id = $_.ProcessId; MB = [math]::Round($_.WorkingSetSize / 1MB, 1) } } |
+  Sort-Object MB -Descending | Format-Table -AutoSize
+```
+
 ## Данные
 
 Всё хранится в `%LOCALAPPDATA%\fasttube\`:

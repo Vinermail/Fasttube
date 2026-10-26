@@ -137,6 +137,32 @@ def resolve_url(
     quality: str = QUALITY_STANDARD,
     force: bool = False,
 ) -> dict:
+    """Timed wrapper around the extraction; see `_resolve_url_impl`."""
+    started = time.perf_counter()
+    key = f"{video_id}@{quality}@{'account' if cookie_header else 'anon'}"
+    cached = False
+    if not force:
+        with _resolve_lock:
+            hit = _RESOLVE_CACHE.get(key)
+            cached = bool(hit and time.time() - hit[0] < _RESOLVE_TTL)
+    result = _resolve_url_impl(video_id, cookie_header, quality, force)
+    log.info(
+        "[perf] resolve_ms=%.1f video=%s quality=%s cached=%s ok=%s",
+        (time.perf_counter() - started) * 1000.0,
+        video_id,
+        quality,
+        cached,
+        bool(result.get("ok")),
+    )
+    return result
+
+
+def _resolve_url_impl(
+    video_id: str,
+    cookie_header: str | None = None,
+    quality: str = QUALITY_STANDARD,
+    force: bool = False,
+) -> dict:
     """Extract direct stream URL + metadata for a video id.
 
     Quality levels:

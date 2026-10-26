@@ -19,9 +19,24 @@ pub struct ProgressHandle {
     pub total: Arc<AtomicU64>,
     pub done: Arc<std::sync::atomic::AtomicBool>,
     pub title: Arc<parking_lot::Mutex<String>>,
+    /// Milliseconds from the start of `download` to the first body byte.
+    /// Measurement only: 0 means "no byte arrived yet".
+    pub first_byte_ms: Arc<AtomicU64>,
 }
 
 impl ProgressHandle {
+    /// Records the first byte of the current transfer once; later chunks do not
+    /// overwrite it (`compare_exchange` keeps the earliest value).
+    fn mark_first_byte(&self, started: std::time::Instant) {
+        let ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+        let _ = self.first_byte_ms.compare_exchange(
+            0,
+            ms,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+    }
+
     pub fn snapshot(&self) -> DownloadProgress {
         DownloadProgress {
             bytes: self.bytes.load(Ordering::Relaxed),
@@ -255,6 +270,7 @@ fn evict_cache_in(dir: &Path, limit_bytes: u64, keep: &[PathBuf]) -> (usize, u64
 /// Large files are downloaded with several parallel byte-range connections,
 /// which is dramatically faster through latency-heavy proxies.
 pub async fn download(url: &str, dest: &Path, handle: &ProgressHandle) -> Result<()> {
+    let started = std::time::Instant::now();
     let client = build_client()?;
 
     // Probe request: obtains the total size (and confirms Range support).
@@ -267,23 +283,42 @@ pub async fn download(url: &str, dest: &Path, handle: &ProgressHandle) -> Result
         .error_for_status()?;
 
     let total = response.content_length().unwrap_or(0);
+    let probe_ms = started.elapsed().as_millis();
     handle.total.store(total, Ordering::Relaxed);
     handle.bytes.store(0, Ordering::Relaxed);
+    handle.first_byte_ms.store(0, Ordering::Relaxed);
     handle.done.store(false, Ordering::Relaxed);
 
     let parent = dest.parent().ok_or_else(|| anyhow!("no parent dir"))?;
     std::fs::create_dir_all(parent)?;
     let tmp = dest.with_extension("part");
 
-    if total > PARALLEL_THRESHOLD && response.status() == reqwest::StatusCode::PARTIAL_CONTENT {
+    let parallel = total > PARALLEL_THRESHOLD
+        && response.status() == reqwest::StatusCode::PARTIAL_CONTENT;
+    if parallel {
         drop(response);
-        parallel_download(&client, url, &tmp, total, handle).await?;
+        parallel_download(&client, url, &tmp, total, handle, started).await?;
     } else {
-        sequential_download(response, &tmp, handle).await?;
+        sequential_download(response, &tmp, handle, started).await?;
     }
 
     tokio::fs::rename(&tmp, dest).await?;
     handle.done.store(true, Ordering::Relaxed);
+
+    // One line per finished transfer: how long the server took to answer, how
+    // long the whole thing took and what the average rate was.
+    let elapsed = started.elapsed();
+    let secs = elapsed.as_secs_f64().max(0.001);
+    let bytes = handle.bytes.load(Ordering::Relaxed);
+    eprintln!(
+        "[perf] download_ms={} probe_ms={} ttfb_ms={} bytes={} mbps={:.2} parallel={}",
+        elapsed.as_millis(),
+        probe_ms,
+        handle.first_byte_ms.load(Ordering::Relaxed),
+        bytes,
+        bytes as f64 / secs / 1_000_000.0,
+        parallel
+    );
     Ok(())
 }
 
@@ -306,6 +341,7 @@ async fn sequential_download(
     response: reqwest::Response,
     tmp: &Path,
     handle: &ProgressHandle,
+    started: std::time::Instant,
 ) -> Result<()> {
     let file = tokio::fs::File::create(tmp).await?;
     let mut sink = CountingSink {
@@ -315,6 +351,7 @@ async fn sequential_download(
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
+        handle.mark_first_byte(started);
         tokio::io::AsyncWriteExt::write_all(&mut sink, &chunk).await?;
     }
     Ok(())
@@ -326,6 +363,7 @@ async fn parallel_download(
     tmp: &Path,
     total: u64,
     handle: &ProgressHandle,
+    started: std::time::Instant,
 ) -> Result<()> {
     use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
@@ -346,6 +384,7 @@ async fn parallel_download(
         let url = url.to_string();
         let tmp = tmp.to_path_buf();
         let bytes = handle.bytes.clone();
+        let first_byte = handle.first_byte_ms.clone();
         tasks.push(tokio::spawn(async move {
             let resp = client
                 .get(&url)
@@ -362,6 +401,13 @@ async fn parallel_download(
             let mut pos = start;
             while let Some(chunk) = stream.next().await {
                 let chunk = chunk?;
+                // First byte from any chunk task wins.
+                let _ = first_byte.compare_exchange(
+                    0,
+                    started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                );
                 file.seek(std::io::SeekFrom::Start(pos)).await?;
                 file.write_all(&chunk).await?;
                 pos += chunk.len() as u64;

@@ -1444,6 +1444,7 @@ fn read_cached_title(meta: &std::path::Path) -> Option<String> {
 }
 
 async fn play_current(state: &AppState) -> Result<(), String> {
+    let started = std::time::Instant::now();
     let item = state
         .queue
         .lock()
@@ -1452,6 +1453,7 @@ async fn play_current(state: &AppState) -> Result<(), String> {
 
     let quality = current_quality(state);
     let dest = downloader::cached_file(&item.id, &quality);
+    let cached = dest.exists();
     if !dest.exists() {
         // Claim this id so a concurrent prefetch cannot write the same file.
         let claimed = {
@@ -1507,6 +1509,14 @@ async fn play_current(state: &AppState) -> Result<(), String> {
         .engine
         .lock()
         .send(Cmd::SetPlaylist(playlist));
+    // The queue asked for this track at `started`; this is the moment the audio
+    // thread is told what to play.
+    eprintln!(
+        "[perf] time_to_audio_ms={} cached={} track={}",
+        started.elapsed().as_millis(),
+        cached,
+        item.id
+    );
     record_history(
         state,
         &HistoryItem {
