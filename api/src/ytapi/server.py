@@ -68,6 +68,22 @@ def _to_pb_section(section: dict) -> player_api_pb2.SearchSection:
     )
 
 
+def _edit_response(result: dict) -> player_api_pb2.PlaylistEditResponse:
+    return player_api_pb2.PlaylistEditResponse(
+        ok=bool(result.get("ok")),
+        error=result.get("error", ""),
+        id=result.get("id", ""),
+        code=result.get("code", ""),
+        video_ids=list(result.get("video_ids") or []),
+        items=[
+            player_api_pb2.PlaylistItem(
+                video_id=i.get("video_id", ""), set_video_id=i.get("set_video_id", "")
+            )
+            for i in result.get("items") or []
+        ],
+    )
+
+
 def _to_pb_track(t: dict) -> player_api_pb2.Track:
     return player_api_pb2.Track(
         video_id=t.get("video_id", ""),
@@ -77,6 +93,7 @@ def _to_pb_track(t: dict) -> player_api_pb2.Track:
         duration_secs=t.get("duration_secs", 0.0),
         thumbnail=t.get("thumbnail", ""),
         set_video_id=t.get("set_video_id", ""),
+        like_status=t.get("like_status", ""),
     )
 
 
@@ -252,9 +269,22 @@ class PlayerApiServicer(player_api_pb2_grpc.PlayerApiServicer):
         )
 
     def AddPlaylistItems(self, request, context):
-        result = youtube.add_playlist_items(request.playlist_id, list(request.video_ids))
+        result = youtube.add_playlist_items(
+            request.playlist_id,
+            list(request.video_ids),
+            allow_duplicates=request.allow_duplicates,
+        )
         return player_api_pb2.PlaylistEditResponse(
-            ok=bool(result.get("ok")), error=result.get("error", "")
+            ok=bool(result.get("ok")),
+            error=result.get("error", ""),
+            code=result.get("code", ""),
+            video_ids=list(result.get("video_ids") or []),
+            items=[
+                player_api_pb2.PlaylistItem(
+                    video_id=i.get("video_id", ""), set_video_id=i.get("set_video_id", "")
+                )
+                for i in result.get("items") or []
+            ],
         )
 
     def RemovePlaylistItems(self, request, context):
@@ -262,6 +292,43 @@ class PlayerApiServicer(player_api_pb2_grpc.PlayerApiServicer):
         result = youtube.remove_playlist_items(request.playlist_id, items)
         return player_api_pb2.PlaylistEditResponse(
             ok=bool(result.get("ok")), error=result.get("error", "")
+        )
+
+    def MovePlaylistItem(self, request, context):
+        result = youtube.move_playlist_item(
+            request.playlist_id, request.set_video_id, request.before_set_video_id
+        )
+        return _edit_response(result)
+
+    def EditPlaylistMeta(self, request, context):
+        result = youtube.edit_playlist_meta(
+            request.playlist_id, request.title, request.description, request.privacy
+        )
+        return _edit_response(result)
+
+    def RateSong(self, request, context):
+        result = youtube.rate_song(request.video_id, request.rating)
+        return _edit_response(result)
+
+    def SavePlaylistToLibrary(self, request, context):
+        result = youtube.save_playlist_to_library(request.playlist_id)
+        return _edit_response(result)
+
+    def CopyPlaylist(self, request, context):
+        result = youtube.copy_playlist(request.source_id, request.title)
+        return _edit_response(result)
+
+    def ResolvePlaylistUrl(self, request, context):
+        try:
+            data = youtube.resolve_playlist_url(request.url)
+        except Exception as e:
+            log.exception("resolve_playlist_url failed")
+            return player_api_pb2.PlaylistTracksResponse(error=str(e))
+        return player_api_pb2.PlaylistTracksResponse(
+            tracks=[_to_pb_track(t) for t in data.get("tracks", [])],
+            error=data.get("error", ""),
+            total=data.get("total", 0),
+            owned=bool(data.get("owned", False)),
         )
 
     def RemoveFromLibrary(self, request, context):

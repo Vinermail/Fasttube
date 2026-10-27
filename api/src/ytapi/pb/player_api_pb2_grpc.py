@@ -149,6 +149,36 @@ class PlayerApiStub:
                 request_serializer=player__api__pb2.DeletePlaylistRequest.SerializeToString,
                 response_deserializer=player__api__pb2.PlaylistEditResponse.FromString,
                 _registered_method=True)
+        self.MovePlaylistItem = channel.unary_unary(
+                '/player.PlayerApi/MovePlaylistItem',
+                request_serializer=player__api__pb2.MovePlaylistItemRequest.SerializeToString,
+                response_deserializer=player__api__pb2.PlaylistEditResponse.FromString,
+                _registered_method=True)
+        self.EditPlaylistMeta = channel.unary_unary(
+                '/player.PlayerApi/EditPlaylistMeta',
+                request_serializer=player__api__pb2.EditPlaylistMetaRequest.SerializeToString,
+                response_deserializer=player__api__pb2.PlaylistEditResponse.FromString,
+                _registered_method=True)
+        self.RateSong = channel.unary_unary(
+                '/player.PlayerApi/RateSong',
+                request_serializer=player__api__pb2.RateSongRequest.SerializeToString,
+                response_deserializer=player__api__pb2.PlaylistEditResponse.FromString,
+                _registered_method=True)
+        self.SavePlaylistToLibrary = channel.unary_unary(
+                '/player.PlayerApi/SavePlaylistToLibrary',
+                request_serializer=player__api__pb2.DeletePlaylistRequest.SerializeToString,
+                response_deserializer=player__api__pb2.PlaylistEditResponse.FromString,
+                _registered_method=True)
+        self.CopyPlaylist = channel.unary_unary(
+                '/player.PlayerApi/CopyPlaylist',
+                request_serializer=player__api__pb2.CopyPlaylistRequest.SerializeToString,
+                response_deserializer=player__api__pb2.PlaylistEditResponse.FromString,
+                _registered_method=True)
+        self.ResolvePlaylistUrl = channel.unary_unary(
+                '/player.PlayerApi/ResolvePlaylistUrl',
+                request_serializer=player__api__pb2.ResolvePlaylistUrlRequest.SerializeToString,
+                response_deserializer=player__api__pb2.PlaylistTracksResponse.FromString,
+                _registered_method=True)
 
 
 class PlayerApiServicer:
@@ -292,6 +322,42 @@ class PlayerApiServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def MovePlaylistItem(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def EditPlaylistMeta(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def RateSong(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def SavePlaylistToLibrary(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def CopyPlaylist(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ResolvePlaylistUrl(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_PlayerApiServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -409,6 +475,36 @@ def add_PlayerApiServicer_to_server(servicer, server):
                     servicer.RemoveFromLibrary,
                     request_deserializer=player__api__pb2.DeletePlaylistRequest.FromString,
                     response_serializer=player__api__pb2.PlaylistEditResponse.SerializeToString,
+            ),
+            'MovePlaylistItem': grpc.unary_unary_rpc_method_handler(
+                    servicer.MovePlaylistItem,
+                    request_deserializer=player__api__pb2.MovePlaylistItemRequest.FromString,
+                    response_serializer=player__api__pb2.PlaylistEditResponse.SerializeToString,
+            ),
+            'EditPlaylistMeta': grpc.unary_unary_rpc_method_handler(
+                    servicer.EditPlaylistMeta,
+                    request_deserializer=player__api__pb2.EditPlaylistMetaRequest.FromString,
+                    response_serializer=player__api__pb2.PlaylistEditResponse.SerializeToString,
+            ),
+            'RateSong': grpc.unary_unary_rpc_method_handler(
+                    servicer.RateSong,
+                    request_deserializer=player__api__pb2.RateSongRequest.FromString,
+                    response_serializer=player__api__pb2.PlaylistEditResponse.SerializeToString,
+            ),
+            'SavePlaylistToLibrary': grpc.unary_unary_rpc_method_handler(
+                    servicer.SavePlaylistToLibrary,
+                    request_deserializer=player__api__pb2.DeletePlaylistRequest.FromString,
+                    response_serializer=player__api__pb2.PlaylistEditResponse.SerializeToString,
+            ),
+            'CopyPlaylist': grpc.unary_unary_rpc_method_handler(
+                    servicer.CopyPlaylist,
+                    request_deserializer=player__api__pb2.CopyPlaylistRequest.FromString,
+                    response_serializer=player__api__pb2.PlaylistEditResponse.SerializeToString,
+            ),
+            'ResolvePlaylistUrl': grpc.unary_unary_rpc_method_handler(
+                    servicer.ResolvePlaylistUrl,
+                    request_deserializer=player__api__pb2.ResolvePlaylistUrlRequest.FromString,
+                    response_serializer=player__api__pb2.PlaylistTracksResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -1032,6 +1128,168 @@ class PlayerApi:
             '/player.PlayerApi/RemoveFromLibrary',
             player__api__pb2.DeletePlaylistRequest.SerializeToString,
             player__api__pb2.PlaylistEditResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def MovePlaylistItem(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/player.PlayerApi/MovePlaylistItem',
+            player__api__pb2.MovePlaylistItemRequest.SerializeToString,
+            player__api__pb2.PlaylistEditResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def EditPlaylistMeta(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/player.PlayerApi/EditPlaylistMeta',
+            player__api__pb2.EditPlaylistMetaRequest.SerializeToString,
+            player__api__pb2.PlaylistEditResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def RateSong(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/player.PlayerApi/RateSong',
+            player__api__pb2.RateSongRequest.SerializeToString,
+            player__api__pb2.PlaylistEditResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def SavePlaylistToLibrary(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/player.PlayerApi/SavePlaylistToLibrary',
+            player__api__pb2.DeletePlaylistRequest.SerializeToString,
+            player__api__pb2.PlaylistEditResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def CopyPlaylist(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/player.PlayerApi/CopyPlaylist',
+            player__api__pb2.CopyPlaylistRequest.SerializeToString,
+            player__api__pb2.PlaylistEditResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ResolvePlaylistUrl(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/player.PlayerApi/ResolvePlaylistUrl',
+            player__api__pb2.ResolvePlaylistUrlRequest.SerializeToString,
+            player__api__pb2.PlaylistTracksResponse.FromString,
             options,
             channel_credentials,
             insecure,

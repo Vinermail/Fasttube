@@ -348,6 +348,9 @@ pub async fn add_playlist_items(
             AddPlaylistItemsRequest {
                 playlist_id: playlist_id.to_string(),
                 video_ids: video_ids.to_vec(),
+                // The sidecar refuses duplicates it can see in its cache; the UI
+                // can override that when the user really wants a repeat.
+                allow_duplicates: false,
             },
             CALL_TIMEOUT,
         ))

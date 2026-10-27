@@ -107,19 +107,34 @@ def _cached_lib(key: str, ttl: int, loader):
     return data
 
 
-def _edit_status(result) -> tuple[bool, str]:
+# YouTube takes playlist edits in one call, but a 350-track copy should still
+# be polite: batches, and a pause between them.
+ADD_BATCH = 50
+ADD_PAUSE = 0.3
+
+
+def _edit_status(result, lenient: bool = False) -> tuple[bool, str]:
     """ytmusicapi does not raise when YouTube refuses: it returns a status
-    string or the whole response. Only SUCCEEDED counts as done."""
+    string or the whole response. Only SUCCEEDED counts as done.
+
+    `lenient` is for the like endpoints (rate_song/rate_playlist): they answer
+    with a plain responseContext and no status at all, so "no status" there
+    means "no refusal".
+    """
     if isinstance(result, str):
         return ("SUCCEEDED" in result.upper()), result
     if isinstance(result, dict):
         status = str(result.get("status") or "").upper()
         if status:
             return ("SUCCEEDED" in status), status
+        if lenient and not result.get("error"):
+            return True, "OK"
         # Some endpoints answer with the action list and no status at all.
         if result.get("actions") or result.get("playlistEditResults"):
             return True, "OK"
         return False, json.dumps(result)[:300]
+    if result is None and lenient:
+        return True, "OK"
     return False, repr(result)
 
 
@@ -132,12 +147,13 @@ def _refuse_unowned(playlist_id: str) -> dict | None:
     """A saved (not owned) playlist cannot be edited, and a mix is generated:
     both are rejected here, before any request leaves the process."""
     if _is_mix(playlist_id):
-        return {"ok": False, "error": "автоматический микс менять нельзя"}
+        return {"ok": False, "error": "автоматический микс менять нельзя", "code": "MIX"}
     owned = _playlist_owned(playlist_id)
     if owned is False:
         return {
             "ok": False,
             "error": "это сохранённый чужой плейлист — менять его нельзя (только убрать из медиатеки)",
+            "code": "NOT_OWNED",
         }
     return None
 
@@ -146,6 +162,58 @@ def _playlist_owned(playlist_id: str) -> bool | None:
     with _playlist_lock:
         entry = _PLAYLISTS.get(f"playlist:{playlist_id}")
         return None if entry is None else bool(entry.get("owned"))
+
+
+def _cached_video_ids(playlist_id: str) -> set[str]:
+    with _playlist_lock:
+        entry = _PLAYLISTS.get(f"playlist:{playlist_id}")
+        if entry is None:
+            return set()
+        return {t.get("video_id", "") for t in entry.get("tracks") or []}
+
+
+def _apply_to_cache(playlist_id: str, mutate) -> None:
+    """Applies a successful edit to the cached page.
+
+    Dropping the cache instead ([`invalidate_account_caches`]) would force a full
+    refetch of a 350-track playlist on every single-track edit, and the user
+    would watch the list blank out.
+    """
+    with _playlist_lock:
+        entry = _PLAYLISTS.get(f"playlist:{playlist_id}")
+        if entry is not None:
+            mutate(entry)
+
+
+def _blank_row(video_id: str, set_video_id: str) -> dict:
+    """A row we know exists but have no metadata for yet: the next page fetch
+    fills it in, meanwhile the UI shows it instead of a hole."""
+    return {
+        "video_id": video_id,
+        "title": "",
+        "artist": "",
+        "album": "",
+        "duration_secs": 0.0,
+        "thumbnail": "",
+        "set_video_id": set_video_id,
+        "like_status": "",
+    }
+
+
+def _added_items(result) -> list[dict]:
+    """`playlistEditResults[].playlistEditVideoAddedResultData` → rows."""
+    items = []
+    if not isinstance(result, dict):
+        return items
+    for entry in result.get("playlistEditResults") or []:
+        data = entry.get("playlistEditVideoAddedResultData") if isinstance(entry, dict) else None
+        if not isinstance(data, dict):
+            continue
+        video_id = data.get("videoId") or data.get("addedVideoId") or ""
+        set_video_id = data.get("setVideoId") or ""
+        if video_id:
+            items.append({"video_id": video_id, "set_video_id": set_video_id})
+    return items
 
 
 def create_account_playlist(title: str) -> dict:
@@ -193,29 +261,84 @@ def delete_account_playlist(playlist_id: str) -> dict:
     return {"ok": True, "error": ""}
 
 
-def add_playlist_items(playlist_id: str, video_ids: list[str]) -> dict:
-    """Appends tracks to one of the account's playlists (writes to YouTube)."""
-    if not video_ids:
-        return {"ok": True, "error": ""}
+def add_playlist_items(
+    playlist_id: str, video_ids: list[str], allow_duplicates: bool = False
+) -> dict:
+    """Appends tracks to one of the account's playlists (writes to YouTube).
+
+    With `allow_duplicates` False the cached page is checked first and the
+    duplicates are reported instead of being sent — YouTube refuses the whole
+    batch when one track is already there.
+    """
+    wanted = [v for v in dict.fromkeys(video_ids) if v]
+    if not wanted:
+        return {"ok": True, "error": "", "items": [], "video_ids": []}
     refused = _refuse_unowned(playlist_id)
     if refused:
         return refused
     ytm = _session_client()
     if ytm is None:
         return {"ok": False, "error": "нужен вход в аккаунт YouTube"}
-    try:
-        result = ytm.add_playlist_items(playlist_id, videoIds=list(video_ids))
-    except Exception as e:
-        log.exception("add_playlist_items failed")
-        return {"ok": False, "error": str(e)}
-    ok, status = _edit_status(result)
-    if not ok:
-        if _looks_like_duplicate(result):
-            return {"ok": False, "error": "уже есть в плейлисте"}
-        return {"ok": False, "error": f"YouTube отказал: {status}"}
-    # The cached list is stale the moment the write lands.
-    invalidate_account_caches()
-    return {"ok": True, "error": ""}
+
+    if not allow_duplicates:
+        already = [v for v in wanted if v in _cached_video_ids(playlist_id)]
+        if already:
+            return {
+                "ok": False,
+                "error": "уже есть в плейлисте",
+                "code": "DUPLICATE",
+                "video_ids": already,
+            }
+
+    created: list[dict] = []
+    failed: list[str] = []
+    first_error = ""
+    for index, chunk in enumerate(
+        [wanted[i : i + ADD_BATCH] for i in range(0, len(wanted), ADD_BATCH)]
+    ):
+        if index:
+            time.sleep(ADD_PAUSE)
+        try:
+            result = ytm.add_playlist_items(playlist_id, videoIds=list(chunk))
+        except Exception as e:
+            log.exception("add_playlist_items failed")
+            failed.extend(chunk)
+            first_error = first_error or str(e)
+            continue
+        ok, status = _edit_status(result)
+        if ok:
+            created.extend(_added_items(result))
+            continue
+        failed.extend(chunk)
+        first_error = first_error or (
+            "уже есть в плейлисте" if _looks_like_duplicate(result) else f"YouTube отказал: {status}"
+        )
+
+    if created:
+        _apply_to_cache(
+            playlist_id,
+            lambda entry: _cache_after_add(entry, created),
+        )
+    if failed:
+        return {
+            "ok": False,
+            "error": first_error or "часть треков не добавилась",
+            "code": "PARTIAL" if created else "",
+            "items": created,
+            "video_ids": failed,
+        }
+    return {"ok": True, "error": "", "items": created, "video_ids": []}
+
+
+def _cache_after_add(entry: dict, created: list[dict]) -> None:
+    known = {t.get("set_video_id") for t in entry.get("tracks") or []}
+    for item in created:
+        if item["set_video_id"] and item["set_video_id"] in known:
+            continue
+        entry.setdefault("tracks", []).append(
+            _blank_row(item["video_id"], item["set_video_id"])
+        )
+    entry["total"] = int(entry.get("total") or 0) + len(created)
 
 
 def remove_playlist_items(playlist_id: str, items: list[dict]) -> dict:
@@ -248,14 +371,168 @@ def remove_playlist_items(playlist_id: str, items: list[dict]) -> dict:
     ok, status = _edit_status(result)
     if not ok:
         return {"ok": False, "error": f"YouTube не подтвердил удаление: {status}"}
+
+    gone = {v["setVideoId"] for v in videos}
+    _apply_to_cache(playlist_id, lambda entry: _cache_after_remove(entry, gone))
+    return {"ok": True, "error": ""}
+
+
+def _cache_after_remove(entry: dict, gone: set[str]) -> None:
+    tracks = entry.get("tracks") or []
+    removed = sum(1 for t in tracks if t.get("set_video_id") in gone)
+    entry["tracks"] = [t for t in tracks if t.get("set_video_id") not in gone]
+    entry["total"] = max(0, int(entry.get("total") or 0) - (removed or len(gone)))
+
+
+def move_playlist_item(playlist_id: str, set_video_id: str, before_set_video_id: str = "") -> dict:
+    """Moves one row within a playlist. An empty `before` means "to the end":
+    ytmusicapi sends ACTION_MOVE_VIDEO_BEFORE without a successor."""
+    if not set_video_id:
+        return {"ok": False, "error": "не указана строка для перемещения"}
+    refused = _refuse_unowned(playlist_id)
+    if refused:
+        return refused
+    ytm = _session_client()
+    if ytm is None:
+        return {"ok": False, "error": "нужен вход в аккаунт YouTube"}
+    move = (set_video_id, before_set_video_id) if before_set_video_id else set_video_id
+    try:
+        result = ytm.edit_playlist(playlistId=playlist_id, moveItem=move)
+    except Exception as e:
+        log.exception("move_playlist_item failed")
+        return {"ok": False, "error": str(e)}
+    ok, status = _edit_status(result)
+    if not ok:
+        return {"ok": False, "error": f"YouTube не подтвердил перемещение: {status}"}
+    _apply_to_cache(
+        playlist_id,
+        lambda entry: _cache_after_move(entry, set_video_id, before_set_video_id),
+    )
+    return {"ok": True, "error": ""}
+
+
+def _cache_after_move(entry: dict, moved: str, before: str) -> None:
+    tracks = entry.get("tracks") or []
+    ids = [t.get("set_video_id") for t in tracks]
+    if moved not in ids:
+        return
+    row = tracks.pop(ids.index(moved))
+    if before and before in ids:
+        target = [t.get("set_video_id") for t in tracks].index(before)
+    else:
+        target = len(tracks)
+    tracks.insert(target, row)
+    entry["tracks"] = tracks
+
+
+def edit_playlist_meta(
+    playlist_id: str, title: str = "", description: str = "", privacy: str = ""
+) -> dict:
+    """Renames a playlist, edits its description or privacy (writes to YouTube)."""
+    if not (title or description or privacy):
+        return {"ok": True, "error": ""}
+    refused = _refuse_unowned(playlist_id)
+    if refused:
+        return refused
+    ytm = _session_client()
+    if ytm is None:
+        return {"ok": False, "error": "нужен вход в аккаунт YouTube"}
+    kwargs = {"playlistId": playlist_id}
+    if title:
+        kwargs["title"] = title
+    if description:
+        kwargs["description"] = description
+    if privacy:
+        kwargs["privacyStatus"] = privacy
+    try:
+        result = ytm.edit_playlist(**kwargs)
+    except Exception as e:
+        log.exception("edit_playlist failed")
+        return {"ok": False, "error": str(e)}
+    ok, status = _edit_status(result)
+    if not ok:
+        return {"ok": False, "error": f"YouTube отказал: {status}"}
+    return {"ok": True, "error": ""}
+
+
+def rate_song(video_id: str, rating: str = "LIKE") -> dict:
+    """Thumbs up / no rating for one track. The response carries no status."""
+    from ytmusicapi.models.content.enums import LikeStatus
+
+    if not _VIDEO_ID_RE.match(video_id or ""):
+        return {"ok": False, "error": "неверный id трека"}
+    value = (rating or "LIKE").upper()
+    if value not in ("LIKE", "INDIFFERENT"):
+        return {"ok": False, "error": "поддерживаются только LIKE и INDIFFERENT"}
+    ytm = _session_client()
+    if ytm is None:
+        return {"ok": False, "error": "нужен вход в аккаунт YouTube"}
+    try:
+        result = ytm.rate_song(video_id, getattr(LikeStatus, value))
+    except Exception as e:
+        log.exception("rate_song failed")
+        return {"ok": False, "error": str(e)}
+    ok, status = _edit_status(result, lenient=True)
+    if not ok:
+        return {"ok": False, "error": f"YouTube отказал: {status}"}
+    return {"ok": True, "error": ""}
+
+
+def save_playlist_to_library(playlist_id: str) -> dict:
+    """Saves someone else's playlist into the account's library."""
+    if _is_mix(playlist_id):
+        return {"ok": False, "error": "микс нельзя сохранить в медиатеку", "code": "MIX"}
+    ytm = _session_client()
+    if ytm is None:
+        return {"ok": False, "error": "нужен вход в аккаунт YouTube"}
+    try:
+        result = ytm.rate_playlist(playlist_id, "LIKE")
+    except Exception as e:
+        log.exception("rate_playlist failed")
+        return {"ok": False, "error": str(e)}
+    ok, status = _edit_status(result, lenient=True)
+    if not ok:
+        return {"ok": False, "error": f"YouTube не подтвердил сохранение: {status}"}
     invalidate_account_caches()
     return {"ok": True, "error": ""}
+
+
+def copy_playlist(source_id: str, title: str = "") -> dict:
+    """Copies a playlist into a new private one on the account."""
+    if _is_mix(source_id):
+        return {"ok": False, "error": "микс нельзя скопировать", "code": "MIX"}
+    ytm = _session_client()
+    if ytm is None:
+        return {"ok": False, "error": "нужен вход в аккаунт YouTube", "id": ""}
+    try:
+        data = ytm.get_playlist(source_id, limit=None) or {}
+    except Exception as e:
+        log.exception("copy: cannot read the source")
+        return {"ok": False, "error": f"не удалось прочитать плейлист: {e}", "id": ""}
+    video_ids = [t.get("videoId") for t in data.get("tracks") or [] if t.get("videoId")]
+    if not video_ids:
+        return {"ok": False, "error": "в плейлисте нет треков", "id": ""}
+    name = (title or "").strip() or f"{data.get('title') or 'Плейлист'} (копия)"
+    try:
+        created = ytm.create_playlist(
+            name,
+            "Скопировано в Fasttube",
+            privacy_status="PRIVATE",
+            video_ids=video_ids,
+        )
+    except Exception as e:
+        log.exception("copy_playlist failed")
+        return {"ok": False, "error": str(e), "id": ""}
+    if not isinstance(created, str) or not created:
+        return {"ok": False, "error": "YouTube не вернул id копии", "id": ""}
+    invalidate_account_caches()
+    return {"ok": True, "error": "", "id": created}
 
 
 def remove_from_library(playlist_id: str) -> dict:
     """Drops a saved playlist out of the account's library (it stays on YouTube)."""
     if _is_mix(playlist_id):
-        return {"ok": False, "error": "автоматический микс нельзя убрать из медиатеки"}
+        return {"ok": False, "error": "автоматический микс нельзя убрать из медиатеки", "code": "MIX"}
     ytm = _session_client()
     if ytm is None:
         return {"ok": False, "error": "нужен вход в аккаунт YouTube"}
@@ -264,12 +541,23 @@ def remove_from_library(playlist_id: str) -> dict:
     except Exception as e:
         log.exception("rate_playlist failed")
         return {"ok": False, "error": str(e)}
-    ok, status = _edit_status(result)
+    ok, status = _edit_status(result, lenient=True)
     if not ok:
         return {"ok": False, "error": f"YouTube не подтвердил удаление из медиатеки: {status}"}
     invalidate_account_caches()
     _forget_playlist(playlist_id)
     return {"ok": True, "error": ""}
+
+
+def resolve_playlist_url(url: str) -> dict:
+    """`...&list=PL…` → the playlist id, read through the same paging path."""
+    match = re.search(r"[?&]list=([A-Za-z0-9_-]+)", url or "")
+    if not match:
+        return {"tracks": [], "total": 0, "error": "в ссылке нет параметра list=", "id": ""}
+    playlist_id = match.group(1)
+    page = playlist_tracks(playlist_id, offset=0, limit=PLAYLIST_PAGE)
+    page["id"] = playlist_id
+    return page
 
 
 def set_proxy(url: str) -> dict:
@@ -1738,6 +2026,7 @@ def _playlist_rows(data: dict) -> list[dict]:
                 "duration_secs": float(t.get("duration_seconds") or 0.0),
                 "thumbnail": pick_thumbnail(t.get("thumbnails"), THUMB_ROW),
                 "set_video_id": t.get("setVideoId") or "",
+                "like_status": t.get("likeStatus") or "",
             }
         )
     return tracks

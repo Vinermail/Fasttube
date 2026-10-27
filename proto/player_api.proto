@@ -11,6 +11,11 @@ message HealthResponse {
   bool auth_ok = 4;
 }
 
+message PlaylistItem {
+  string video_id = 1;
+  string set_video_id = 2;
+}
+
 message Track {
   string video_id = 1;
   string title = 2;
@@ -20,11 +25,45 @@ message Track {
   string thumbnail = 6;
   // YouTube's per-item id: removing a track from a playlist needs it.
   string set_video_id = 7;
+  // "LIKE" / "INDIFFERENT" when YouTube reports it for this row.
+  string like_status = 8;
 }
 
 message AddPlaylistItemsRequest {
   string playlist_id = 1;
   repeated string video_ids = 2;
+  // false: tracks already in the playlist are reported instead of added.
+  bool allow_duplicates = 3;
+}
+
+message MovePlaylistItemRequest {
+  string playlist_id = 1;
+  string set_video_id = 2;
+  // Empty = move to the end.
+  string before_set_video_id = 3;
+}
+
+message EditPlaylistMetaRequest {
+  string playlist_id = 1;
+  string title = 2;
+  string description = 3;
+  // "", "PRIVATE", "PUBLIC", "UNLISTED"
+  string privacy = 4;
+}
+
+message RateSongRequest {
+  string video_id = 1;
+  // "LIKE" or "INDIFFERENT"
+  string rating = 2;
+}
+
+message CopyPlaylistRequest {
+  string source_id = 1;
+  string title = 2;
+}
+
+message ResolvePlaylistUrlRequest {
+  string url = 1;
 }
 
 message PlaylistItemRef {
@@ -40,8 +79,14 @@ message RemovePlaylistItemsRequest {
 message PlaylistEditResponse {
   bool ok = 1;
   string error = 2;
-  // Set by CreateAccountPlaylist.
+  // Set by CreateAccountPlaylist / CopyPlaylist / ResolvePlaylistUrl.
   string id = 3;
+  // Rows created or moved by this call (video id + YouTube's per-item id).
+  repeated PlaylistItem items = 4;
+  // Machine-readable reason: "", "DUPLICATE", "NOT_OWNED", "MIX", "PARTIAL".
+  string code = 5;
+  // The video ids that were refused (duplicates or failed batches).
+  repeated string video_ids = 6;
 }
 
 message CreatePlaylistRequest {
@@ -280,4 +325,10 @@ service PlayerApi {
   rpc CreateAccountPlaylist(CreatePlaylistRequest) returns (PlaylistEditResponse);
   rpc DeleteAccountPlaylist(DeletePlaylistRequest) returns (PlaylistEditResponse);
   rpc RemoveFromLibrary(DeletePlaylistRequest) returns (PlaylistEditResponse);
+  rpc MovePlaylistItem(MovePlaylistItemRequest) returns (PlaylistEditResponse);
+  rpc EditPlaylistMeta(EditPlaylistMetaRequest) returns (PlaylistEditResponse);
+  rpc RateSong(RateSongRequest) returns (PlaylistEditResponse);
+  rpc SavePlaylistToLibrary(DeletePlaylistRequest) returns (PlaylistEditResponse);
+  rpc CopyPlaylist(CopyPlaylistRequest) returns (PlaylistEditResponse);
+  rpc ResolvePlaylistUrl(ResolvePlaylistUrlRequest) returns (PlaylistTracksResponse);
 }
