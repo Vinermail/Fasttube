@@ -9,7 +9,7 @@ pub mod proto {
     tonic::include_proto!("player");
 }
 
-pub use proto::{
+pub use proto::{ResolvePlaylistUrlRequest, CopyPlaylistRequest, 
     AlbumRequest, AlbumResponse, ArtistRequest, ArtistResponse, Empty, HealthResponse,
     HomeRequest, LikedSongsRequest, LyricsRequest, LyricsResponse, ParseAuthHeadersRequest,
     AddPlaylistItemsRequest, CreatePlaylistRequest, DeletePlaylistRequest, EditPlaylistMetaRequest,
@@ -392,6 +392,35 @@ pub async fn create_account_playlist(title: &str) -> Result<PlaylistEditResponse
                 title: title.to_string(),
             },
             CALL_TIMEOUT,
+        ))
+        .await?;
+    Ok(resp.into_inner())
+}
+
+/// Copies someone else's playlist into the account as a private one.
+pub async fn copy_playlist(source_id: &str, title: &str) -> Result<PlaylistEditResponse> {
+    let mut client = connect().await?;
+    let resp = client
+        .copy_playlist(with_timeout(
+            CopyPlaylistRequest {
+                source_id: source_id.to_string(),
+                title: title.to_string(),
+            },
+            PLAYLIST_TIMEOUT,
+        ))
+        .await?;
+    Ok(resp.into_inner())
+}
+
+/// A pasted playlist link, read once: the id comes back in the response.
+pub async fn resolve_playlist_url(url: &str) -> Result<PlaylistTracksResponse> {
+    let mut client = connect().await?;
+    let resp = client
+        .resolve_playlist_url(with_timeout(
+            ResolvePlaylistUrlRequest {
+                url: url.to_string(),
+            },
+            PLAYLIST_TIMEOUT,
         ))
         .await?;
     Ok(resp.into_inner())

@@ -4,6 +4,7 @@ mod auth_window;
 mod browser;
 mod downloader;
 mod engine;
+mod m3u;
 mod fsutil;
 mod grpc;
 mod home;
@@ -1191,6 +1192,368 @@ fn set_playlist_cover(id: String, path: String, state: tauri::State<AppState>) -
     Ok(stored)
 }
 
+#[derive(Deserialize)]
+struct YoutubeRowDto {
+    #[serde(default)]
+    video_id: String,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    artist: String,
+    #[serde(default)]
+    duration: f64,
+    #[serde(default)]
+    thumbnail: String,
+}
+
+#[derive(Serialize)]
+struct LinkPreview {
+    youtube: usize,
+    local: usize,
+}
+
+#[derive(Serialize)]
+struct LinkOutcome {
+    playlist_id: String,
+    added: usize,
+    skipped: usize,
+}
+
+fn now_millis() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+}
+
+/// What "link to YouTube" would send and what it would leave behind.
+#[tauri::command]
+fn playlist_link_preview(id: String, state: tauri::State<AppState>) -> Result<LinkPreview, String> {
+    let store = state.playlists.lock();
+    let list = store.custom_by_id(&id).ok_or("плейлист не найден")?;
+    let youtube = list
+        .tracks
+        .iter()
+        .filter(|t| matches!(t, playlists_store::PlaylistItem::Youtube { .. }))
+        .count();
+    Ok(LinkPreview {
+        youtube,
+        local: list.tracks.len() - youtube,
+    })
+}
+
+/// Creates the private YouTube playlist out of this one's YouTube rows and keeps
+/// the two in step from then on.
+#[tauri::command]
+fn playlist_link_to_youtube(
+    id: String,
+    title: String,
+    state: tauri::State<AppState>,
+) -> Result<LinkOutcome, String> {
+    let (name, items, linked) = {
+        let store = state.playlists.lock();
+        let list = store.custom_by_id(&id).ok_or("плейлист не найден")?;
+        (list.title.clone(), list.tracks.clone(), list.linked_id.clone())
+    };
+    if linked.is_some() {
+        return Err("этот плейлист уже связан с YouTube".to_string());
+    }
+    let mut video_ids: Vec<String> = Vec::new();
+    for item in &items {
+        if let playlists_store::PlaylistItem::Youtube { video_id, .. } = item {
+            if !video_id.is_empty() && !video_ids.iter().any(|v| v == video_id) {
+                video_ids.push(video_id.clone());
+            }
+        }
+    }
+    if video_ids.is_empty() {
+        return Err("в плейлисте нет треков YouTube".to_string());
+    }
+    let skipped = items.len() - video_ids.len();
+
+    let name = if title.trim().is_empty() { name } else { title.trim().to_string() };
+    let created = tauri::async_runtime::block_on(grpc::create_account_playlist(&name))
+        .map_err(|e| e.to_string())?;
+    if !created.ok || created.id.is_empty() {
+        return Err(if created.error.is_empty() {
+            "YouTube не вернул id созданного плейлиста".to_string()
+        } else {
+            created.error
+        });
+    }
+    let youtube_id = created.id.clone();
+
+    let mut added = 0usize;
+    for chunk in video_ids.chunks(50) {
+        match tauri::async_runtime::block_on(grpc::add_playlist_items_full(
+            &youtube_id,
+            chunk,
+            false,
+        )) {
+            Ok(resp) if resp.ok => added += chunk.len(),
+            Ok(resp) => {
+                // Half a playlist on YouTube is worse than none: take it back.
+                let _ =
+                    tauri::async_runtime::block_on(grpc::delete_account_playlist(&youtube_id));
+                return Err(if resp.error.is_empty() {
+                    "YouTube отказал в добавлении треков".to_string()
+                } else {
+                    resp.error
+                });
+            }
+            Err(e) => {
+                let _ =
+                    tauri::async_runtime::block_on(grpc::delete_account_playlist(&youtube_id));
+                return Err(e.to_string());
+            }
+        }
+    }
+
+    let snapshot = {
+        let mut store = state.playlists.lock();
+        store.set_linked(&id, Some(youtube_id.clone()));
+        store.clone()
+    };
+    save_playlist_store(&snapshot);
+
+    Ok(LinkOutcome {
+        playlist_id: youtube_id,
+        added,
+        skipped,
+    })
+}
+
+/// "Unlink": the YouTube rows come back as a local copy, nothing is deleted on
+/// YouTube.
+#[tauri::command]
+fn playlist_unlink(id: String, state: tauri::State<AppState>) -> Result<usize, String> {
+    let youtube_id = {
+        let store = state.playlists.lock();
+        let list = store.custom_by_id(&id).ok_or("плейлист не найден")?;
+        list.linked_id.clone()
+    };
+    let Some(youtube_id) = youtube_id else {
+        return Err("плейлист не связан с YouTube".to_string());
+    };
+
+    let mut rows: Vec<playlists_store::PlaylistItem> = Vec::new();
+    let mut offset = 0;
+    loop {
+        let page =
+            tauri::async_runtime::block_on(grpc::get_playlist_tracks(&youtube_id, offset, 200))
+                .map_err(|e| e.to_string())?;
+        if !page.error.is_empty() {
+            return Err(page.error);
+        }
+        let fetched = page.tracks.len() as i32;
+        let total = page.total;
+        for track in page.tracks {
+            rows.push(playlists_store::PlaylistItem::youtube(
+                &track.video_id,
+                &track.title,
+                &track.artist,
+                track.duration_secs,
+                &track.thumbnail,
+            ));
+        }
+        offset += fetched;
+        if fetched == 0 || (total > 0 && offset >= total) {
+            break;
+        }
+    }
+
+    let snapshot = {
+        let mut store = state.playlists.lock();
+        store.set_linked(&id, None);
+        let added = store.add_tracks(&id, rows);
+        (added, store.clone())
+    };
+    save_playlist_store(&snapshot.1);
+    Ok(snapshot.0)
+}
+
+/// Rows picked on the YouTube side land in a playlist the user owns here.
+#[tauri::command]
+fn playlist_add_youtube_rows(
+    id: String,
+    tracks: Vec<YoutubeRowDto>,
+    state: tauri::State<AppState>,
+) -> Result<playlists_store::Store, String> {
+    let items: Vec<playlists_store::PlaylistItem> = tracks
+        .into_iter()
+        .filter(|t| !t.video_id.is_empty())
+        .map(|t| {
+            playlists_store::PlaylistItem::youtube(
+                &t.video_id,
+                &t.title,
+                &t.artist,
+                t.duration,
+                &t.thumbnail,
+            )
+        })
+        .collect();
+    if items.is_empty() {
+        return Err("нечего добавлять".to_string());
+    }
+    let snapshot = {
+        let mut store = state.playlists.lock();
+        store.add_tracks(&id, items);
+        store.clone()
+    };
+    save_playlist_store(&snapshot);
+    Ok(snapshot)
+}
+
+/// Writes the playlist as M3U; an empty path means the app's own export folder.
+#[tauri::command]
+fn playlist_export_m3u(
+    id: String,
+    path: String,
+    state: tauri::State<AppState>,
+) -> Result<String, String> {
+    let (title, items) = {
+        let store = state.playlists.lock();
+        let list = store.custom_by_id(&id).ok_or("плейлист не найден")?;
+        (list.title.clone(), list.tracks.clone())
+    };
+    if items.is_empty() {
+        return Err("плейлист пуст".to_string());
+    }
+    let target = if path.trim().is_empty() {
+        let dir = downloader::data_dir().join("exports");
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        dir.join(format!("{}.m3u", safe_file_name(&title)))
+    } else {
+        std::path::PathBuf::from(path.trim())
+    };
+    if let Some(dir) = target.parent() {
+        if !dir.as_os_str().is_empty() {
+            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        }
+    }
+    fsutil::write_atomic(&target, m3u::render(&items).as_bytes()).map_err(|e| e.to_string())?;
+    Ok(target.to_string_lossy().into_owned())
+}
+
+/// Reads an M3U into a new playlist; relative paths are resolved against it.
+#[tauri::command]
+fn playlist_import_m3u(
+    path: String,
+    state: tauri::State<AppState>,
+) -> Result<playlists_store::Store, String> {
+    let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+    let text = String::from_utf8_lossy(&bytes);
+    let file = std::path::Path::new(&path);
+    let base = file.parent().unwrap_or(std::path::Path::new("."));
+
+    let mut items = m3u::parse(&text);
+    for item in &mut items {
+        if let playlists_store::PlaylistItem::Local { path, .. } = item {
+            *path = m3u::resolve(path, base);
+        }
+    }
+    if items.is_empty() {
+        return Err("в файле нет треков".to_string());
+    }
+    let title = file
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "Импорт".to_string());
+
+    let snapshot = {
+        let mut store = state.playlists.lock();
+        let id = store.create_custom(&title, now_millis());
+        store.add_tracks(&id, items);
+        store.clone()
+    };
+    save_playlist_store(&snapshot);
+    Ok(snapshot)
+}
+
+/// "Save to library" for a playlist saved from someone else.
+#[tauri::command]
+fn save_playlist_to_library(playlist_id: String) -> Result<(), String> {
+    let resp = tauri::async_runtime::block_on(grpc::save_playlist_to_library(&playlist_id))
+        .map_err(|e| e.to_string())?;
+    if !resp.ok {
+        return Err(if resp.error.is_empty() {
+            "YouTube отказал".to_string()
+        } else {
+            resp.error
+        });
+    }
+    Ok(())
+}
+
+/// "Make a copy": a private copy the user owns.
+#[tauri::command]
+fn copy_playlist(source_id: String, title: String) -> Result<String, String> {
+    let resp = tauri::async_runtime::block_on(grpc::copy_playlist(&source_id, &title))
+        .map_err(|e| e.to_string())?;
+    if !resp.ok || resp.id.is_empty() {
+        return Err(if resp.error.is_empty() {
+            "YouTube отказал".to_string()
+        } else {
+            resp.error
+        });
+    }
+    Ok(resp.id)
+}
+
+#[derive(Serialize)]
+struct ResolvedPlaylist {
+    id: String,
+    total: i32,
+    owned: bool,
+    tracks: Vec<SearchTrack>,
+}
+
+/// A pasted playlist link, read once and shown read-only.
+#[tauri::command]
+fn resolve_playlist_url(url: String) -> Result<ResolvedPlaylist, String> {
+    if !url.contains("list=") {
+        return Err("в ссылке нет параметра list=".to_string());
+    }
+    let id = url
+        .split("list=")
+        .nth(1)
+        .unwrap_or("")
+        .split(['&', '#'])
+        .next()
+        .unwrap_or("")
+        .to_string();
+    let page = tauri::async_runtime::block_on(grpc::resolve_playlist_url(url.trim()))
+        .map_err(|e| e.to_string())?;
+    if !page.error.is_empty() {
+        return Err(page.error);
+    }
+    Ok(ResolvedPlaylist {
+        id,
+        total: page.total,
+        owned: page.owned,
+        tracks: page.tracks.into_iter().map(to_search_track).collect(),
+    })
+}
+
+fn safe_file_name(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == ' ' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let cleaned = cleaned.trim().to_string();
+    if cleaned.is_empty() {
+        "playlist".to_string()
+    } else {
+        cleaned
+    }
+}
+
 #[tauri::command]
 fn create_playlist(title: String, state: tauri::State<AppState>) -> String {
     let now = std::time::SystemTime::now()
@@ -1231,20 +1594,10 @@ fn add_tracks_to_playlist(
     paths: Vec<String>,
     state: tauri::State<AppState>,
 ) -> Result<usize, String> {
-    let tracks: Vec<playlists_store::CustomTrack> = paths
+    let tracks: Vec<playlists_store::PlaylistItem> = paths
         .into_iter()
         .filter(|p| !p.trim().is_empty())
-        .map(|path| {
-            let title = std::path::Path::new(&path)
-                .file_stem()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_else(|| path.clone());
-            playlists_store::CustomTrack {
-                path,
-                title,
-                artist: String::new(),
-            }
-        })
+        .map(|path| playlists_store::PlaylistItem::local(&path, "", ""))
         .collect();
     let (added, snapshot) = {
         let mut store = state.playlists.lock();
@@ -1287,23 +1640,39 @@ fn open_custom_playlist(
         name: title,
         tracks: Vec::new(),
     };
-    for track in tracks {
-        let path = std::path::PathBuf::from(&track.path);
-        if !path.is_file() {
+    let mut youtube_rows = 0;
+    for item in tracks {
+        if !item.is_local() {
+            youtube_rows += 1;
             continue;
         }
-        let dir = path.parent().unwrap_or(std::path::Path::new("."));
-        let mut t = playlist::read_track(&path, dir);
-        if !track.title.is_empty() {
-            t.title = track.title.clone();
+        match item {
+            playlists_store::PlaylistItem::Local { path, title, artist } => {
+                let path = std::path::PathBuf::from(&path);
+                if !path.is_file() {
+                    continue;
+                }
+                let dir = path.parent().unwrap_or(std::path::Path::new("."));
+                let mut t = playlist::read_track(&path, dir);
+                if !title.is_empty() {
+                    t.title = title;
+                }
+                if !artist.is_empty() {
+                    t.artist = artist;
+                }
+                pl.tracks.push(t);
+            }
+            // Rows that live on YouTube are played from the YouTube side; the
+            // count above is only there to explain a shorter list.
+            playlists_store::PlaylistItem::Youtube { .. } => {}
         }
-        if !track.artist.is_empty() {
-            t.artist = track.artist.clone();
-        }
-        pl.tracks.push(t);
     }
     if pl.tracks.is_empty() {
-        return Err("в этом плейлисте нет доступных файлов".to_string());
+        return Err(if youtube_rows > 0 {
+            "в этом плейлисте только треки YouTube".to_string()
+        } else {
+            "в этом плейлисте нет доступных файлов".to_string()
+        });
     }
     Ok(load_local_playlist(pl, 0, &state))
 }
@@ -3831,6 +4200,15 @@ fn main() {
             playlist_move_track,
             playlist_rate_song,
             playlist_library,
+            playlist_link_preview,
+            playlist_link_to_youtube,
+            playlist_unlink,
+            playlist_add_youtube_rows,
+            playlist_export_m3u,
+            playlist_import_m3u,
+            save_playlist_to_library,
+            copy_playlist,
+            resolve_playlist_url,
             set_developer_mode,
             open_devtools
         ])

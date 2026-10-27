@@ -387,6 +387,9 @@ function allPlaylists() {
     name: c.title,
     tracks: (c.tracks || []).length,
     custom: true,
+    // Rows of both kinds: the count in the sidebar is what the user sees.
+    youtube: (c.tracks || []).filter((t) => t.kind === "youtube").length,
+    linkedId: c.linked_id || null,
   }));
   return [...custom, ...localPlaylists, ...ytPlaylists];
 }
@@ -501,9 +504,29 @@ async function openSidebarPlaylist(entry) {
   try {
     hideError();
     if (entry.custom) {
+      if (entry.linkedId) {
+        // Linked means YouTube is the source of truth from now on.
+        currentLocalPlaylistId = null;
+        currentYtPlaylistId = entry.linkedId;
+        await loadTrackPages(
+          "get_playlist_tracks",
+          { playlistId: entry.linkedId },
+          (tracks, total) => ({
+            title: playlistTitle(entry),
+            subtitle: `${total || tracks.length} tracks`,
+            cover: playlistCover(entry) || (tracks[0] ? tracks[0].thumbnail || "" : ""),
+          })
+        );
+        $("yt-more-btn").classList.add("hidden");
+        return;
+      }
       currentLocalPlaylistId = entry.id;
       const infos = await invoke("open_custom_playlist", { id: entry.id });
       applyLocalTrackList(infos, playlistTitle(entry));
+      const local = infos.length;
+      if (entry.tracks > local) {
+        $("lh-subtitle").textContent = `${local} файлов · ${entry.tracks - local} треков YouTube`;
+      }
       return;
     }
     if (entry.index !== undefined) {
@@ -654,6 +677,20 @@ async function openPlaylistMenu(x, y, entry) {
       },
     });
   }
+  if (entry.custom) {
+    if (entry.linkedId) {
+      items.push({
+        label: "Отвязать от YouTube",
+        run: () => unlinkPlaylist(entry),
+      });
+    } else if (entry.youtube > 0) {
+      items.push({
+        label: "Связать с YouTube…",
+        run: () => linkPlaylistToYoutube(entry),
+      });
+    }
+    items.push({ label: "Экспорт в M3U…", run: () => exportPlaylistM3u(entry) });
+  }
   if (ytId && owned) {
     items.push({
       label: "Добавить треки на YouTube…",
@@ -672,6 +709,14 @@ async function openPlaylistMenu(x, y, entry) {
     },
   });
   if (ytId && !owned && !mix) {
+    items.push({
+      label: "Сохранить в медиатеку",
+      run: () => savePlaylistToLibrary(ytId),
+    });
+    items.push({
+      label: "Сделать копию…",
+      run: () => copyPlaylistToAccount(ytId, playlistTitle(entry)),
+    });
     items.push({
       label: "Убрать из медиатеки…",
       danger: true,
@@ -3119,6 +3164,161 @@ async function pickTracksForYtPlaylist(ytId, name) {
   openContextMenu(lastCtxX, lastCtxY, sources);
 }
 
+/* ---------- linking, copies and playlists on disk ---------- */
+
+/// Creates the private YouTube playlist out of the rows that live there and
+/// leaves the local files where they are, saying so before it starts.
+async function linkPlaylistToYoutube(entry) {
+  try {
+    hideError();
+    const preview = await invoke("playlist_link_preview", { id: entry.id });
+    if (!preview.youtube) {
+      showError("в этом плейлисте нет треков YouTube: отправлять нечего");
+      return;
+    }
+    const tail =
+      preview.local > 0
+        ? `\n\n${preview.local} локальных файлов не будут отправлены.`
+        : "";
+    const ok = await askConfirm(
+      `Создать приватный плейлист на YouTube из ${preview.youtube} треков?${tail}`
+    );
+    if (!ok) return;
+
+    const title = await askPlaylistTitle(playlistTitle(entry));
+    if (title === null) return;
+    const out = await invoke("playlist_link_to_youtube", { id: entry.id, title });
+    await loadPlaylistStore();
+    await loadUserPlaylists();
+    showError(
+      `Связано с YouTube: добавлено ${out.added}` +
+        (out.skipped ? `, пропущено локальных ${out.skipped}` : "")
+    );
+    const linked = allPlaylists().find((p) => p.id === entry.id);
+    if (linked) await openSidebarPlaylist(linked);
+  } catch (e) {
+    showError(playlistError(e));
+  }
+}
+
+/// Drops the link and keeps a local copy of what was on YouTube.
+async function unlinkPlaylist(entry) {
+  try {
+    hideError();
+    const ok = await askConfirm(
+      `Отвязать «${playlistTitle(entry)}» от YouTube?\n\n` +
+        "Плейлист на YouTube останется как есть; сюда вернётся его копия."
+    );
+    if (!ok) return;
+    const added = await invoke("playlist_unlink", { id: entry.id });
+    await loadPlaylistStore();
+    showError(`Отвязано: в локальную копию добавлено ${added} треков`);
+    const fresh = allPlaylists().find((p) => p.id === entry.id);
+    if (fresh) await openSidebarPlaylist(fresh);
+  } catch (e) {
+    showError(playlistError(e));
+  }
+}
+
+async function exportPlaylistM3u(entry) {
+  try {
+    hideError();
+    let target = "";
+    if (dialog && dialog.save) {
+      target = await dialog.save({
+        defaultPath: `${playlistTitle(entry) || "playlist"}.m3u`,
+        filters: [{ name: "M3U", extensions: ["m3u"] }],
+      });
+      if (target === null) return;
+    }
+    const written = await invoke("playlist_export_m3u", {
+      id: entry.id,
+      path: target ? String(target) : "",
+    });
+    showError(`Сохранено: ${written}`);
+  } catch (e) {
+    showError(playlistError(e));
+  }
+}
+
+async function importPlaylistM3u() {
+  try {
+    hideError();
+    const file = await dialog.open({
+      multiple: false,
+      filters: [{ name: "M3U", extensions: ["m3u", "m3u8"] }],
+    });
+    if (!file) return;
+    await invoke("playlist_import_m3u", { path: String(file) });
+    await loadPlaylistStore();
+    renderSidebar();
+  } catch (e) {
+    showError(playlistError(e));
+  }
+}
+
+async function savePlaylistToLibrary(ytId) {
+  try {
+    hideError();
+    await invoke("save_playlist_to_library", { playlistId: ytId });
+    await loadUserPlaylists();
+    await loadPlaylistStore();
+    showError("плейлист сохранён в медиатеку");
+  } catch (e) {
+    showError(playlistError(e));
+  }
+}
+
+async function copyPlaylistToAccount(ytId, title) {
+  try {
+    hideError();
+    const name = await askPlaylistTitle(`${title || "Копия"}`);
+    if (name === null) return;
+    const id = await invoke("copy_playlist", { sourceId: ytId, title: name });
+    await loadUserPlaylists();
+    const entry = allPlaylists().find((p) => p.ytId === id);
+    if (entry) await openSidebarPlaylist(entry);
+    showError("копия создана");
+  } catch (e) {
+    showError(playlistError(e));
+  }
+}
+
+/// A pasted link: the list is shown read-only, with the two ways to keep it.
+async function importPlaylistByLink() {
+  try {
+    hideError();
+    const url = await askPlaylistTitle("");
+    if (!url || !url.trim()) return;
+    const data = await invoke("resolve_playlist_url", { url: url.trim() });
+    const rows = data.tracks || [];
+    if (!rows.length) {
+      showError("в этом плейлисте нет доступных треков");
+      return;
+    }
+    // Not in the library: nothing here is editable, so the id stays empty.
+    currentYtPlaylistId = null;
+    currentYtPlaylistOwned = false;
+    currentLocalPlaylistId = null;
+    setMode("youtube");
+    setYtTracks(rows, false, {
+      title: "Плейлист по ссылке",
+      subtitle: `${data.total || rows.length} tracks · только чтение`,
+      cover: rows[0] ? rows[0].thumbnail || "" : "",
+    });
+    $("yt-more-btn").classList.add("hidden");
+    openContextMenu(240, 200, [
+      { label: "Сохранить в медиатеку", run: () => savePlaylistToLibrary(data.id) },
+      {
+        label: "Сделать копию…",
+        run: () => copyPlaylistToAccount(data.id, "Копия плейлиста"),
+      },
+    ]);
+  } catch (e) {
+    showError(playlistError(e));
+  }
+}
+
 /// "Создать плейлист…" has two homes: the disk (files) and the account.
 async function askWhereToCreate() {
   openContextMenu(lastCtxX, lastCtxY, [
@@ -3136,6 +3336,14 @@ async function askWhereToCreate() {
         const entry = allPlaylists().find((p) => p.ytId === id);
         if (entry) await openSidebarPlaylist(entry);
       },
+    },
+    {
+      label: "Импорт по ссылке…",
+      run: () => importPlaylistByLink(),
+    },
+    {
+      label: "Импорт M3U…",
+      run: () => importPlaylistM3u(),
     },
   ]);
 }
