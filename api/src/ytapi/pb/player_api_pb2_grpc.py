@@ -119,6 +119,11 @@ class PlayerApiStub:
                 request_serializer=player__api__pb2.Empty.SerializeToString,
                 response_deserializer=player__api__pb2.SessionStatus.FromString,
                 _registered_method=True)
+        self.SetProxy = channel.unary_unary(
+                '/player.PlayerApi/SetProxy',
+                request_serializer=player__api__pb2.SetProxyRequest.SerializeToString,
+                response_deserializer=player__api__pb2.SetProxyResponse.FromString,
+                _registered_method=True)
 
 
 class PlayerApiServicer:
@@ -226,6 +231,12 @@ class PlayerApiServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def SetProxy(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_PlayerApiServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -313,6 +324,11 @@ def add_PlayerApiServicer_to_server(servicer, server):
                     servicer.ClearSession,
                     request_deserializer=player__api__pb2.Empty.FromString,
                     response_serializer=player__api__pb2.SessionStatus.SerializeToString,
+            ),
+            'SetProxy': grpc.unary_unary_rpc_method_handler(
+                    servicer.SetProxy,
+                    request_deserializer=player__api__pb2.SetProxyRequest.FromString,
+                    response_serializer=player__api__pb2.SetProxyResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -774,6 +790,33 @@ class PlayerApi:
             '/player.PlayerApi/ClearSession',
             player__api__pb2.Empty.SerializeToString,
             player__api__pb2.SessionStatus.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def SetProxy(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/player.PlayerApi/SetProxy',
+            player__api__pb2.SetProxyRequest.SerializeToString,
+            player__api__pb2.SetProxyResponse.FromString,
             options,
             channel_credentials,
             insecure,

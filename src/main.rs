@@ -137,6 +137,17 @@ struct Settings {
     /// Last search tab: "", songs, videos, albums, artists, playlists.
     #[serde(default = "default_search_filter")]
     search_filter: String,
+    /// "system" probes the usual local ports, "manual" uses the host/port
+    /// below, "off" talks to the internet directly.
+    #[serde(default = "default_proxy_mode")]
+    proxy_mode: String,
+    /// "socks5" or "http".
+    #[serde(default = "default_proxy_kind")]
+    proxy_kind: String,
+    #[serde(default = "default_proxy_host")]
+    proxy_host: String,
+    #[serde(default = "default_proxy_port")]
+    proxy_port: u16,
     /// Last played track and where it stopped: feeds the «Продолжить» shelf.
     #[serde(default)]
     resume: Option<ResumeState>,
@@ -181,6 +192,22 @@ fn default_volume() -> f32 {
     0.8
 }
 
+fn default_proxy_mode() -> String {
+    "system".to_string()
+}
+
+fn default_proxy_kind() -> String {
+    "socks5".to_string()
+}
+
+fn default_proxy_host() -> String {
+    "127.0.0.1".to_string()
+}
+
+fn default_proxy_port() -> u16 {
+    10808
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -193,6 +220,10 @@ impl Default for Settings {
             cache_limit_mb: default_cache_limit_mb(),
             search_filter: default_search_filter(),
             resume: None,
+            proxy_mode: default_proxy_mode(),
+            proxy_kind: default_proxy_kind(),
+            proxy_host: default_proxy_host(),
+            proxy_port: default_proxy_port(),
         }
     }
 }
@@ -241,6 +272,48 @@ fn spawn_settings_flusher(app: tauri::AppHandle) {
 fn save_settings(settings: &Settings) {
     if let Err(e) = fsutil::write_json_atomic(&downloader::settings_file(), settings, true) {
         eprintln!("[store] cannot save settings: {e}");
+    }
+}
+
+/// The proxy the settings describe, if they describe one.
+fn configured_proxy(settings: &Settings) -> Option<String> {
+    if settings.proxy_mode != "manual" {
+        return None;
+    }
+    let host = settings.proxy_host.trim();
+    if host.is_empty() {
+        return None;
+    }
+    // socks5h resolves names through the proxy, which is what a VPN client
+    // expects; reqwest and yt-dlp both understand the scheme.
+    let scheme = if settings.proxy_kind == "http" {
+        "http"
+    } else {
+        "socks5h"
+    };
+    Some(format!("{scheme}://{host}:{}", settings.proxy_port))
+}
+
+/// Applies the saved choice to the proxy lookup.
+///
+/// Deliberately not through environment variables: mutating the environment of
+/// a running process is racy, and the sidecar gets the same value over gRPC
+/// ([`push_proxy_to_sidecar`]) which needs no restart.
+fn apply_proxy_settings(settings: &Settings) {
+    let forced = match settings.proxy_mode.as_str() {
+        "manual" => Some(configured_proxy(settings)),
+        "off" => Some(None),
+        _ => None,
+    };
+    net::set_override(forced);
+}
+
+/// What is actually in use right now, and where it came from.
+fn effective_proxy(settings: &Settings) -> (Option<String>, &'static str) {
+    match settings.proxy_mode.as_str() {
+        "manual" => (configured_proxy(settings), "manual"),
+        "off" => (None, "off"),
+        _ => (net::detect_proxy_cached(), "system"),
     }
 }
 
@@ -950,6 +1023,162 @@ fn toggle_mute(state: tauri::State<AppState>) -> bool {
     muted
 }
 
+#[derive(Serialize, Clone)]
+struct ProxyStatus {
+    mode: String,
+    kind: String,
+    host: String,
+    port: u16,
+    /// Empty when nothing is being proxied.
+    url: String,
+    /// "manual", "system" or "off".
+    source: String,
+    /// Set when the sidecar could not be told about the change yet.
+    warning: String,
+}
+
+fn proxy_status(settings: &Settings, warning: String) -> ProxyStatus {
+    let (url, source) = effective_proxy(settings);
+    ProxyStatus {
+        mode: settings.proxy_mode.clone(),
+        kind: settings.proxy_kind.clone(),
+        host: settings.proxy_host.clone(),
+        port: settings.proxy_port,
+        url: url.unwrap_or_default(),
+        source: source.to_string(),
+        warning,
+    }
+}
+
+#[tauri::command]
+fn get_proxy_status(state: tauri::State<AppState>) -> ProxyStatus {
+    proxy_status(&state.settings.lock().clone(), String::new())
+}
+
+/// Saves the choice, applies it to the downloader and tells the sidecar.
+#[tauri::command]
+async fn set_proxy_settings(
+    mode: String,
+    kind: String,
+    host: String,
+    port: u16,
+    state: tauri::State<'_, AppState>,
+) -> Result<ProxyStatus, String> {
+    let mode = match mode.as_str() {
+        "manual" | "off" => mode,
+        _ => "system".to_string(),
+    };
+    let kind = if kind == "http" { kind } else { "socks5".to_string() };
+    let host = host.trim().to_string();
+    if mode == "manual" {
+        if host.is_empty() || host.contains(char::is_whitespace) || host.contains('/') {
+            return Err("Укажи хост прокси, например 127.0.0.1".to_string());
+        }
+        if port == 0 {
+            return Err("Порт должен быть от 1 до 65535".to_string());
+        }
+    }
+
+    let settings = {
+        let mut guard = state.settings.lock();
+        guard.proxy_mode = mode;
+        guard.proxy_kind = kind;
+        guard.proxy_host = host;
+        guard.proxy_port = port;
+        guard.clone()
+    };
+    apply_proxy_settings(&settings);
+    save_settings(&settings);
+    // The downloader rebuilds its client on the next request (the proxy is part
+    // of the client key); the caches inside the sidecar belong to the old exit
+    // IP anyway.
+    let (url, _) = effective_proxy(&settings);
+    let mut warning = String::new();
+    if let Err(e) = grpc::set_proxy(url.as_deref().unwrap_or("")).await {
+        warning = format!("сайдкар ещё не готов: {e}");
+    } else {
+        net::invalidate_proxy_cache();
+    }
+    Ok(proxy_status(&settings, warning))
+}
+
+#[derive(Serialize)]
+struct ProxyCheck {
+    ok: bool,
+    ms: u64,
+    detail: String,
+}
+
+/// One real request through the current proxy: the point of the button is to
+/// show what the app's traffic actually goes through.
+#[tauri::command]
+async fn test_proxy(state: tauri::State<'_, AppState>) -> Result<ProxyCheck, String> {
+    let settings = state.settings.lock().clone();
+    let (proxy, source) = {
+        let settings = settings.clone();
+        tokio::task::spawn_blocking(move || effective_proxy(&settings))
+            .await
+            .unwrap_or((None, "off"))
+    };
+    let mut builder = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .http1_only();
+    if let Some(url) = &proxy {
+        match reqwest::Proxy::all(url) {
+            Ok(p) => builder = builder.proxy(p),
+            Err(e) => {
+                return Err(format!("плохой адрес прокси: {e}"));
+            }
+        }
+    }
+    let client = match builder.build() {
+        Ok(c) => c,
+        Err(e) => {
+            return Err(format!("клиент не собрался: {e}"));
+        }
+    };
+
+    let started = std::time::Instant::now();
+    let response = client
+        .get("https://www.youtube.com/generate_204")
+        .send()
+        .await;
+    let ms = started.elapsed().as_millis() as u64;
+    let via = match (&proxy, source) {
+        (Some(url), "manual") => format!("через {url} (вручную)"),
+        (Some(url), _) => format!("через {url} (системный)"),
+        _ => "напрямую, без прокси".to_string(),
+    };
+    match response {
+        Ok(resp) => {
+            let code = resp.status().as_u16();
+            let ip = match client.get("https://api.ipify.org").send().await {
+                Ok(r) => r.text().await.unwrap_or_default().trim().to_string(),
+                Err(_) => String::new(),
+            };
+            let ip = if ip.len() <= 64 && !ip.is_empty() {
+                ip
+            } else {
+                String::new()
+            };
+            let mut detail = format!("{via}: YouTube ответил {code} за {ms} мс");
+            if !ip.is_empty() {
+                detail.push_str(&format!(", выходной IP {ip}"));
+            }
+            Ok(ProxyCheck {
+                ok: (200..400).contains(&code),
+                ms,
+                detail,
+            })
+        }
+        Err(e) => Ok(ProxyCheck {
+            ok: false,
+            ms,
+            detail: format!("{via}: ошибка — {e}"),
+        }),
+    }
+}
+
 #[tauri::command]
 fn get_api_status(state: tauri::State<AppState>) -> ApiStatus {
     state.api_status.read().clone()
@@ -1479,6 +1708,21 @@ fn drop_legacy_browser_file(app: &tauri::AppHandle, path: &std::path::Path, reas
 }
 
 /// Restores the session once the sidecar is up, then re-validates every 15 min.
+/// The sidecar may have started before the settings were read (or survive a
+/// restart): tell it the proxy once it is up.
+async fn push_proxy_to_sidecar(app: &tauri::AppHandle) {
+    let state = app.state::<AppState>();
+    let settings = state.settings.lock().clone();
+    let (url, _) = {
+        tokio::task::spawn_blocking(move || effective_proxy(&settings))
+            .await
+            .unwrap_or((None, "off"))
+    };
+    if let Err(e) = grpc::set_proxy(url.as_deref().unwrap_or("")).await {
+        eprintln!("[net] cannot tell the sidecar about the proxy: {e}");
+    }
+}
+
 fn spawn_session_bootstrap(app: tauri::AppHandle) {
     tauri::async_runtime::spawn(async move {
         for _ in 0..60 {
@@ -1487,6 +1731,7 @@ fn spawn_session_bootstrap(app: tauri::AppHandle) {
             }
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         }
+        push_proxy_to_sidecar(&app).await;
         restore_session(&app).await;
         loop {
             tokio::time::sleep(SESSION_BACKGROUND_EVERY).await;
@@ -2848,6 +3093,9 @@ fn main() {
         engine.send(Cmd::SetVolume(volume));
         engine.send(Cmd::SetMuted(muted));
     }
+    // The sidecar inherits YTAPI_PROXY from here, so the choice has to be in
+    // place before it is spawned.
+    apply_proxy_settings(&app_state.settings.lock().clone());
     let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let sidecar_shutdown = shutdown.clone();
     let sidecar = sidecar::spawn_and_supervise(api_status, sidecar_shutdown, api_token);
@@ -2958,7 +3206,10 @@ fn main() {
             stop,
             seek,
             set_volume,
-            toggle_mute
+            toggle_mute,
+            get_proxy_status,
+            set_proxy_settings,
+            test_proxy
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
@@ -3042,4 +3293,36 @@ mod tests {
         assert!(loudness_window(paths(3), 9).is_empty());
         assert!(loudness_window(Vec::new(), 0).is_empty());
     }
+
+    use super::{configured_proxy, Settings};
+
+    fn settings(mode: &str, kind: &str, host: &str, port: u16) -> Settings {
+        let mut s = Settings::default();
+        s.proxy_mode = mode.to_string();
+        s.proxy_kind = kind.to_string();
+        s.proxy_host = host.to_string();
+        s.proxy_port = port;
+        s
+    }
+
+    #[test]
+    fn a_manual_proxy_becomes_a_url_reqwest_understands() {
+        assert_eq!(
+            configured_proxy(&settings("manual", "socks5", "127.0.0.1", 1080)).as_deref(),
+            Some("socks5h://127.0.0.1:1080")
+        );
+        assert_eq!(
+            configured_proxy(&settings("manual", "http", "192.168.1.2", 8118)).as_deref(),
+            Some("http://192.168.1.2:8118")
+        );
+    }
+
+    #[test]
+    fn system_and_off_modes_have_no_url() {
+        assert_eq!(configured_proxy(&settings("system", "socks5", "127.0.0.1", 1080)), None);
+        assert_eq!(configured_proxy(&settings("off", "socks5", "127.0.0.1", 1080)), None);
+        // An empty host must not turn into "socks5h://:1080".
+        assert_eq!(configured_proxy(&settings("manual", "socks5", "   ", 1080)), None);
+    }
+
 }

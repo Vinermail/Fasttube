@@ -107,6 +107,47 @@ def _cached_lib(key: str, ttl: int, loader):
     return data
 
 
+def set_proxy(url: str) -> dict:
+    """Route every request through `url` ("" or "none" means no proxy).
+
+    yt-dlp takes the proxy per call, ytmusicapi reads it from the environment
+    when it builds a requests session — so the session client is rebuilt here
+    instead of waiting for the next app start.
+    """
+    global _PROXY, _RESOLVE_OPTS
+    from ytmusicapi import YTMusic
+    url = (url or "").strip()
+    proxy = "" if url.lower() in ("", "none", "off", "direct") else url
+
+    _PROXY = proxy or None
+    for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
+        if proxy:
+            os.environ[name] = proxy
+        else:
+            os.environ.pop(name, None)
+    if proxy:
+        YT_DLP_OPTS["proxy"] = proxy
+        log.info("proxy set to %s", proxy)
+    else:
+        YT_DLP_OPTS.pop("proxy", None)
+        log.info("proxy disabled")
+    _RESOLVE_OPTS = dict(YT_DLP_OPTS)
+
+    # An existing client keeps its own requests.Session, with the old proxy.
+    with _session_lock:
+        if _session is not None and _session.get("state") == "active":
+            try:
+                headers = _browser_headers(
+                    _session["cookie"], _session["user_agent"], _session["authuser"]
+                )
+                _session["client"] = YTMusic(auth=headers, language=YTM_LANGUAGE)
+            except Exception as e:  # keep the old client rather than sign out
+                log.warning("could not rebuild the session client: %s", e)
+
+    invalidate_account_caches()
+    return {"ok": True, "error": ""}
+
+
 def invalidate_account_caches() -> None:
     """Drop per-account library data (playlists, likes) after a session change.
 

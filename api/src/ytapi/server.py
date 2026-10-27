@@ -250,6 +250,16 @@ class PlayerApiServicer(player_api_pb2_grpc.PlayerApiServicer):
             error=result.get("error", ""),
         )
 
+    def SetProxy(self, request, context):
+        try:
+            result = youtube.set_proxy(request.url)
+        except Exception as e:
+            log.exception("set_proxy failed")
+            return player_api_pb2.SetProxyResponse(ok=False, error=str(e))
+        return player_api_pb2.SetProxyResponse(
+            ok=bool(result.get("ok")), error=result.get("error", "")
+        )
+
     def GetPlaylistTracks(self, request, context):
         result = youtube.playlist_tracks(
             request.id, offset=request.offset, limit=request.limit

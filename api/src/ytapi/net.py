@@ -32,6 +32,9 @@ PROXY_CANDIDATES = [
 def detect_proxy() -> str | None:
     env = os.environ.get("YTAPI_PROXY")
     if env:
+        # The app writes "none" when the user turned the proxy off explicitly.
+        if env.strip().lower() in ("none", "off", "direct"):
+            return None
         return env
     for cand in PROXY_CANDIDATES:
         host = cand.split("://", 1)[1].split(":", 1)[0]

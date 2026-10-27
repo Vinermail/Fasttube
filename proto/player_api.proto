@@ -155,6 +155,17 @@ message UserPlaylistsResponse {
   string error = 4;
 }
 
+message SetProxyRequest {
+  // Empty or "none" disables the proxy; the sidecar then talks to the internet
+  // directly (or through whatever the OS has).
+  string url = 1;
+}
+
+message SetProxyResponse {
+  bool ok = 1;
+  string error = 2;
+}
+
 message PlaylistTracksRequest {
   string id = 1;
   // Paging: the UI draws the first page and asks for the rest while it loads.
@@ -228,4 +239,5 @@ service PlayerApi {
   rpc ParseAuthHeaders(ParseAuthHeadersRequest) returns (SetSessionRequest);
   rpc ValidateSession(Empty) returns (SessionStatus);
   rpc ClearSession(Empty) returns (SessionStatus);
+  rpc SetProxy(SetProxyRequest) returns (SetProxyResponse);
 }

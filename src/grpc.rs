@@ -12,6 +12,7 @@ pub mod proto {
 pub use proto::{
     AlbumRequest, AlbumResponse, ArtistRequest, ArtistResponse, Empty, HealthResponse,
     HomeRequest, LikedSongsRequest, LyricsRequest, LyricsResponse, ParseAuthHeadersRequest,
+    SetProxyRequest, SetProxyResponse,
     Shelf,
     PlaylistTracksRequest, PlaylistTracksResponse, PrefetchResolveRequest, RecommendRequest,
     ResolveRequest, ResolveResponse, SearchRequest, SearchSection, SessionState, SessionStatus,
@@ -280,6 +281,20 @@ pub async fn get_playlist_tracks(
                 limit,
             },
             PLAYLIST_TIMEOUT,
+        ))
+        .await?;
+    Ok(resp.into_inner())
+}
+
+/// Tells the sidecar which proxy to use ("" or "none" = no proxy).
+pub async fn set_proxy(url: &str) -> Result<SetProxyResponse> {
+    let mut client = connect().await?;
+    let resp = client
+        .set_proxy(with_timeout(
+            SetProxyRequest {
+                url: url.to_string(),
+            },
+            CALL_TIMEOUT,
         ))
         .await?;
     Ok(resp.into_inner())

@@ -2023,3 +2023,41 @@ input[type="range"]::-moz-range-thumb {
 .pb-vol.is-muted input[type="range"] {
   opacity: 0.4;
 }
+
+/* Proxy settings: one row of controls, the status sits to the right. */
+.proxy-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+
+.proxy-row select,
+.proxy-row input {
+  background: var(--bg2);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 6px 8px;
+  font-size: 13px;
+}
+
+.proxy-row input#opt-proxy-host {
+  width: 150px;
+}
+
+.proxy-row input#opt-proxy-port {
+  width: 90px;
+}
+
+.proxy-row select:disabled,
+.proxy-row input:disabled {
+  opacity: 0.45;
+}
+
+#proxy-status {
+  font-size: 12px;
+  color: var(--fg-dim);
+  overflow-wrap: anywhere;
+}

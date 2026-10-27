@@ -187,6 +187,38 @@
         </section>
 
         <section class="settings-section">
+          <h3>Network proxy</h3>
+          <p class="hint">
+            Через этот прокси идёт весь трафик приложения: загрузчик треков,
+            yt-dlp и ytmusicapi в сайдкаре. «Системный» — приложение само ищет
+            локальный прокси на обычных портах (10808, 1080, 7890) или берёт
+            YTAPI_PROXY из окружения.
+          </p>
+          <div class="proxy-row">
+            <select id="opt-proxy-mode">
+              <option value="system">Системный (авто)</option>
+              <option value="manual">Вручную</option>
+              <option value="off">Без прокси</option>
+            </select>
+            <select id="opt-proxy-kind">
+              <option value="socks5">SOCKS5</option>
+              <option value="http">HTTP</option>
+            </select>
+            <input id="opt-proxy-host" placeholder="127.0.0.1" spellcheck="false" />
+            <input id="opt-proxy-port" type="number" min="1" max="65535" placeholder="10808" />
+          </div>
+          <div class="cache-row">
+            <button id="btn-proxy-apply" class="btn primary">Применить</button>
+            <button id="btn-proxy-test" class="btn">Проверить</button>
+            <span id="proxy-status"></span>
+          </div>
+          <p class="hint">
+            «Проверить» делает реальный запрос через выбранный прокси и показывает
+            ответ YouTube и выходной IP — чтобы было видно, куда именно ходит трафик.
+          </p>
+        </section>
+
+        <section class="settings-section">
           <h3>Sleep timer</h3>
           <p class="hint">Stop playback after N minutes.</p>
           <div class="sleep-row">

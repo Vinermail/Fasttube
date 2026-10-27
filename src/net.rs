@@ -17,6 +17,25 @@ const PROXY_TTL: Duration = Duration::from_secs(60);
 
 static PROXY_CACHE: OnceLock<Mutex<Option<(Option<String>, Instant)>>> = OnceLock::new();
 
+/// What the user picked in the settings. The outer `None` means "detect it",
+/// `Some(None)` means "no proxy at all", `Some(Some(url))` is an explicit one.
+static PROXY_OVERRIDE: OnceLock<Mutex<Option<Option<String>>>> = OnceLock::new();
+
+fn override_slot() -> &'static Mutex<Option<Option<String>>> {
+    PROXY_OVERRIDE.get_or_init(|| Mutex::new(None))
+}
+
+/// Sets (or clears) the explicit proxy. Also drops the cached probe, so the
+/// next request uses the new value immediately.
+pub fn set_override(value: Option<Option<String>>) {
+    *override_slot().lock() = value;
+    invalidate_proxy_cache();
+}
+
+pub fn current_override() -> Option<Option<String>> {
+    override_slot().lock().clone()
+}
+
 fn cache() -> &'static Mutex<Option<(Option<String>, Instant)>> {
     PROXY_CACHE.get_or_init(|| Mutex::new(None))
 }
@@ -52,6 +71,10 @@ pub fn invalidate_proxy_cache() {
 /// Returns a proxy URL usable by reqwest, from `YTAPI_PROXY` or by probing
 /// common local VPN/proxy ports (same list as the Python sidecar uses).
 pub fn detect_proxy() -> Option<String> {
+    // An explicit choice from the settings always wins over probing.
+    if let Some(forced) = current_override() {
+        return forced;
+    }
     if let Ok(env) = std::env::var("YTAPI_PROXY")
         && !env.is_empty()
     {
@@ -81,12 +104,18 @@ pub fn detect_proxy() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// The proxy state is process-wide, so these tests must not overlap.
+    static SERIAL: Mutex<()> = Mutex::new(());
 
     /// Probing three ports with a 400 ms budget each is the slow path; a cached
     /// answer must not repeat it (and must survive invalidation the way the
     /// retry path expects).
     #[test]
     fn proxy_lookup_is_cached_and_invalidatable() {
+        let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        set_override(None);
         invalidate_proxy_cache();
         let started = Instant::now();
         let first = detect_proxy_cached();
@@ -105,5 +134,22 @@ mod tests {
         invalidate_proxy_cache();
         let third = detect_proxy_cached();
         assert_eq!(third, first, "the detection is deterministic here");
+    }
+
+    /// What the settings pick must win over anything the probe would find.
+    #[test]
+    fn the_explicit_choice_beats_probing() {
+        let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        set_override(Some(Some("socks5h://10.1.2.3:9050".to_string())));
+        assert_eq!(
+            detect_proxy_cached().as_deref(),
+            Some("socks5h://10.1.2.3:9050")
+        );
+
+        // "off" stays off even when a local proxy is running.
+        set_override(Some(None));
+        assert_eq!(detect_proxy_cached(), None);
+
+        set_override(None);
     }
 }

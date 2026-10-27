@@ -1619,6 +1619,71 @@ volumeEl.addEventListener("change", () => {
   volumeDragging = false;
 });
 
+/* ---------- proxy ---------- */
+
+const proxyModeEl = $("opt-proxy-mode");
+const proxyKindEl = $("opt-proxy-kind");
+const proxyHostEl = $("opt-proxy-host");
+const proxyPortEl = $("opt-proxy-port");
+let proxyInfo = null;
+
+function renderProxy(status) {
+  if (!status) return;
+  proxyInfo = status;
+  proxyModeEl.value = status.mode || "system";
+  proxyKindEl.value = status.kind || "socks5";
+  proxyHostEl.value = status.host || "127.0.0.1";
+  proxyPortEl.value = String(status.port || 10808);
+  const manual = proxyModeEl.value === "manual";
+  proxyKindEl.disabled = !manual;
+  proxyHostEl.disabled = !manual;
+  proxyPortEl.disabled = !manual;
+  const where = status.url
+    ? (status.source === "manual" ? "сейчас: " : "сейчас (системный): ") + status.url
+    : "сейчас: без прокси";
+  $("proxy-status").textContent = status.warning ? `${where} · ${status.warning}` : where;
+}
+
+async function loadProxy() {
+  try {
+    renderProxy(await invoke("get_proxy_status"));
+  } catch (e) {
+    showError(e);
+  }
+}
+
+proxyModeEl.addEventListener("change", () => {
+  renderProxy(Object.assign({}, proxyInfo, { mode: proxyModeEl.value }));
+});
+
+$("btn-proxy-apply").onclick = async () => {
+  const port = Number(proxyPortEl.value);
+  $("proxy-status").textContent = "применяю…";
+  try {
+    const status = await invoke("set_proxy_settings", {
+      mode: proxyModeEl.value,
+      kind: proxyKindEl.value,
+      host: proxyHostEl.value,
+      port: Number.isFinite(port) ? port : 0,
+    });
+    renderProxy(status);
+    hideError();
+  } catch (e) {
+    $("proxy-status").textContent = String(e);
+    showError(e);
+  }
+};
+
+$("btn-proxy-test").onclick = async () => {
+  $("proxy-status").textContent = "проверяю…";
+  try {
+    const res = await invoke("test_proxy");
+    $("proxy-status").textContent = res.detail;
+  } catch (e) {
+    $("proxy-status").textContent = String(e);
+  }
+};
+
 /* ---------- mute ---------- */
 
 const muteEl = $("mute-btn");
@@ -2350,6 +2415,7 @@ try {
 
 refresh();
 loadLibrary();
+loadProxy();
 loadUserPlaylists();
 loadSettings();
 pollApiStatus();
