@@ -9,6 +9,7 @@ mod grpc;
 mod home;
 mod net;
 mod playlist;
+mod playlists_store;
 mod queue;
 mod secrets;
 mod sidecar;
@@ -25,6 +26,8 @@ use tauri::{Emitter, Manager};
 
 #[derive(Serialize, Clone)]
 struct PlaylistInfo {
+    /// "local:<folder>" — what pinning, hiding and renaming refer to.
+    id: String,
     name: String,
     tracks: usize,
 }
@@ -139,6 +142,9 @@ struct Settings {
     search_filter: String,
     /// "system" probes the usual local ports, "manual" uses the host/port
     /// below, "off" talks to the internet directly.
+    /// Shows the usual WebView menu and F12; off by default.
+    #[serde(default)]
+    developer_mode: bool,
     #[serde(default = "default_proxy_mode")]
     proxy_mode: String,
     /// "socks5" or "http".
@@ -220,6 +226,7 @@ impl Default for Settings {
             cache_limit_mb: default_cache_limit_mb(),
             search_filter: default_search_filter(),
             resume: None,
+            developer_mode: false,
             proxy_mode: default_proxy_mode(),
             proxy_kind: default_proxy_kind(),
             proxy_host: default_proxy_host(),
@@ -739,6 +746,8 @@ struct AppState {
     session_checked: Mutex<Option<std::time::Instant>>,
     /// Set by anything that changes settings, cleared when the flusher saves.
     settings_dirty: std::sync::atomic::AtomicBool,
+    /// Pins, hidden playlists, renames and the user's own playlists.
+    playlists: Mutex<playlists_store::Store>,
 }
 
 fn track_to_info(t: &Track) -> engine::TrackInfo {
@@ -751,11 +760,255 @@ fn track_to_info(t: &Track) -> engine::TrackInfo {
     }
 }
 
+/// Local playlists are folders, so the folder path is their identity: it
+/// survives re-scans, unlike the index in the library vector.
+fn local_playlist_id(pl: &Playlist) -> String {
+    match pl.tracks.first().and_then(|t| t.path.parent()) {
+        Some(dir) => format!("local:{}", dir.to_string_lossy()),
+        None => format!("local:name:{}", pl.name),
+    }
+}
+
 fn to_playlist_info(pl: &Playlist) -> PlaylistInfo {
     PlaylistInfo {
+        id: local_playlist_id(pl),
         name: pl.name.clone(),
         tracks: pl.tracks.len(),
     }
+}
+
+fn playlist_store_file() -> std::path::PathBuf {
+    downloader::data_dir().join("library.json")
+}
+
+fn save_playlist_store(store: &playlists_store::Store) {
+    if let Err(e) = fsutil::write_json_atomic(&playlist_store_file(), store, true) {
+        eprintln!("[store] cannot save the playlist settings: {e}");
+    }
+}
+
+/// Where a user-picked cover image is copied: the asset protocol only serves
+/// files under the app's own data directory.
+fn cover_file(id: &str, source: &str) -> std::path::PathBuf {
+    let safe: String = id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let ext = std::path::Path::new(source)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("jpg")
+        .to_ascii_lowercase();
+    let ext = if ext.chars().all(|c| c.is_ascii_alphanumeric()) && ext.len() <= 5 {
+        ext
+    } else {
+        "jpg".to_string()
+    };
+    downloader::data_dir()
+        .join("covers")
+        .join(format!("{safe}.{ext}"))
+}
+
+#[tauri::command]
+fn get_playlist_store(state: tauri::State<AppState>) -> playlists_store::Store {
+    state.playlists.lock().clone()
+}
+
+#[tauri::command]
+fn set_playlist_pinned(id: String, state: tauri::State<AppState>) -> bool {
+    let (pinned, snapshot) = {
+        let mut store = state.playlists.lock();
+        let pinned = store.toggle_pin(&id);
+        (pinned, store.clone())
+    };
+    save_playlist_store(&snapshot);
+    pinned
+}
+
+#[tauri::command]
+fn set_playlist_hidden(id: String, state: tauri::State<AppState>) -> bool {
+    let (hidden, snapshot) = {
+        let mut store = state.playlists.lock();
+        let hidden = store.toggle_hidden(&id);
+        (hidden, store.clone())
+    };
+    save_playlist_store(&snapshot);
+    hidden
+}
+
+#[tauri::command]
+fn rename_playlist(id: String, title: String, state: tauri::State<AppState>) {
+    let snapshot = {
+        let mut store = state.playlists.lock();
+        store.set_title(&id, &title);
+        store.clone()
+    };
+    save_playlist_store(&snapshot);
+}
+
+/// Copies the picked image next to the app's data and remembers it for `id`.
+#[tauri::command]
+fn set_playlist_cover(id: String, path: String, state: tauri::State<AppState>) -> Result<String, String> {
+    if path.trim().is_empty() {
+        let snapshot = {
+            let mut store = state.playlists.lock();
+            store.set_cover(&id, "");
+            store.clone()
+        };
+        save_playlist_store(&snapshot);
+        return Ok(String::new());
+    }
+    let source = std::path::Path::new(&path);
+    if !source.is_file() {
+        return Err("файл обложки не найден".to_string());
+    }
+    let dest = cover_file(&id, &path);
+    if let Some(dir) = dest.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    std::fs::copy(source, &dest).map_err(|e| format!("не удалось скопировать обложку: {e}"))?;
+    let stored = dest.to_string_lossy().into_owned();
+    let snapshot = {
+        let mut store = state.playlists.lock();
+        store.set_cover(&id, &stored);
+        store.clone()
+    };
+    save_playlist_store(&snapshot);
+    Ok(stored)
+}
+
+#[tauri::command]
+fn create_playlist(title: String, state: tauri::State<AppState>) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let (id, snapshot) = {
+        let mut store = state.playlists.lock();
+        let id = store.create_custom(&title, now);
+        (id, store.clone())
+    };
+    save_playlist_store(&snapshot);
+    id
+}
+
+#[tauri::command]
+fn delete_playlist(id: String, state: tauri::State<AppState>) -> Result<(), String> {
+    let snapshot = {
+        let mut store = state.playlists.lock();
+        if store.custom_by_id(&id).is_none() {
+            return Err("удалять можно только свои плейлисты (чужие — скрыть)".to_string());
+        }
+        let cover = store.custom_by_id(&id).map(|c| c.cover.clone()).unwrap_or_default();
+        store.forget(&id);
+        if !cover.is_empty() {
+            let _ = std::fs::remove_file(&cover);
+        }
+        store.clone()
+    };
+    save_playlist_store(&snapshot);
+    Ok(())
+}
+
+/// Appends files to a playlist of the user's own.
+#[tauri::command]
+fn add_tracks_to_playlist(
+    id: String,
+    paths: Vec<String>,
+    state: tauri::State<AppState>,
+) -> Result<usize, String> {
+    let tracks: Vec<playlists_store::CustomTrack> = paths
+        .into_iter()
+        .filter(|p| !p.trim().is_empty())
+        .map(|path| {
+            let title = std::path::Path::new(&path)
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.clone());
+            playlists_store::CustomTrack {
+                path,
+                title,
+                artist: String::new(),
+            }
+        })
+        .collect();
+    let (added, snapshot) = {
+        let mut store = state.playlists.lock();
+        if store.custom_by_id(&id).is_none() {
+            return Err("плейлист не найден".to_string());
+        }
+        let added = store.add_tracks(&id, tracks);
+        (added, store.clone())
+    };
+    save_playlist_store(&snapshot);
+    Ok(added)
+}
+
+#[tauri::command]
+fn remove_track_from_playlist(id: String, index: usize, state: tauri::State<AppState>) -> bool {
+    let (removed, snapshot) = {
+        let mut store = state.playlists.lock();
+        let removed = store.remove_track(&id, index);
+        (removed, store.clone())
+    };
+    if removed {
+        save_playlist_store(&snapshot);
+    }
+    removed
+}
+
+/// Opens one of the user's playlists: files that are gone are skipped rather
+/// than turning the whole list into an error.
+#[tauri::command]
+fn open_custom_playlist(
+    id: String,
+    state: tauri::State<AppState>,
+) -> Result<Vec<engine::TrackInfo>, String> {
+    let (title, tracks) = {
+        let store = state.playlists.lock();
+        let list = store.custom_by_id(&id).ok_or("плейлист не найден")?;
+        (list.title.clone(), list.tracks.clone())
+    };
+    let mut pl = Playlist {
+        name: title,
+        tracks: Vec::new(),
+    };
+    for track in tracks {
+        let path = std::path::PathBuf::from(&track.path);
+        if !path.is_file() {
+            continue;
+        }
+        let dir = path.parent().unwrap_or(std::path::Path::new("."));
+        let mut t = playlist::read_track(&path, dir);
+        if !track.title.is_empty() {
+            t.title = track.title.clone();
+        }
+        if !track.artist.is_empty() {
+            t.artist = track.artist.clone();
+        }
+        pl.tracks.push(t);
+    }
+    if pl.tracks.is_empty() {
+        return Err("в этом плейлисте нет доступных файлов".to_string());
+    }
+    Ok(load_local_playlist(pl, 0, &state))
+}
+
+#[tauri::command]
+fn set_developer_mode(enabled: bool, state: tauri::State<AppState>) {
+    state.settings.lock().developer_mode = enabled;
+    save_settings(&state.settings.lock().clone());
+}
+
+#[tauri::command]
+fn open_devtools(window: tauri::WebviewWindow) {
+    window.open_devtools();
 }
 
 #[tauri::command]
@@ -1920,6 +2173,12 @@ async fn play_video_inner(id: &str, state: &AppState) -> Result<PlaylistInfo, St
         title
     };
 
+    let playlist_id = format!(
+        "local:{}",
+        dest.parent()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    );
     let playlist = Playlist {
         name: title.clone(),
         tracks: vec![Track::new(dest, title.clone())],
@@ -1930,6 +2189,7 @@ async fn play_video_inner(id: &str, state: &AppState) -> Result<PlaylistInfo, St
         .send(Cmd::SetPlaylist(playlist));
 
     Ok(PlaylistInfo {
+        id: playlist_id,
         name: title,
         tracks: 1,
     })
@@ -3077,6 +3337,7 @@ fn main() {
         loudness: load_loudness(),
         session_checked: Mutex::new(None),
         settings_dirty: std::sync::atomic::AtomicBool::new(false),
+        playlists: Mutex::new(load_json(&playlist_store_file())),
     };
     let api_status = app_state.api_status.clone();
     {
@@ -3209,7 +3470,19 @@ fn main() {
             toggle_mute,
             get_proxy_status,
             set_proxy_settings,
-            test_proxy
+            test_proxy,
+            get_playlist_store,
+            set_playlist_pinned,
+            set_playlist_hidden,
+            rename_playlist,
+            set_playlist_cover,
+            create_playlist,
+            delete_playlist,
+            add_tracks_to_playlist,
+            remove_track_from_playlist,
+            open_custom_playlist,
+            set_developer_mode,
+            open_devtools
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");

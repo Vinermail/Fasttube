@@ -351,39 +351,412 @@ $("lh-sort").onclick = () => {
   refresh();
 };
 
+
+/* ---------- sidebar: pinned, plain, hidden; plus the user's own lists -------- */
+
+let localPlaylists = [];
+let ytPlaylists = [];
+let playlistStore = { pinned: [], hidden: [], meta: {}, custom: [] };
+let hiddenOpen = false;
+let currentLocalPlaylistId = null;
+
+function allPlaylists() {
+  const custom = (playlistStore.custom || []).map((c) => ({
+    id: c.id,
+    name: c.title,
+    tracks: (c.tracks || []).length,
+    custom: true,
+  }));
+  return [...custom, ...localPlaylists, ...ytPlaylists];
+}
+
+function playlistTitle(entry) {
+  const meta = playlistStore.meta && playlistStore.meta[entry.id];
+  return (meta && meta.title) || entry.name || "";
+}
+
+function playlistCover(entry) {
+  const meta = playlistStore.meta && playlistStore.meta[entry.id];
+  if (meta && meta.cover) return convertFileSrc(meta.cover);
+  if (entry.thumbnail) return entry.thumbnail;
+  return "";
+}
+
+async function loadPlaylistStore() {
+  try {
+    playlistStore = await invoke("get_playlist_store");
+  } catch (e) {
+    console.warn("could not load the playlist settings:", String(e));
+  }
+  renderSidebar();
+}
+
+function sidebarRow(entry) {
+  const div = document.createElement("div");
+  const pinned = (playlistStore.pinned || []).includes(entry.id);
+  div.className = "item pl-item" + (pinned ? " pinned" : "");
+  div.dataset.id = entry.id;
+
+  const cover = playlistCover(entry);
+  if (cover) {
+    const img = document.createElement("img");
+    img.className = "yt-thumb";
+    img.loading = "lazy";
+    img.alt = "";
+    img.src = cover;
+    div.appendChild(img);
+  }
+  if (pinned) {
+    const pin = document.createElement("span");
+    pin.className = "pin-mark";
+    pin.textContent = "📌";
+    pin.title = "Закреплён";
+    div.appendChild(pin);
+  }
+  const name = document.createElement("span");
+  name.className = "pl-name";
+  name.textContent = playlistTitle(entry);
+  div.appendChild(name);
+  const count = document.createElement("span");
+  count.className = "count";
+  count.textContent = `(${entry.tracks || 0})`;
+  div.appendChild(count);
+
+  div.onclick = () => openSidebarPlaylist(entry);
+  div.addEventListener("contextmenu", (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    openPlaylistMenu(e.clientX, e.clientY, entry);
+  });
+  return div;
+}
+
+function renderSidebar() {
+  const el = $("playlists");
+  if (!el) return;
+  el.innerHTML = "";
+  $("yt-user-playlists").innerHTML = "";
+
+  const everything = allPlaylists();
+  const byId = new Map(everything.map((p) => [p.id, p]));
+  const pinnedIds = (playlistStore.pinned || []).filter((id) => byId.has(id));
+  const hiddenIds = (playlistStore.hidden || []).filter((id) => byId.has(id));
+
+  if (pinnedIds.length) {
+    const head = document.createElement("div");
+    head.className = "pl-group";
+    head.textContent = "Закреплённые";
+    el.appendChild(head);
+    pinnedIds.forEach((id) => el.appendChild(sidebarRow(byId.get(id))));
+  }
+
+  const rest = everything.filter(
+    (p) => !pinnedIds.includes(p.id) && !hiddenIds.includes(p.id)
+  );
+  if (pinnedIds.length && rest.length) {
+    const head = document.createElement("div");
+    head.className = "pl-group";
+    head.textContent = "Все плейлисты";
+    el.appendChild(head);
+  }
+  rest.forEach((p) => el.appendChild(sidebarRow(p)));
+
+  const newBtn = document.createElement("button");
+  newBtn.className = "btn pl-new";
+  newBtn.textContent = "＋ Свой плейлист";
+  newBtn.onclick = () => createCustomPlaylist();
+  el.appendChild(newBtn);
+
+  if (hiddenIds.length) {
+    const folder = document.createElement("div");
+    folder.className = "pl-group pl-hidden-toggle";
+    folder.textContent = `${hiddenOpen ? "▾" : "▸"} Скрытые (${hiddenIds.length})`;
+    folder.onclick = () => {
+      hiddenOpen = !hiddenOpen;
+      renderSidebar();
+    };
+    el.appendChild(folder);
+    if (hiddenOpen) {
+      hiddenIds.forEach((id) => el.appendChild(sidebarRow(byId.get(id))));
+    }
+  }
+}
+
+async function openSidebarPlaylist(entry) {
+  try {
+    hideError();
+    if (entry.custom) {
+      currentLocalPlaylistId = entry.id;
+      const infos = await invoke("open_custom_playlist", { id: entry.id });
+      applyLocalTrackList(infos, playlistTitle(entry));
+      return;
+    }
+    if (entry.index !== undefined) {
+      currentLocalPlaylistId = entry.id;
+      const infos = await invoke("open_playlist", { index: entry.index });
+      applyLocalTrackList(infos, playlistTitle(entry));
+      return;
+    }
+    // A YouTube playlist.
+    currentLocalPlaylistId = null;
+    const ytId = entry.ytId;
+    await loadTrackPages(
+      "get_playlist_tracks",
+      { playlistId: ytId },
+      (tracks, total) => ({
+        title: playlistTitle(entry),
+        subtitle: `${total || entry.tracks || tracks.length} tracks`,
+        cover: playlistCover(entry) || (tracks[0] ? tracks[0].thumbnail || "" : ""),
+      })
+    );
+    $("yt-more-btn").classList.add("hidden");
+  } catch (e) {
+    showError(playlistError(e));
+  }
+}
+
+function applyLocalTrackList(infos, title) {
+  trackList = infos.map((t) => ({
+    title: t.title,
+    artist: t.artist,
+    duration: t.duration,
+    path: t.path,
+  }));
+  trackListKey = null;
+  const coverPath = (infos.find((t) => t.cover) || {}).cover;
+  setListHeader({
+    title,
+    subtitle: `${infos.length} tracks`,
+    cover: coverPath ? convertFileSrc(coverPath) : "",
+  });
+  setMode("local");
+  refresh();
+}
+
+/* ---------- context menu ---------- */
+
+let ctxMenuEl = null;
+
+function closeContextMenu() {
+  if (ctxMenuEl) {
+    ctxMenuEl.remove();
+    ctxMenuEl = null;
+  }
+}
+
+function openContextMenu(x, y, items) {
+  closeContextMenu();
+  if (!items.length) return;
+  const menu = document.createElement("div");
+  menu.className = "ctx-menu";
+  items.forEach((item) => {
+    const row = document.createElement("div");
+    row.className = "ctx-item" + (item.danger ? " danger" : "");
+    row.textContent = item.label;
+    row.onclick = () => {
+      closeContextMenu();
+      Promise.resolve()
+        .then(item.run)
+        .catch((e) => showError(e));
+    };
+    menu.appendChild(row);
+  });
+  document.body.appendChild(menu);
+  // Keep it on screen: the menu is placed at the cursor, which may be close to
+  // the right or bottom edge.
+  const rect = menu.getBoundingClientRect();
+  const left = Math.min(x, window.innerWidth - rect.width - 8);
+  const top = Math.min(y, window.innerHeight - rect.height - 8);
+  menu.style.left = `${Math.max(8, left)}px`;
+  menu.style.top = `${Math.max(8, top)}px`;
+  ctxMenuEl = menu;
+}
+
+document.addEventListener("click", closeContextMenu);
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") closeContextMenu();
+});
+window.addEventListener("blur", closeContextMenu);
+
+function openPlaylistMenu(x, y, entry) {
+  const pinned = (playlistStore.pinned || []).includes(entry.id);
+  const hidden = (playlistStore.hidden || []).includes(entry.id);
+  const items = [
+    {
+      label: pinned ? "Открепить" : "Закрепить",
+      run: async () => {
+        await invoke("set_playlist_pinned", { id: entry.id });
+        await loadPlaylistStore();
+      },
+    },
+    {
+      label: "Переименовать…",
+      run: () => askPlaylistTitle(playlistTitle(entry)).then(async (title) => {
+        if (title === null) return;
+        await invoke("rename_playlist", { id: entry.id, title });
+        await loadPlaylistStore();
+      }),
+    },
+    {
+      label: "Сменить обложку…",
+      run: async () => {
+        const file = await dialog.open({
+          multiple: false,
+          filters: [{ name: "Картинка", extensions: ["jpg", "jpeg", "png", "webp"] }],
+        });
+        if (!file) return;
+        await invoke("set_playlist_cover", { id: entry.id, path: String(file) });
+        await loadPlaylistStore();
+      },
+    },
+  ];
+  if (entry.custom) {
+    items.push({
+      label: "Добавить файлы…",
+      run: async () => {
+        const files = await dialog.open({
+          multiple: true,
+          filters: [{ name: "Аудио", extensions: ["mp3", "flac", "m4a", "wav", "ogg", "opus"] }],
+        });
+        const list = Array.isArray(files) ? files : files ? [files] : [];
+        if (!list.length) return;
+        const added = await invoke("add_tracks_to_playlist", {
+          id: entry.id,
+          paths: list.map(String),
+        });
+        await loadPlaylistStore();
+        if (!added) showError("эти файлы уже есть в плейлисте");
+        else if (currentLocalPlaylistId === entry.id) await openSidebarPlaylist(entry);
+      },
+    });
+  }
+  items.push({
+    label: hidden ? "Показать в списке" : "Скрыть в папку",
+    run: async () => {
+      await invoke("set_playlist_hidden", { id: entry.id });
+      await loadPlaylistStore();
+    },
+  });
+  if (entry.custom) {
+    items.push({
+      label: "Удалить плейлист",
+      danger: true,
+      run: async () => {
+        if (!(await askConfirm(`Удалить «${playlistTitle(entry)}»?`))) return;
+        await invoke("delete_playlist", { id: entry.id });
+        if (currentLocalPlaylistId === entry.id) {
+          currentLocalPlaylistId = null;
+          trackList = [];
+          trackListKey = null;
+          refresh();
+        }
+        await loadPlaylistStore();
+      },
+    });
+  }
+  openContextMenu(x, y, items);
+}
+
+/* ---------- small dialogs (rename, new playlist, confirm) ---------- */
+
+function askPlaylistTitle(initial) {
+  return new Promise((resolve) => {
+    const wrap = document.createElement("div");
+    wrap.className = "modal-backdrop";
+    const box = document.createElement("div");
+    box.className = "modal-box";
+    const label = document.createElement("div");
+    label.className = "modal-title";
+    label.textContent = "Название плейлиста";
+    const input = document.createElement("input");
+    input.className = "modal-input";
+    input.value = initial || "";
+    const hint = document.createElement("p");
+    hint.className = "hint";
+    hint.textContent = "Пустое имя вернёт название из источника.";
+    const row = document.createElement("div");
+    row.className = "modal-actions";
+    const cancel = document.createElement("button");
+    cancel.className = "btn";
+    cancel.textContent = "Отмена";
+    const ok = document.createElement("button");
+    ok.className = "btn primary";
+    ok.textContent = "Сохранить";
+    row.append(cancel, ok);
+    box.append(label, input, hint, row);
+    wrap.appendChild(box);
+    document.body.appendChild(wrap);
+    input.focus();
+    input.select();
+
+    const done = (value) => {
+      wrap.remove();
+      resolve(value);
+    };
+    cancel.onclick = () => done(null);
+    ok.onclick = () => done(input.value);
+    input.onkeydown = (e) => {
+      if (e.key === "Enter") done(input.value);
+      if (e.key === "Escape") done(null);
+    };
+    wrap.onclick = (e) => {
+      if (e.target === wrap) done(null);
+    };
+  });
+}
+
+function askConfirm(text) {
+  return new Promise((resolve) => {
+    const wrap = document.createElement("div");
+    wrap.className = "modal-backdrop";
+    const box = document.createElement("div");
+    box.className = "modal-box";
+    const label = document.createElement("div");
+    label.className = "modal-title";
+    label.textContent = text;
+    const row = document.createElement("div");
+    row.className = "modal-actions";
+    const cancel = document.createElement("button");
+    cancel.className = "btn";
+    cancel.textContent = "Отмена";
+    const ok = document.createElement("button");
+    ok.className = "btn danger";
+    ok.textContent = "Удалить";
+    row.append(cancel, ok);
+    box.append(label, row);
+    wrap.appendChild(box);
+    document.body.appendChild(wrap);
+    const done = (value) => {
+      wrap.remove();
+      resolve(value);
+    };
+    cancel.onclick = () => done(false);
+    ok.onclick = () => done(true);
+    wrap.onclick = (e) => {
+      if (e.target === wrap) done(false);
+    };
+  });
+}
+
+async function createCustomPlaylist() {
+  const title = await askPlaylistTitle("");
+  if (title === null) return;
+  const id = await invoke("create_playlist", { title });
+  await loadPlaylistStore();
+  const entry = allPlaylists().find((p) => p.id === id);
+  if (entry) await openSidebarPlaylist(entry);
+}
+
 /* ---------- local playlists ---------- */
 
 function renderPlaylists(library) {
-  const el = $("playlists");
-  el.innerHTML = "";
-  library.forEach((pl, i) => {
-    const div = document.createElement("div");
-    div.className = "item";
-    div.innerHTML = `<span>${escapeHtml(pl.name)}</span> <span class="count">(${pl.tracks})</span>`;
-    div.onclick = async () => {
-      try {
-        hideError();
-        const infos = await invoke("open_playlist", { index: i });
-        trackList = infos.map((t) => ({
-          title: t.title,
-          artist: t.artist,
-          duration: t.duration,
-        }));
-        trackListKey = null;
-        const coverPath = (infos.find((t) => t.cover) || {}).cover;
-        setListHeader({
-          title: pl.name,
-          subtitle: `${infos.length} tracks`,
-          cover: coverPath ? convertFileSrc(coverPath) : "",
-        });
-        setMode("local");
-        refresh();
-      } catch (e) {
-        showError(e);
-      }
-    };
-    el.appendChild(div);
-  });
+  localPlaylists = library.map((pl, i) => ({
+    id: pl.id || `local:index:${i}`,
+    name: pl.name,
+    tracks: pl.tracks,
+    index: i,
+  }));
+  renderSidebar();
 }
 
 async function loadLibrary() {
@@ -1271,47 +1644,32 @@ let ytPlaylistsLoaded = false;
 /// the same list as the local folders, separated by a hairline.
 async function loadUserPlaylists() {
   const el = $("yt-user-playlists");
+  el.innerHTML = "";
   try {
     const status = await invoke("get_api_status");
     if ((status.session_state || "signed_out") !== "active") {
-      el.innerHTML = "";
+      ytPlaylists = [];
       ytPlaylistsLoaded = false;
+      renderSidebar();
       return;
     }
     const playlists = await invoke("get_user_playlists");
     ytPlaylistsLoaded = true;
-    el.innerHTML = "";
-    playlists.forEach((p) => {
-      const div = document.createElement("div");
-      div.className = "item";
-      const thumb = p.thumbnail
-        ? `<img class="yt-thumb" src="${escapeHtml(p.thumbnail)}" loading="lazy" alt="" />`
-        : "";
-      div.innerHTML = `${thumb}<span>${escapeHtml(p.name)}</span> <span class="count">(${p.track_count})</span>`;
-      div.onclick = async () => {
-        try {
-          hideError();
-          await loadTrackPages(
-            "get_playlist_tracks",
-            { playlistId: p.id },
-            (tracks, total) => ({
-              title: p.name,
-              subtitle: `${total || p.track_count || tracks.length} tracks`,
-              cover: p.thumbnail || (tracks[0] ? tracks[0].thumbnail || "" : ""),
-            })
-          );
-          $("yt-more-btn").classList.add("hidden");
-        } catch (e) {
-          showError(playlistError(e));
-        }
-      };
-      el.appendChild(div);
-    });
+    ytPlaylists = playlists.map((p) => ({
+      id: `yt:${p.id}`,
+      ytId: p.id,
+      name: p.name,
+      tracks: p.track_count,
+      thumbnail: p.thumbnail || "",
+    }));
+    renderSidebar();
   } catch (e) {
     // No session (or the sidecar is down): the local folders still work, so a
     // banner would be noise.
     ytPlaylistsLoaded = false;
+    ytPlaylists = [];
     el.innerHTML = "";
+    renderSidebar();
     console.warn("could not load the account playlists:", String(e));
   }
 }
@@ -1533,6 +1891,8 @@ $("yt-logout-btn").onclick = async () => {
 async function loadSettings() {
   try {
     const s = await invoke("get_settings");
+    applyDeveloperMode(s.developer_mode);
+    loadPlaylistStore();
     const radio = document.querySelector(`input[name="quality"][value="${s.audio_quality}"]`);
     if (radio) radio.checked = true;
     const norm = document.querySelector(`input[name="normlevel"][value="${s.normalize_level || "medium"}"]`);
@@ -1668,6 +2028,35 @@ volumeEl.addEventListener("change", () => {
   volumeDragging = false;
 });
 
+/* ---------- developer mode ---------- */
+
+let devMode = false;
+
+// The native WebView menu (Back, Reload, Save as, Inspect) is noise in a music
+// player and lets anyone peek at the internals: it stays off unless the user
+// turns the developer mode on.
+document.addEventListener(
+  "contextmenu",
+  (e) => {
+    if (!devMode) e.preventDefault();
+  },
+  true
+);
+
+function applyDeveloperMode(enabled) {
+  devMode = !!enabled;
+  const box = $("opt-dev-mode");
+  if (box) box.checked = devMode;
+}
+
+window.addEventListener("keydown", (e) => {
+  if (!devMode) return;
+  if (e.code === "F12" || (e.ctrlKey && e.shiftKey && e.code === "KeyI")) {
+    e.preventDefault();
+    invoke("open_devtools").catch(() => {});
+  }
+});
+
 /* ---------- proxy ---------- */
 
 const proxyModeEl = $("opt-proxy-mode");
@@ -1703,6 +2092,16 @@ async function loadProxy() {
 
 proxyModeEl.addEventListener("change", () => {
   renderProxy(Object.assign({}, proxyInfo, { mode: proxyModeEl.value }));
+});
+
+$("opt-dev-mode").addEventListener("change", async (e) => {
+  const on = e.target.checked;
+  applyDeveloperMode(on);
+  try {
+    await invoke("set_developer_mode", { enabled: on });
+  } catch (err) {
+    showError(err);
+  }
 });
 
 $("btn-proxy-apply").onclick = async () => {
@@ -1799,6 +2198,34 @@ function buildRow(entry, i) {
     `<div class="t-title">${escapeHtml(row.title)}</div>` +
     `<div class="t-artist">${escapeHtml(row.artist || "")}</div>` +
     `<div class="t-dur">${dur}</div>`;
+  div.addEventListener("contextmenu", (e) => {
+    const items = [];
+    if (row.path) {
+      items.push({
+        label: "Добавить в плейлист…",
+        run: () => addTrackToPlaylist(row.path),
+      });
+    }
+    if (currentLocalPlaylistId && String(currentLocalPlaylistId).startsWith("custom:")) {
+      items.push({
+        label: "Убрать из плейлиста",
+        danger: true,
+        run: async () => {
+          await invoke("remove_track_from_playlist", {
+            id: currentLocalPlaylistId,
+            index: entry.orig,
+          });
+          const infos = await invoke("open_custom_playlist", { id: currentLocalPlaylistId });
+          applyLocalTrackList(infos, $("list-title") ? $("list-title").textContent : "");
+          await loadPlaylistStore();
+        },
+      });
+    }
+    if (!items.length) return;
+    e.preventDefault();
+    e.stopPropagation();
+    openContextMenu(e.clientX, e.clientY, items);
+  });
   div.onclick = () => {
     const orig = entry.orig;
     if (mode === "youtube") {
@@ -1876,6 +2303,7 @@ async function refreshTracks(key, activeIndex) {
       title: t.title,
       artist: t.artist,
       duration: t.duration,
+      path: t.path,
     }));
     trackListKey = key;
     renderTracks($("tracks"), applyFilterSort(trackList, key), activeIndex, key + ":" + filterText + ":" + sortMode);
@@ -2475,3 +2903,37 @@ schedulePoll();
 setInterval(pollApiStatus, 3000);
 setInterval(tickProgress, 250);
 
+/// Adds one file to one of the user's playlists, creating one if asked.
+async function addTrackToPlaylist(path) {
+  const lists = (playlistStore.custom || []).filter((c) => c.id !== currentLocalPlaylistId);
+  const items = lists.map((c) => ({
+    label: `${c.title} (${(c.tracks || []).length})`,
+    run: async () => {
+      const added = await invoke("add_tracks_to_playlist", { id: c.id, paths: [path] });
+      await loadPlaylistStore();
+      if (!added) showError("этот трек уже есть в плейлисте");
+    },
+  }));
+  items.push({
+    label: "＋ Новый плейлист…",
+    run: async () => {
+      const title = await askPlaylistTitle("");
+      if (title === null) return;
+      const id = await invoke("create_playlist", { title });
+      await invoke("add_tracks_to_playlist", { id, paths: [path] });
+      await loadPlaylistStore();
+    },
+  });
+  openContextMenu(lastCtxX, lastCtxY, items);
+}
+
+let lastCtxX = 0;
+let lastCtxY = 0;
+document.addEventListener(
+  "contextmenu",
+  (e) => {
+    lastCtxX = e.clientX;
+    lastCtxY = e.clientY;
+  },
+  true
+);

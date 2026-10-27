@@ -2061,3 +2061,121 @@ input[type="range"]::-moz-range-thumb {
   color: var(--fg-dim);
   overflow-wrap: anywhere;
 }
+
+/* Sidebar groups, pins and the hidden folder. */
+.pl-group {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--fg-dim);
+  padding: 10px 6px 4px;
+  user-select: none;
+}
+
+.pl-hidden-toggle {
+  cursor: pointer;
+  text-transform: none;
+  letter-spacing: 0;
+  font-size: 12px;
+}
+
+.pl-hidden-toggle:hover {
+  color: var(--fg);
+}
+
+.pl-item .pin-mark {
+  font-size: 10px;
+  margin-right: 4px;
+  opacity: 0.9;
+}
+
+.pl-item .pl-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pl-new {
+  width: 100%;
+  margin-top: 8px;
+  font-size: 12px;
+  padding: 6px 8px;
+  text-align: left;
+}
+
+/* Our own context menu (the native one is disabled outside dev mode). */
+.ctx-menu {
+  position: fixed;
+  z-index: 999;
+  min-width: 190px;
+  padding: 6px;
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 12px 32px rgb(0 0 0 / 0.45);
+}
+
+.ctx-item {
+  padding: 7px 10px;
+  border-radius: 7px;
+  font-size: 13px;
+  color: var(--fg);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.ctx-item:hover {
+  background: var(--bg3);
+}
+
+.ctx-item.danger {
+  color: var(--red);
+}
+
+/* Tiny modal for rename / new playlist / confirm. */
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgb(0 0 0 / 0.55);
+}
+
+.modal-box {
+  width: min(420px, 90vw);
+  padding: 18px;
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  box-shadow: 0 24px 60px rgb(0 0 0 / 0.5);
+}
+
+.modal-title {
+  font-size: 15px;
+  font-weight: 600;
+  margin-bottom: 10px;
+}
+
+.modal-input {
+  width: 100%;
+  padding: 9px 11px;
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  font-size: 14px;
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+.btn.danger {
+  color: var(--red);
+  border-color: var(--red);
+}
