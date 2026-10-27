@@ -361,7 +361,10 @@ class PlayerApiServicer(player_api_pb2_grpc.PlayerApiServicer):
 
     def GetPlaylistTracks(self, request, context):
         result = youtube.playlist_tracks(
-            request.id, offset=request.offset, limit=request.limit
+            request.id,
+            offset=request.offset,
+            limit=request.limit,
+            refresh=request.refresh,
         )
         return player_api_pb2.PlaylistTracksResponse(
             tracks=[_to_pb_track(t) for t in result.get("tracks", [])],

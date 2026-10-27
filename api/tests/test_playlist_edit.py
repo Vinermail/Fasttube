@@ -37,6 +37,9 @@ class Client:
     def rate_playlist(self, playlist_id, rating):
         return self._answer("rate", playlist_id, rating)
 
+    def get_playlist(self, playlist_id, limit=None, **_):
+        return self._answer("read", playlist_id)
+
 
 def use(monkeypatch, client, *, owned: bool | None = True, playlist_id="PL1"):
     monkeypatch.setattr(youtube, "_session_client", lambda: client)
@@ -218,3 +221,47 @@ def test_a_background_load_started_before_a_reset_cannot_store(monkeypatch):
     time.sleep(0.45)
 
     assert youtube._PLAYLISTS == {}, "the stale load must not resurrect the cache"
+
+
+def test_a_succeeded_add_without_ids_reads_the_rows_back(monkeypatch):
+    # YouTube sometimes says SUCCEEDED without naming the new rows.
+    client = Client(
+        {
+            "add": {"status": "STATUS_SUCCEEDED", "playlistEditResults": []},
+            # The shape ytmusicapi's own parser produces for a browse page.
+            "read": {
+                "trackCount": 1,
+                "tracks": [
+                    {
+                        "videoId": "v1",
+                        "title": "One",
+                        "artists": [{"name": "Somebody"}],
+                        "duration_seconds": 200,
+                        "setVideoId": "sv1",
+                    }
+                ],
+            },
+        }
+    )
+    use(monkeypatch, client)
+
+    result = youtube.add_playlist_items("PL1", ["v1"])
+
+    assert result["ok"] is True
+    assert result["items"] == [{"video_id": "v1", "set_video_id": "sv1"}]
+    assert ("read", "PL1") in client.calls
+
+
+def test_a_succeeded_add_that_is_not_there_is_reported(monkeypatch):
+    client = Client(
+        {
+            "add": {"status": "STATUS_SUCCEEDED", "playlistEditResults": []},
+            "read": {"trackCount": 0, "tracks": []},
+        }
+    )
+    use(monkeypatch, client)
+
+    result = youtube.add_playlist_items("PL1", ["v1"])
+
+    assert result["ok"] is False
+    assert "не подтвердил" in result["error"]

@@ -15,6 +15,8 @@ mod queue;
 mod secrets;
 mod sidecar;
 mod sync;
+#[cfg(test)]
+mod acceptance;
 
 use downloader::ProgressHandle;
 use engine::{Cmd, EngineHandle, Snapshot};

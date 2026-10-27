@@ -269,10 +269,28 @@ pub async fn get_user_playlists() -> Result<UserPlaylistsResponse> {
 }
 
 /// One page of a playlist. `limit == 0` means "the default page".
+/// `refresh` asks the sidecar to drop its in-memory copy and read YouTube again.
+pub async fn get_playlist_tracks_fresh(
+    playlist_id: &str,
+    offset: i32,
+    limit: i32,
+) -> Result<PlaylistTracksResponse> {
+    get_playlist_tracks_opts(playlist_id, offset, limit, true).await
+}
+
 pub async fn get_playlist_tracks(
     playlist_id: &str,
     offset: i32,
     limit: i32,
+) -> Result<PlaylistTracksResponse> {
+    get_playlist_tracks_opts(playlist_id, offset, limit, false).await
+}
+
+async fn get_playlist_tracks_opts(
+    playlist_id: &str,
+    offset: i32,
+    limit: i32,
+    refresh: bool,
 ) -> Result<PlaylistTracksResponse> {
     let mut client = connect().await?;
     let resp = client
@@ -281,6 +299,7 @@ pub async fn get_playlist_tracks(
                 id: playlist_id.to_string(),
                 offset,
                 limit,
+                refresh,
             },
             PLAYLIST_TIMEOUT,
         ))

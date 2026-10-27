@@ -177,7 +177,9 @@ impl PlaylistApi for GrpcApi {
         let mut tracks = Vec::new();
         let mut offset = 0;
         let (total, owned) = loop {
-            let page = tauri::async_runtime::block_on(grpc::get_playlist_tracks(
+            // Revalidation must see YouTube, not the sidecar's copy: this is the
+            // read that turns "someone changed it on the phone" into a diff.
+            let page = tauri::async_runtime::block_on(grpc::get_playlist_tracks_fresh(
                 playlist_id, offset, 200,
             ))
             .map_err(|e| classify(&e.to_string()))?;

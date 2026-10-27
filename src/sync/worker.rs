@@ -137,6 +137,15 @@ impl<A: PlaylistApi> SyncEngine<A> {
         }
     }
 
+    /// How much work is still waiting (the acceptance test asks).
+    #[cfg(test)]
+    pub fn pending_ops(&self) -> usize {
+        self.ops
+            .iter()
+            .filter(|op| op.state == OpState::Pending || op.state == OpState::Running)
+            .count()
+    }
+
     pub fn status(&self, playlist_id: &str) -> SyncStatus {
         let pending = self
             .ops

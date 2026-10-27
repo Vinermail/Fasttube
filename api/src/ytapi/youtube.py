@@ -160,6 +160,8 @@ def _refuse_unowned(playlist_id: str) -> dict | None:
 
 def _playlist_owned(playlist_id: str) -> bool | None:
     with _playlist_lock:
+        if playlist_id in _OWNED:
+            return _OWNED[playlist_id]
         entry = _PLAYLISTS.get(f"playlist:{playlist_id}")
         return None if entry is None else bool(entry.get("owned"))
 
@@ -237,6 +239,12 @@ def create_account_playlist(title: str) -> dict:
     if not isinstance(created, str) or not created:
         return {"ok": False, "error": "YouTube не вернул id плейлиста", "id": ""}
     invalidate_account_caches()
+    # A brand-new playlist has no rows, and YouTube answers its browse page with
+    # something the parser cannot read. Seed the cache so the first open shows an
+    # empty list that the account owns instead of an error.
+    with _playlist_lock:
+        _OWNED[created] = True
+    _store_playlist(f"playlist:{created}", [], 0, True, True, _generation())
     return {"ok": True, "error": "", "id": created}
 
 
@@ -253,7 +261,9 @@ def delete_account_playlist(playlist_id: str) -> dict:
     except Exception as e:
         log.exception("delete_playlist failed")
         return {"ok": False, "error": str(e)}
-    ok, status = _edit_status(result)
+    # The delete endpoint answers with a bare responseContext and no status when
+    # it works, so "no status" here means "no refusal".
+    ok, status = _edit_status(result, lenient=True)
     if not ok:
         return {"ok": False, "error": f"YouTube не подтвердил удаление: {status}"}
     invalidate_account_caches()
@@ -307,7 +317,34 @@ def add_playlist_items(
             continue
         ok, status = _edit_status(result)
         if ok:
-            created.extend(_added_items(result))
+            named = _added_items(result)
+            if named:
+                created.extend(named)
+            else:
+                # The answer did not list the new rows (it does for some
+                # playlists only): read the playlist back and find them.
+                try:
+                    rows = _fresh_rows(ytm, playlist_id)
+                except Exception as e:
+                    # The status said it worked; an unreadable read-back is not
+                    # proof otherwise, so the add stands.
+                    log.warning("cannot read back %s after an add: %s", playlist_id, e)
+                    rows = None
+                if rows is not None:
+                    wanted_here = set(chunk)
+                    for row in rows:
+                        video = row.get("video_id", "")
+                        if video in wanted_here:
+                            wanted_here.discard(video)
+                            created.append(
+                                {
+                                    "video_id": video,
+                                    "set_video_id": row.get("set_video_id", ""),
+                                }
+                            )
+                    if wanted_here:
+                        failed.extend(sorted(wanted_here))
+                        first_error = first_error or "YouTube не подтвердил добавление"
             continue
         failed.extend(chunk)
         first_error = first_error or (
@@ -328,6 +365,19 @@ def add_playlist_items(
             "video_ids": failed,
         }
     return {"ok": True, "error": "", "items": created, "video_ids": []}
+
+
+def _fresh_rows(ytm, playlist_id: str, limit: int = 300) -> list[dict]:
+    """Rows straight from YouTube: the cache is dropped first."""
+    with _playlist_lock:
+        _PLAYLISTS.pop(f"playlist:{playlist_id}", None)
+    try:
+        data = ytm.get_playlist(playlist_id, limit=limit) or {}
+    except Exception as e:
+        if _looks_empty(e):
+            return []
+        raise
+    return _playlist_rows(data)
 
 
 def _cache_after_add(entry: dict, created: list[dict]) -> None:
@@ -611,6 +661,8 @@ def invalidate_account_caches() -> None:
         _LIB_CACHE.clear()
     with _home_lock:
         _HOME_CACHE.clear()
+    with _playlist_lock:
+        _OWNED.clear()
     # Also bumps the generation, so a background playlist load that started
     # before this reset cannot store the previous account's tracks.
     invalidate_playlists()
@@ -1894,6 +1946,10 @@ _playlist_lock = threading.Lock()
 # "playlist:<id>" / "liked" -> {"tracks", "total", "owned", "complete", "at",
 # "loading", "done"}
 _PLAYLISTS: dict[str, dict] = {}
+# playlist id -> True/False. Ownership is a fact about the account, not about the
+# page in hand: an empty playlist has no page to read it from, and a refresh must
+# not forget it.
+_OWNED: dict[str, bool] = {}
 
 # Bumped by every account invalidation. A background load remembers the value
 # it started with, so a fetch that began before a logout/session change cannot
@@ -1998,6 +2054,7 @@ def _forget_playlist(playlist_id: str) -> None:
     """Drops one playlist's page cache (after it was edited or deleted)."""
     with _playlist_lock:
         _PLAYLISTS.pop(f"playlist:{playlist_id}", None)
+        _OWNED.pop(playlist_id, None)
 
 
 def _is_mix(playlist_id: str) -> bool:
@@ -2049,26 +2106,56 @@ def _fetch_playlist_page(
             data = ytm.get_playlist(playlist_id, limit=limit) or {}
             tracks = _playlist_rows(data)
         return tracks, len(tracks), False
-    data = ytm.get_playlist(playlist_id, limit=limit) or {}
+    try:
+        data = ytm.get_playlist(playlist_id, limit=limit) or {}
+    except Exception as e:
+        # An empty playlist (or one just created) has no "contents" to parse.
+        if _looks_empty(e):
+            log.info("playlist %s reads as empty: %s", playlist_id, e)
+            entry = _playlist_state(f"playlist:{playlist_id}") or {}
+            owned = _OWNED.get(playlist_id, bool(entry.get("owned")))
+            return [], 0, owned
+        raise
     tracks = _playlist_rows(data)
     total = int(data.get("trackCount") or 0) or len(tracks)
-    return tracks, max(total, len(tracks)), bool(data.get("owned"))
+    owned = bool(data.get("owned"))
+    with _playlist_lock:
+        _OWNED[playlist_id] = owned
+    return tracks, max(total, len(tracks)), owned
+
+
+def _looks_empty(error: Exception) -> bool:
+    text = str(error)
+    return "Unable to find 'contents'" in text or isinstance(error, KeyError)
 
 
 def _fetch_playlist_all(ytm, playlist_id: str) -> tuple[list[dict], int, bool]:
     if _is_mix(playlist_id):
         return _fetch_playlist_page(ytm, playlist_id, MIX_TRACK_LIMIT)
-    data = ytm.get_playlist(playlist_id, limit=None) or {}
+    try:
+        data = ytm.get_playlist(playlist_id, limit=None) or {}
+    except Exception as e:
+        if _looks_empty(e):
+            log.info("playlist %s reads as empty on the full load: %s", playlist_id, e)
+            return [], 0, False
+        raise
     tracks = _playlist_rows(data)
     total = max(int(data.get("trackCount") or 0), len(tracks))
     return tracks, total, bool(data.get("owned"))
 
 
-def playlist_tracks(playlist_id: str, offset: int = 0, limit: int = PLAYLIST_PAGE) -> dict:
+def playlist_tracks(
+    playlist_id: str,
+    offset: int = 0,
+    limit: int = PLAYLIST_PAGE,
+    refresh: bool = False,
+) -> dict:
     """One page of a playlist.
 
     The first call asks YouTube for a single page and starts a background fetch
     of the rest, so the UI can draw immediately; later calls slice memory.
+    `refresh` throws that copy away first: revalidation must see YouTube, not a
+    page that may be hours old.
     """
     if _session_client() is None:
         return {"tracks": [], "error": "sign in to YouTube in the app", "total": 0}
@@ -2076,6 +2163,9 @@ def playlist_tracks(playlist_id: str, offset: int = 0, limit: int = PLAYLIST_PAG
     offset = max(0, int(offset or 0))
     limit = max(1, min(int(limit or PLAYLIST_PAGE), 500))
     key = f"playlist:{playlist_id}"
+    if refresh:
+        with _playlist_lock:
+            _PLAYLISTS.pop(key, None)
     entry = _playlist_state(key)
     if entry is None:
         try:

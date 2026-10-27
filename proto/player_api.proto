@@ -248,6 +248,8 @@ message PlaylistTracksRequest {
   // Paging: the UI draws the first page and asks for the rest while it loads.
   int32 offset = 2;
   int32 limit = 3;
+  // Read YouTube again instead of serving the in-memory copy (revalidation).
+  bool refresh = 4;
 }
 
 message LikedSongsRequest {
