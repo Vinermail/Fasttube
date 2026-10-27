@@ -112,6 +112,9 @@ struct SearchTrack {
     /// YouTube's per-item id inside a playlist ("" outside one).
     #[serde(default)]
     set_video_id: String,
+    /// "LIKE" / "DISLIKE" / "" as YouTube reports it for this row.
+    #[serde(default)]
+    like_status: String,
 }
 
 #[derive(Serialize, Clone)]
@@ -1033,22 +1036,194 @@ fn playlist_add_tracks(
     Ok(())
 }
 
+#[derive(Deserialize)]
+struct RemovedRowDto {
+    #[serde(default)]
+    video_id: String,
+    #[serde(default)]
+    set_video_id: String,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    artist: String,
+    #[serde(default)]
+    duration: f64,
+    #[serde(default)]
+    thumbnail: String,
+    #[serde(default)]
+    like_status: String,
+    #[serde(default)]
+    index: usize,
+}
+
+/// Removes a row; `delay_ms` holds the request back so an undo can still catch
+/// it. Returns the operation id the undo needs.
 #[tauri::command]
 fn playlist_remove_track(
     playlist_id: String,
-    video_id: String,
-    set_video_id: String,
+    row: RemovedRowDto,
+    delay_ms: Option<u64>,
+    state: tauri::State<AppState>,
+) -> Result<String, String> {
+    let service = state.sync.lock().clone().ok_or("sync is not ready")?;
+    let now = now_secs();
+    let mut op = sync::Op::new(
+        sync::OpKind::Remove,
+        &playlist_id,
+        "",
+        serde_json::json!({
+            "video_id": row.video_id,
+            "set_video_id": row.set_video_id,
+            "title": row.title,
+            "artist": row.artist,
+            "duration": row.duration,
+            "thumbnail": row.thumbnail,
+            "like_status": row.like_status,
+            "index": row.index,
+        }),
+        now,
+    );
+    op.not_before = now + (delay_ms.unwrap_or(0) as f64) / 1000.0;
+    let id = op.id.clone();
+    service.enqueue(op);
+    Ok(id)
+}
+
+/// The undo of a removal: no request ever leaves the machine.
+#[tauri::command]
+fn playlist_undo_remove(op_id: String, state: tauri::State<AppState>) -> bool {
+    match state.sync.lock().clone() {
+        Some(service) => service.undo_remove(&op_id),
+        None => false,
+    }
+}
+
+#[tauri::command]
+fn playlist_edit_meta(
+    playlist_id: String,
+    title: String,
+    description: String,
+    privacy: String,
     state: tauri::State<AppState>,
 ) -> Result<(), String> {
     let service = state.sync.lock().clone().ok_or("sync is not ready")?;
     service.enqueue(sync::Op::new(
-        sync::OpKind::Remove,
+        sync::OpKind::Meta,
         &playlist_id,
         "",
-        serde_json::json!({ "video_id": video_id, "set_video_id": set_video_id }),
+        serde_json::json!({
+            "title": title,
+            "description": description,
+            "privacy": privacy,
+        }),
         now_secs(),
     ));
     Ok(())
+}
+
+#[tauri::command]
+fn playlist_delete(playlist_id: String, state: tauri::State<AppState>) -> Result<(), String> {
+    let service = state.sync.lock().clone().ok_or("sync is not ready")?;
+    service.enqueue(sync::Op::new(
+        sync::OpKind::Delete,
+        &playlist_id,
+        "",
+        serde_json::json!({}),
+        now_secs(),
+    ));
+    Ok(())
+}
+
+/// Removes a row of a playlist the user built, by key, and returns where it was.
+#[tauri::command]
+fn remove_item_from_playlist(
+    id: String,
+    key: String,
+    state: tauri::State<AppState>,
+) -> Result<Option<usize>, String> {
+    let (at, snapshot) = {
+        let mut store = state.playlists.lock();
+        let at = store.remove_item(&id, &key).map(|(at, _)| at);
+        (at, store.clone())
+    };
+    if at.is_none() {
+        return Ok(None);
+    }
+    save_playlist_store(&snapshot);
+    Ok(at)
+}
+
+#[tauri::command]
+fn insert_item_into_playlist(
+    id: String,
+    index: usize,
+    item: playlists_store::PlaylistItem,
+    state: tauri::State<AppState>,
+) -> Result<bool, String> {
+    let (done, snapshot) = {
+        let mut store = state.playlists.lock();
+        let done = store.insert_item(&id, index, item);
+        (done, store.clone())
+    };
+    if done {
+        save_playlist_store(&snapshot);
+    }
+    Ok(done)
+}
+
+#[tauri::command]
+fn move_item_in_playlist(
+    id: String,
+    key: String,
+    before: String,
+    state: tauri::State<AppState>,
+) -> Result<bool, String> {
+    let (done, snapshot) = {
+        let mut store = state.playlists.lock();
+        let done = store.move_item_before(&id, &key, &before);
+        (done, store.clone())
+    };
+    if done {
+        save_playlist_store(&snapshot);
+    }
+    Ok(done)
+}
+
+/// Puts a deleted playlist back exactly as it was (the undo of a deletion).
+#[tauri::command]
+fn restore_custom_playlist(
+    playlist: playlists_store::CustomPlaylist,
+    pinned: bool,
+    hidden: bool,
+    meta: Option<playlists_store::PlaylistMeta>,
+    state: tauri::State<AppState>,
+) -> Result<(), String> {
+    let snapshot = {
+        let mut store = state.playlists.lock();
+        store.restore_custom(playlist, pinned, hidden, meta);
+        store.clone()
+    };
+    save_playlist_store(&snapshot);
+    Ok(())
+}
+
+/// Moves a row inside one of the user's own playlists.
+#[tauri::command]
+fn move_track_in_playlist(
+    id: String,
+    from: usize,
+    to: usize,
+    state: tauri::State<AppState>,
+) -> Result<bool, String> {
+    let (moved, snapshot) = {
+        let mut store = state.playlists.lock();
+        let moved = store.move_track(&id, from, to);
+        (moved, store.clone())
+    };
+    if moved {
+        save_playlist_store(&snapshot);
+    }
+    Ok(moved)
 }
 
 #[tauri::command]
@@ -2348,6 +2523,7 @@ fn to_search_track(t: grpc::Track) -> SearchTrack {
         duration_secs: t.duration_secs,
         thumbnail: t.thumbnail,
         set_video_id: t.set_video_id,
+        like_status: t.like_status,
     }
 }
 
@@ -4197,6 +4373,14 @@ fn main() {
             set_open_playlist,
             playlist_add_tracks,
             playlist_remove_track,
+            playlist_undo_remove,
+            playlist_edit_meta,
+            playlist_delete,
+            move_track_in_playlist,
+            remove_item_from_playlist,
+            insert_item_into_playlist,
+            move_item_in_playlist,
+            restore_custom_playlist,
             playlist_move_track,
             playlist_rate_song,
             playlist_library,

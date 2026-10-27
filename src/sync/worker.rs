@@ -224,6 +224,43 @@ impl<A: PlaylistApi> SyncEngine<A> {
         }]
     }
 
+    /// Takes a pending operation back out of the journal (the undo of a
+    /// deferred removal) and returns it, so the caller can restore the row.
+    pub fn cancel(&mut self, op_id: &str) -> Option<Op> {
+        let position = self.ops.iter().position(|op| op.id == op_id)?;
+        if self.ops[position].state != OpState::Pending {
+            return None;
+        }
+        let op = self.ops.remove(position);
+        self.save();
+        Some(op)
+    }
+
+    /// Puts a row back into a playlist snapshot (undo of a removal).
+    pub fn restore_row(&mut self, playlist_id: &str, index: usize, track: SnapshotTrack) -> bool {
+        let Some(mut snapshot) = self.store.load(playlist_id) else {
+            return false;
+        };
+        let already_there = if track.set_video_id.is_empty() {
+            snapshot
+                .tracks
+                .iter()
+                .any(|t| t.video_id == track.video_id && t.set_video_id.is_empty())
+        } else {
+            snapshot
+                .tracks
+                .iter()
+                .any(|t| t.set_video_id == track.set_video_id)
+        };
+        if already_there {
+            return false;
+        }
+        let at = index.min(snapshot.tracks.len());
+        snapshot.tracks.insert(at, track);
+        let _ = self.store.save(playlist_id, &snapshot);
+        true
+    }
+
     /// The user's action: applied to the snapshot now, queued for YouTube.
     pub fn enqueue(&mut self, mut op: Op) -> Vec<SyncEvent> {
         op.account_id = self.account.clone();
@@ -838,6 +875,55 @@ mod tests {
             engine.snapshot("PL").is_none(),
             "a different account must not see the previous snapshots"
         );
+        let _ = std::fs::remove_dir_all(store.base());
+    }
+
+    #[test]
+    fn a_deferred_removal_waits_and_can_be_taken_back() {
+        let api = FakeApi::default();
+        let (mut engine, clock, store) = engine("undo", api);
+        store.save("PL", &snapshot(&[("a", "sa"), ("b", "sb")])).unwrap();
+
+        let mut op = Op::new(
+            OpKind::Remove,
+            "PL",
+            "acc",
+            serde_json::json!({
+                "video_id": "a",
+                "set_video_id": "sa",
+                "title": "A",
+                "index": 0,
+            }),
+            1000.0,
+        );
+        op.not_before = 1008.0;
+        let id = op.id.clone();
+        engine.enqueue(op);
+
+        engine.tick();
+        assert!(
+            engine.api().calls().is_empty(),
+            "a deferred removal must not touch the network yet"
+        );
+        let taken = engine.cancel(&id).expect("still pending");
+        assert_eq!(taken.playlist_id, "PL");
+        assert!(engine.restore_row(
+            "PL",
+            0,
+            SnapshotTrack {
+                video_id: "a".into(),
+                set_video_id: "sa".into(),
+                title: "A".into(),
+                ..Default::default()
+            },
+        ));
+
+        let snapshot = engine.snapshot("PL").unwrap();
+        assert_eq!(snapshot.tracks.len(), 2, "the row is back where it was");
+        assert_eq!(snapshot.tracks[0].video_id, "a");
+        assert!(engine.api().calls().is_empty(), "undo is local");
+        assert!(engine.cancel(&id).is_none(), "a second undo is a no-op");
+        let _ = clock;
         let _ = std::fs::remove_dir_all(store.base());
     }
 

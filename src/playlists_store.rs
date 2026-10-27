@@ -283,6 +283,88 @@ impl Store {
         added
     }
 
+    /// Takes a row out by key; returns where it was and the row itself, which
+    /// is what an undo needs to put it back.
+    pub fn remove_item(&mut self, id: &str, key: &str) -> Option<(usize, PlaylistItem)> {
+        let list = self.custom_by_id_mut(id)?;
+        let at = list.tracks.iter().position(|t| t.key() == key)?;
+        Some((at, list.tracks.remove(at)))
+    }
+
+    pub fn insert_item(&mut self, id: &str, index: usize, item: PlaylistItem) -> bool {
+        let Some(list) = self.custom_by_id_mut(id) else {
+            return false;
+        };
+        if list.tracks.iter().any(|t| t.key() == item.key()) {
+            return false;
+        }
+        list.tracks.insert(index.min(list.tracks.len()), item);
+        true
+    }
+
+    /// Moves a row in front of another one; an empty `before` means the end.
+    pub fn move_item_before(&mut self, id: &str, key: &str, before: &str) -> bool {
+        let Some(list) = self.custom_by_id_mut(id) else {
+            return false;
+        };
+        let Some(from) = list.tracks.iter().position(|t| t.key() == key) else {
+            return false;
+        };
+        if key == before {
+            return false;
+        }
+        let item = list.tracks.remove(from);
+        let to = if before.is_empty() {
+            list.tracks.len()
+        } else {
+            match list.tracks.iter().position(|t| t.key() == before) {
+                Some(at) => at,
+                None => {
+                    list.tracks.insert(from, item);
+                    return false;
+                }
+            }
+        };
+        list.tracks.insert(to, item);
+        true
+    }
+
+    /// Puts a whole playlist back (undo of a deletion).
+    pub fn restore_custom(
+        &mut self,
+        playlist: CustomPlaylist,
+        pinned: bool,
+        hidden: bool,
+        meta: Option<PlaylistMeta>,
+    ) {
+        if !self.custom.iter().any(|c| c.id == playlist.id) {
+            self.custom.push(playlist.clone());
+        }
+        let id = playlist.id.clone();
+        if pinned && !self.pinned.contains(&id) {
+            self.pinned.push(id.clone());
+        }
+        if hidden && !self.hidden.contains(&id) {
+            self.hidden.push(id.clone());
+        }
+        if let Some(meta) = meta {
+            self.meta.insert(id, meta);
+        }
+    }
+
+    /// Moves one row of a playlist, keeping the rest in order.
+    pub fn move_track(&mut self, id: &str, from: usize, to: usize) -> bool {
+        let Some(list) = self.custom_by_id_mut(id) else {
+            return false;
+        };
+        if from >= list.tracks.len() || to >= list.tracks.len() || from == to {
+            return false;
+        }
+        let item = list.tracks.remove(from);
+        list.tracks.insert(to, item);
+        true
+    }
+
     /// Links a playlist to a YouTube one ("" unlinks).
     pub fn set_linked(&mut self, id: &str, youtube_id: Option<String>) -> bool {
         match self.custom_by_id_mut(id) {
@@ -409,6 +491,77 @@ mod tests {
         assert!(store.custom.is_empty());
         assert!(store.pinned.is_empty());
         assert!(store.meta.is_empty());
+    }
+
+    #[test]
+    fn rows_by_key_survive_an_undo() {
+        let mut store = Store::default();
+        let id = store.create_custom("mix", 1);
+        store.add_tracks(&id, vec![track("a"), track("b"), track("c")]);
+
+        let (at, item) = store.remove_item(&id, "file:c").expect("found by key");
+        assert_eq!(at, 2);
+        assert_eq!(store.custom_by_id(&id).unwrap().tracks.len(), 2);
+
+        assert!(store.insert_item(&id, at, item), "the undo puts it back");
+        assert_eq!(store.custom_by_id(&id).unwrap().tracks.len(), 3);
+
+        assert!(store.move_item_before(&id, "file:c", "file:a"));
+        let titles: Vec<String> = store
+            .custom_by_id(&id)
+            .unwrap()
+            .tracks
+            .iter()
+            .map(|t| t.title().to_string())
+            .collect();
+        assert_eq!(titles, vec!["c", "a", "b"]);
+        assert!(!store.move_item_before(&id, "file:c", "file:nope"));
+    }
+
+    #[test]
+    fn a_restored_playlist_keeps_its_id_and_places() {
+        let mut store = Store::default();
+        let id = store.create_custom("mix", 1);
+        store.add_tracks(&id, vec![track("a")]);
+        store.toggle_pin(&id);
+        let playlist = store.custom_by_id(&id).unwrap().clone();
+        let meta = PlaylistMeta {
+            title: "Своё имя".into(),
+            cover: "c.png".into(),
+        };
+        store.meta.insert(id.clone(), meta.clone());
+        store.toggle_pin(&id); // unpin
+        store.forget(&id);
+        assert!(store.custom_by_id(&id).is_none());
+
+        store.restore_custom(playlist, true, false, Some(meta));
+        let back = store.custom_by_id(&id).unwrap();
+        assert_eq!(back.tracks.len(), 1);
+        assert!(store.pinned.contains(&id));
+        assert_eq!(store.meta.get(&id).unwrap().title, "Своё имя");
+    }
+
+    #[test]
+    fn a_row_moves_within_its_playlist() {
+        let mut store = Store::default();
+        let id = store.create_custom("mix", 1);
+        store.add_tracks(
+            &id,
+            vec![track("a"), track("b"), track("c")],
+        );
+
+        assert!(store.move_track(&id, 2, 0));
+        let titles: Vec<String> = store
+            .custom_by_id(&id)
+            .unwrap()
+            .tracks
+            .iter()
+            .map(|t| t.title().to_string())
+            .collect();
+        assert_eq!(titles, vec!["c", "a", "b"]);
+
+        assert!(!store.move_track(&id, 9, 0), "out of range changes nothing");
+        assert!(!store.move_track(&id, 0, 0), "same place is a no-op");
     }
 
     #[test]

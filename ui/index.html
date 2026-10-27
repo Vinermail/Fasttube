@@ -81,6 +81,7 @@
               <button id="lh-related" class="btn small hidden">Related</button>
             </div>
             <div id="lh-subtitle"></div>
+            <div id="lh-status" class="lh-status" role="status" aria-live="polite"></div>
             <div class="lh-filter-row">
               <input id="lh-filter" type="text" placeholder="Filter..." />
               <button id="lh-sort" class="btn small">Sort: default</button>
@@ -89,6 +90,9 @@
           <div class="lh-actions">
             <button id="lh-play" class="btn primary">Play</button>
             <button id="lh-shuffle" class="btn">Shuffle</button>
+            <button id="lh-queue" class="btn" title="Добавить весь список в очередь">В очередь</button>
+            <button id="lh-refresh" class="btn icon" title="Обновить с YouTube" aria-label="Обновить">↻</button>
+            <button id="lh-menu" class="btn icon" title="Действия с плейлистом" aria-label="Действия" aria-haspopup="menu">⋯</button>
           </div>
         </div>
         <div id="tracks" class="tracks"></div>
@@ -291,6 +295,7 @@
     </div>
 
     <div class="pb-right">
+      <button id="btn-like" class="tbtn fav" title="Нравится на YouTube" aria-pressed="false">♥</button>
       <button id="btn-fav" class="tbtn fav" title="Add to favorites">♡</button>
       <button id="btn-lyrics" class="tbtn pill" title="Lyrics">Lyrics</button>
       <button id="btn-queue" class="tbtn pill" title="Queue">Queue</button>

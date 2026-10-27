@@ -11,6 +11,14 @@ let seekDragValue = 0;
 let volumeDragging = false;
 let currentYtTracks = [];
 let queueInfo = null;
+// Stage 4: the selection in the list on screen, the rows being dragged, and the
+// last sync status heard about each playlist.
+let sel = new Set();
+let selAnchor = null;
+let currentPlaylistEntry = null;
+let dragRows = null;
+let syncStatusCache = {};
+let likesCache = new Map();
 let trackList = [];
 let trackListKey = null;
 let lyricsLines = [];
@@ -280,6 +288,7 @@ function setListHeader(meta) {
   h.classList.remove("hidden");
   $("lh-title").textContent = meta.title || "";
   $("lh-subtitle").textContent = meta.subtitle || "";
+  renderSyncStatus(null);
   const cover = $("lh-cover");
   if (meta.cover) {
     if (cover.dataset.src !== meta.cover) {
@@ -417,6 +426,17 @@ async function loadPlaylistStore() {
 
 function sidebarRow(entry) {
   const div = document.createElement("div");
+  div.addEventListener("dragover", (e) => {
+    if (!dragRows || !dragRows.length) return;
+    e.preventDefault();
+    div.classList.add("drop-into");
+  });
+  div.addEventListener("dragleave", () => div.classList.remove("drop-into"));
+  div.addEventListener("drop", (e) => {
+    e.preventDefault();
+    div.classList.remove("drop-into");
+    dropRowsOnPlaylist(entry).catch((err) => showError(err));
+  });
   const pinned = (playlistStore.pinned || []).includes(entry.id);
   div.className = "item pl-item" + (pinned ? " pinned" : "");
   div.dataset.id = entry.id;
@@ -503,6 +523,9 @@ function renderSidebar() {
 async function openSidebarPlaylist(entry) {
   try {
     hideError();
+    currentPlaylistEntry = entry;
+    clearSelection();
+    invoke("set_open_playlist", { playlistId: entry.ytId || null }).catch(() => {});
     if (entry.custom) {
       if (entry.linkedId) {
         // Linked means YouTube is the source of truth from now on.
@@ -521,8 +544,11 @@ async function openSidebarPlaylist(entry) {
         return;
       }
       currentLocalPlaylistId = entry.id;
+      currentYtPlaylistId = null;
+      currentYtPlaylistOwned = false;
       const infos = await invoke("open_custom_playlist", { id: entry.id });
       applyLocalTrackList(infos, playlistTitle(entry));
+      renderSyncStatus(null);
       const local = infos.length;
       if (entry.tracks > local) {
         $("lh-subtitle").textContent = `${local} файлов · ${entry.tracks - local} треков YouTube`;
@@ -539,6 +565,7 @@ async function openSidebarPlaylist(entry) {
     currentLocalPlaylistId = null;
     currentYtPlaylistId = entry.ytId;
     const ytId = entry.ytId;
+    showSkeleton();
     await loadTrackPages(
       "get_playlist_tracks",
       { playlistId: ytId },
@@ -549,6 +576,7 @@ async function openSidebarPlaylist(entry) {
       })
     );
     $("yt-more-btn").classList.add("hidden");
+    refreshSyncStatus();
   } catch (e) {
     showError(playlistError(e));
   }
@@ -556,6 +584,8 @@ async function openSidebarPlaylist(entry) {
 
 function applyLocalTrackList(infos, title) {
   currentYtPlaylistOwned = false;
+  sel.clear();
+  selAnchor = null;
   trackList = infos.map((t) => ({
     title: t.title,
     artist: t.artist,
@@ -765,17 +795,8 @@ async function openPlaylistMenu(x, y, entry) {
     items.push({
       label: "Удалить плейлист",
       danger: true,
-      run: async () => {
-        if (!(await askConfirm(`Удалить «${playlistTitle(entry)}»?`))) return;
-        await invoke("delete_playlist", { id: entry.id });
-        if (currentLocalPlaylistId === entry.id) {
-          currentLocalPlaylistId = null;
-          trackList = [];
-          trackListKey = null;
-          refresh();
-        }
-        await loadPlaylistStore();
-      },
+      // One path for a deletion: it keeps everything an undo needs.
+      run: () => deleteCustomPlaylistWithUndo(entry),
     });
   }
   openContextMenu(x, y, items);
@@ -927,6 +948,8 @@ function setYtTracks(tracks, append, meta) {
     artist: t.artist,
     duration: t.duration_secs,
     setVideoId: t.set_video_id || "",
+    thumbnail: t.thumbnail || "",
+    likeStatus: t.like_status || likesCache.get(t.video_id) || "",
   }));
   if (meta) {
     setListHeader(meta);
@@ -960,6 +983,8 @@ function appendYtTracks(tracks) {
     artist: t.artist,
     duration: t.duration_secs,
     setVideoId: t.set_video_id || "",
+    thumbnail: t.thumbnail || "",
+    likeStatus: t.like_status || likesCache.get(t.video_id) || "",
   }));
   ytListVersion++;
   trackListEl = $("tracks");
@@ -996,6 +1021,9 @@ async function loadTrackPages(command, args, meta) {
     if (!tracks.length) break;
     if (total > 0 && seen >= total) break;
     if (tracks.length < TRACK_PAGE) break;
+  }
+  if (!seen && command !== "get_liked_songs") {
+    showTracksEmpty("Здесь пока нет треков");
   }
   return seen;
 }
@@ -1770,6 +1798,53 @@ async function renderYtTrackList(invokeName) {
 
 $("yt-liked-btn").onclick = () => renderYtTrackList("get_liked_songs");
 
+$("lh-refresh").onclick = async () => {
+  if (!currentYtPlaylistId) {
+    toast("Этот список не с YouTube");
+    return;
+  }
+  try {
+    await invoke("sync_playlist_now", { playlistId: currentYtPlaylistId });
+    await reloadYtPlaylist();
+    await refreshSyncStatus();
+  } catch (e) {
+    showError(e);
+  }
+};
+
+$("lh-queue").onclick = () => {
+  const rows = (trackList || []).filter((r) => r.id);
+  if (!rows.length) {
+    toast("В этом списке нет треков YouTube");
+    return;
+  }
+  queueRows(rows, false);
+};
+
+$("lh-menu").onclick = (e) => {
+  e.stopPropagation();
+  lastCtxX = e.clientX;
+  lastCtxY = e.clientY;
+  if (!currentPlaylistEntry) {
+    toast("Сначала открой плейлист");
+    return;
+  }
+  openPlaylistActions(currentPlaylistEntry);
+};
+
+$("btn-like").onclick = () => {
+  const item = queueInfo && queueInfo.active ? queueInfo.items[queueInfo.current] : null;
+  if (!item) return;
+  toggleLike({ id: item.id, title: item.title, artist: item.artist });
+};
+
+// Clicking outside the popover closes it, like every other menu.
+document.addEventListener("click", (e) => {
+  if (!popoverEl) return;
+  if (popoverEl.contains(e.target)) return;
+  closePopover();
+});
+
 let ytPlaylistsLoaded = false;
 
 /// The account's playlists are part of the sidebar from the start: they sit in
@@ -1936,6 +2011,9 @@ function applySessionInfo(info) {
 
 const AUTH_EXPIRED_TEXT =
   "Your YouTube session expired. Sign in again to load your library.";
+/// Shown instead when the journal has work waiting for that sign-in.
+const AUTH_EXPIRED_PENDING_TEXT =
+  "Сессия YouTube истекла. Изменения сохранены локально и отправятся после входа.";
 let authBannerDismissed = false;
 let authBannerKind = "";
 
@@ -1961,7 +2039,14 @@ $("auth-banner-close").onclick = () => {
 };
 
 event.listen("auth-expired", () => {
-  if (!authBannerDismissed) showAuthBanner(AUTH_EXPIRED_TEXT, true, "expired");
+  if (!authBannerDismissed) {
+    const pending = (syncStatusCache[currentYtPlaylistId] || {}).pending || 0;
+    showAuthBanner(
+      pending > 0 ? AUTH_EXPIRED_PENDING_TEXT : AUTH_EXPIRED_TEXT,
+      true,
+      "expired"
+    );
+  }
   // Personal shelves must disappear with the session.
   homeSession = "signed_out";
   homeLastKey = "";
@@ -2321,80 +2406,57 @@ function buildRow(entry, i) {
   const row = entry.row;
   const div = document.createElement("div");
   const isActive = entry.orig === trackActive;
-  div.className = "trow" + (isActive ? " active" : "");
+  div.className = "trow" + (isActive ? " active" : "") + (sel.has(entry.orig) ? " sel" : "");
+  div.dataset.index = String(entry.orig);
+  div.draggable = true;
+  div.tabIndex = -1;
   const dur = row.duration > 0 ? fmt(row.duration) : "";
+  const liked = isLiked(row);
   div.innerHTML =
     (isActive
       ? `<div class="t-idx"><span class="eq"><i></i><i></i><i></i></span></div>`
       : `<div class="t-idx">${i + 1}</div>`) +
     `<div class="t-title">${escapeHtml(row.title)}</div>` +
     `<div class="t-artist">${escapeHtml(row.artist || "")}</div>` +
+    `<button class="t-heart${liked ? " on" : ""}" title="${
+      liked ? "Убрать лайк" : "Нравится"
+    }" aria-pressed="${liked ? "true" : "false"}">${liked ? "♥" : "♡"}</button>` +
     `<div class="t-dur">${dur}</div>`;
+
+  div.querySelector(".t-heart").addEventListener("click", (e) => {
+    e.stopPropagation();
+    toggleLike(row);
+  });
   div.addEventListener("contextmenu", (e) => {
-    const items = [];
-    if (row.path) {
-      items.push({
-        label: "Добавить в плейлист…",
-        run: () => addTrackToPlaylist(row.path),
-      });
-    } else if (row.id) {
-      items.push({
-        label: "Добавить в плейлист YouTube…",
-        run: () => addVideoToYtPlaylist(row.id, row.title),
-      });
-    }
-    if (currentYtPlaylistId && currentYtPlaylistOwned && !row.setVideoId) {
-      // A page cached before the rows carried their per-item id: one refetch
-      // makes removal possible again.
-      items.push({
-        label: "Обновить список (нет id строк)",
-        run: async () => {
-          await invoke("refresh_playlist_tracks", { playlistId: currentYtPlaylistId });
-          await reloadYtPlaylist();
-        },
-      });
-    }
-    if (currentYtPlaylistId && currentYtPlaylistOwned && row.setVideoId) {
-      items.push({
-        label: "Убрать из плейлиста",
-        danger: true,
-        run: async () => {
-          await invoke("remove_playlist_tracks", {
-            playlistId: currentYtPlaylistId,
-            items: [{ videoId: row.id, setVideoId: row.setVideoId }],
-          });
-          await reloadYtPlaylist();
-        },
-      });
-    }
-    if (currentLocalPlaylistId && String(currentLocalPlaylistId).startsWith("custom:")) {
-      items.push({
-        label: "Убрать из плейлиста",
-        danger: true,
-        run: async () => {
-          await invoke("remove_track_from_playlist", {
-            id: currentLocalPlaylistId,
-            index: entry.orig,
-          });
-          const infos = await invoke("open_custom_playlist", { id: currentLocalPlaylistId });
-          applyLocalTrackList(infos, $("list-title") ? $("list-title").textContent : "");
-          await loadPlaylistStore();
-        },
-      });
-    }
-    if (!items.length) return;
     e.preventDefault();
     e.stopPropagation();
-    openContextMenu(e.clientX, e.clientY, items);
+    lastCtxX = e.clientX;
+    lastCtxY = e.clientY;
+    if (!sel.has(entry.orig)) selectOnly(entry.orig);
+    openRowMenu(e.clientX, e.clientY, rowsForAction(entry));
   });
-  div.onclick = () => {
-    const orig = entry.orig;
-    if (mode === "youtube") {
-      playYtAt(orig);
-    } else {
-      invoke("play_track", { index: orig }).then(refresh);
+  div.onclick = (e) => {
+    if (e.shiftKey) {
+      selectRange(entry.orig);
+      return;
     }
+    if (e.ctrlKey || e.metaKey) {
+      toggleSelect(entry.orig);
+      return;
+    }
+    if (sel.size) clearSelection();
+    playRowAt(entry.orig);
   };
+  div.addEventListener("dragstart", (e) => startRowDrag(e, entry));
+  div.addEventListener("dragend", () => {
+    dragRows = null;
+    document.querySelectorAll(".trow.drop-before, .trow.drop-after").forEach((el) => {
+      el.classList.remove("drop-before", "drop-after");
+    });
+  });
+  div.addEventListener("dragover", (e) => onRowDragOver(e, div, entry));
+  div.addEventListener("dragleave", () => div.classList.remove("drop-before", "drop-after"));
+  div.addEventListener("drop", (e) => onRowDrop(e, div, entry));
   return div;
 }
 
@@ -2475,6 +2537,7 @@ async function refreshTracks(key, activeIndex) {
 
 function renderState(state) {
   lastState = state;
+  updateLikeButton();
   lastStateAt = performance.now();
   const hasYtList = mode === "youtube" && currentYtTracks.length > 0;
   if (state || hasYtList) {
@@ -3346,4 +3409,1266 @@ async function askWhereToCreate() {
       run: () => importPlaylistM3u(),
     },
   ]);
+}
+
+/* ================= stage 4: tracks everywhere ================= */
+
+/// "3 изменения", "1 изменение", "12 изменений".
+function plural(n, one, few, many) {
+  const mod10 = n % 10;
+  const mod100 = n % 100;
+  if (mod10 === 1 && mod100 !== 11) return `${n} ${one}`;
+  if (mod10 >= 2 && mod10 <= 4 && (mod100 < 12 || mod100 > 14)) return `${n} ${few}`;
+  return `${n} ${many}`;
+}
+
+/* ---------- likes ---------- */
+
+function isLiked(row) {
+  return (row.likeStatus || "") === "LIKE";
+}
+
+/// One place that knows what the user's like looks like right now.
+function setLikeState(videoId, liked) {
+  likesCache.set(videoId, liked ? "LIKE" : "");
+  const value = liked ? "LIKE" : "";
+  (currentYtTracks || []).forEach((t) => {
+    if (t.video_id === videoId) t.like_status = value;
+  });
+  (ytRows || []).forEach((r) => {
+    if (r.id === videoId) r.likeStatus = value;
+  });
+  (trackList || []).forEach((r) => {
+    if (r.id === videoId) r.likeStatus = value;
+  });
+  paintHearts();
+  updateLikeButton();
+}
+
+function paintHearts() {
+  if (!trackListEl) return;
+  for (const el of trackListEl.querySelectorAll(".trow")) {
+    const row = rowAt(Number(el.dataset.index));
+    const heart = el.querySelector(".t-heart");
+    if (!row || !heart) continue;
+    const liked = isLiked(row);
+    heart.textContent = liked ? "♥" : "♡";
+    heart.classList.toggle("on", liked);
+    heart.setAttribute("aria-pressed", liked ? "true" : "false");
+  }
+}
+
+/// The like goes through the outbox: it works offline and survives a restart.
+async function toggleLike(row) {
+  if (!row || !row.id) {
+    showError("у локального файла нет лайка на YouTube");
+    return;
+  }
+  const next = !isLiked(row);
+  setLikeState(row.id, next);
+  try {
+    await invoke("playlist_rate_song", {
+      videoId: row.id,
+      rating: next ? "LIKE" : "INDIFFERENT",
+    });
+  } catch (e) {
+    setLikeState(row.id, !next);
+    showError(e);
+  }
+}
+
+function updateLikeButton() {
+  const button = $("btn-like");
+  if (!button) return;
+  const item = queueInfo && queueInfo.active ? queueInfo.items[queueInfo.current] : null;
+  const liked = item ? likesCache.get(item.id) === "LIKE" : false;
+  button.textContent = liked ? "♥" : "♡";
+  button.classList.toggle("on", liked);
+  button.setAttribute("aria-pressed", liked ? "true" : "false");
+  button.classList.toggle("hidden", !item);
+}
+
+/* ---------- selection ---------- */
+
+function paintSelection() {
+  if (!trackListEl) return;
+  for (const el of trackListEl.querySelectorAll(".trow")) {
+    el.classList.toggle("sel", sel.has(Number(el.dataset.index)));
+  }
+}
+
+function selectOnly(index) {
+  sel.clear();
+  sel.add(index);
+  selAnchor = index;
+  paintSelection();
+}
+
+function toggleSelect(index) {
+  if (sel.has(index)) sel.delete(index);
+  else sel.add(index);
+  selAnchor = index;
+  paintSelection();
+}
+
+function selectRange(index) {
+  const anchor = selAnchor === null ? index : selAnchor;
+  const from = Math.min(anchor, index);
+  const to = Math.max(anchor, index);
+  for (let i = from; i <= to; i++) sel.add(i);
+  selAnchor = anchor;
+  paintSelection();
+}
+
+function clearSelection() {
+  if (!sel.size && !trackListEl) return;
+  sel.clear();
+  selAnchor = null;
+  paintSelection();
+}
+
+/// The array `trackRows[].orig` indexes into: the YouTube rows or the local list.
+function rowsSource() {
+  return mode === "youtube" ? ytRows : trackList;
+}
+
+function rowAt(orig) {
+  return rowsSource()[orig] || null;
+}
+
+function selectedIndexes() {
+  return [...sel].sort((a, b) => a - b);
+}
+
+function selectedRows() {
+  return selectedIndexes()
+    .map((i) => rowAt(i))
+    .filter(Boolean);
+}
+
+/// What a menu or a drag works on: the selection when the row is part of it.
+function rowsForAction(entry) {
+  if (sel.has(entry.orig) && sel.size > 0) {
+    const rows = selectedRows();
+    if (rows.length) return rows;
+  }
+  return [entry.row];
+}
+
+function playRowAt(orig) {
+  if (mode === "youtube") {
+    playYtAt(orig);
+  } else {
+    invoke("play_track", { index: orig }).then(refresh);
+  }
+}
+
+/* ---------- the row menu ---------- */
+
+/// Rows that can be edited right now: a playlist the user owns on YouTube or
+/// one they built locally. Folder playlists and other people's lists are read-only.
+function editableHere() {
+  if (!currentPlaylistEntry) return false;
+  if (currentPlaylistEntry.custom) return true;
+  return !!currentYtPlaylistId && !!currentYtPlaylistOwned;
+}
+
+function openRowMenu(x, y, rows) {
+  const items = [];
+  const playable = rows.filter((r) => r.id);
+  if (playable.length) {
+    items.push({
+      label: rows.length > 1 ? `Играть следом (${rows.length})` : "Играть следом",
+      run: () => queueRows(rows, true),
+    });
+    items.push({
+      label: rows.length > 1 ? `В очередь (${rows.length})` : "В очередь",
+      run: () => queueRows(rows, false),
+    });
+  }
+  items.push({ label: "Добавить в плейлист…", run: () => openAddPopover(rows) });
+  const withIds = rows.filter((r) => r.id);
+  if (withIds.length) {
+    const allLiked = withIds.every(isLiked);
+    items.push({
+      label: allLiked ? "Снять лайк" : "Лайк",
+      run: () => withIds.forEach((r) => toggleLike(r)),
+    });
+  }
+  if (editableHere() && rows.every((r) => r.path || r.setVideoId)) {
+    items.push({
+      label: rows.length > 1 ? `Убрать из плейлиста (${rows.length})` : "Убрать из плейлиста",
+      danger: true,
+      run: () => removeRows(rows),
+    });
+  }
+  const artist = (rows[0] && rows[0].artist) || "";
+  if (artist) {
+    items.push({
+      label: `Перейти к исполнителю`,
+      run: () => goToSearch(artist, "artists"),
+    });
+    items.push({
+      label: "Перейти к альбому",
+      run: () => goToSearch(rows[0].title ? `${artist} ${rows[0].title}` : artist, "albums"),
+    });
+  }
+  openContextMenu(x, y, items);
+}
+
+function goToSearch(query, filter) {
+  searchFilter = filter;
+  document.querySelectorAll("#search-chips .chip").forEach((chip) => {
+    chip.classList.toggle("active", chip.dataset.filter === filter);
+  });
+  const field = $("yt-query");
+  if (field) field.value = query;
+  runSearch(query);
+}
+
+async function queueRows(rows, playNext) {
+  try {
+    const items = rows
+      .filter((r) => r.id)
+      .map((r) => ({
+        id: r.id,
+        title: r.title,
+        artist: r.artist || "",
+        thumbnail: r.thumbnail || "",
+        durationSecs: r.duration || 0,
+      }));
+    if (!items.length) {
+      showError("эти строки не с YouTube: очередь их не примет");
+      return;
+    }
+    await invoke("queue_add", { items, playNext });
+    await refresh();
+    toast(playNext ? "Играет следом" : `В очереди: ${items.length}`);
+  } catch (e) {
+    showError(e);
+  }
+}
+
+/* ---------- toasts ---------- */
+
+function toast(message, options = {}) {
+  let host = $("toast-host");
+  if (!host) {
+    host = document.createElement("div");
+    host.id = "toast-host";
+    document.body.appendChild(host);
+  }
+  const el = document.createElement("div");
+  el.className = "toast";
+  el.setAttribute("role", "status");
+  const text = document.createElement("span");
+  text.className = "toast-text";
+  text.textContent = message;
+  el.appendChild(text);
+
+  let timer = null;
+  const close = () => {
+    clearTimeout(timer);
+    el.remove();
+  };
+  if (options.undo) {
+    const undo = document.createElement("button");
+    undo.className = "toast-undo";
+    undo.textContent = "Отменить";
+    undo.onclick = () => {
+      close();
+      Promise.resolve(options.undo()).catch((e) => showError(e));
+    };
+    el.appendChild(undo);
+  }
+  host.appendChild(el);
+  while (host.children.length > 3) host.firstChild.remove();
+  timer = setTimeout(close, options.ms ?? (options.undo ? 8000 : 4000));
+  return close;
+}
+
+/* ---------- removal, with an undo window ---------- */
+
+/// Index of a row inside the playlist as stored (not as filtered on screen).
+function storeIndexOf(rows, row) {
+  const list = currentPlaylistEntry && currentPlaylistEntry.custom
+    ? (playlistStore.custom || []).find((c) => c.id === currentPlaylistEntry.id)
+    : null;
+  if (list) {
+    const key = itemKey(row);
+    return list.tracks.findIndex((t) => itemKey(t) === key);
+  }
+  return rows.indexOf(row);
+}
+
+/// The same key for a row on screen and for a row as the store keeps it.
+function itemKey(item) {
+  if (item.kind === "youtube") return `yt:${item.video_id}`;
+  if (item.kind === "local") return `file:${item.path || ""}`;
+  if (item.video_id) return `yt:${item.video_id}`;
+  if (item.id) return `yt:${item.id}`;
+  return `file:${item.path || ""}`;
+}
+
+function rowAsStoreItem(row) {
+  if (row.id) {
+    return {
+      kind: "youtube",
+      video_id: row.id,
+      title: row.title || "",
+      artist: row.artist || "",
+      duration: row.duration || 0,
+      thumbnail: row.thumbnail || "",
+    };
+  }
+  return {
+    kind: "local",
+    path: row.path || "",
+    title: row.title || "",
+    artist: row.artist || "",
+  };
+}
+
+async function removeRows(rows) {
+  const entry = currentPlaylistEntry;
+  if (!entry || !rows.length) return;
+  try {
+    if (entry.custom) {
+      const saved = [];
+      for (const row of rows) {
+        const at = await invoke("remove_item_from_playlist", {
+          id: entry.id,
+          key: itemKey(row),
+        });
+        if (at === null || at === undefined) continue;
+        saved.push({ at, item: rowAsStoreItem(row) });
+      }
+      await loadPlaylistStore();
+      const fresh = allPlaylists().find((p) => p.id === entry.id);
+      if (fresh) await openSidebarPlaylist(fresh);
+      if (!saved.length) return;
+      toast(`Убрано: ${saved.length}`, {
+        undo: async () => {
+          for (const { at, item } of saved) {
+            await invoke("insert_item_into_playlist", { id: entry.id, index: at, item });
+          }
+          await loadPlaylistStore();
+          const back = allPlaylists().find((p) => p.id === entry.id);
+          if (back) await openSidebarPlaylist(back);
+          toast("Возвращено");
+        },
+      });
+      return;
+    }
+
+    // A YouTube playlist: the request waits 8 s, so the undo never leaves the app.
+    const listSnapshot = currentYtTracks.slice();
+    const opIds = [];
+    let index = 0;
+    for (const [orig, row] of currentYtTracks.map((t, i) => [i, t]).filter(([, t]) =>
+      rows.some((r) => r.id === t.video_id && (r.setVideoId || "") === (t.set_video_id || ""))
+    )) {
+      index = orig;
+      const opId = await invoke("playlist_remove_track", {
+        playlistId: currentYtPlaylistId,
+        delayMs: 8000,
+        row: {
+          video_id: row.video_id,
+          set_video_id: row.set_video_id || "",
+          title: row.title || "",
+          artist: row.artist || "",
+          duration: row.duration_secs || 0,
+          thumbnail: row.thumbnail || "",
+          like_status: row.like_status || "",
+          index,
+        },
+      });
+      if (opId) opIds.push(opId);
+    }
+    if (!opIds.length) {
+      showError("у этих строк нет id строки плейлиста — обнови список");
+      return;
+    }
+
+    const drop = new Set(
+      rows.map((r) => `${r.id}|${r.setVideoId || ""}`)
+    );
+    currentYtTracks = currentYtTracks.filter(
+      (t) => !drop.has(`${t.video_id}|${t.set_video_id || ""}`)
+    );
+    setYtTracks(currentYtTracks, false, null);
+    clearSelection();
+
+    toast(`Убрано из плейлиста: ${opIds.length}`, {
+      undo: async () => {
+        for (const opId of opIds) await invoke("playlist_undo_remove", { opId });
+        currentYtTracks = listSnapshot;
+        setYtTracks(currentYtTracks, false, null);
+        toast("Возвращено");
+      },
+    });
+  } catch (e) {
+    showError(e);
+  }
+}
+
+/// Undo of an add: the rows are still on YouTube unless the journal already ran;
+/// looking them up in the snapshot gives the per-item ids the removal needs.
+async function undoAddRows(playlistId, rows) {
+  try {
+    const snapshot = await invoke("get_playlist_snapshot", { playlistId });
+    const tracks = (snapshot && snapshot.tracks) || [];
+    let undone = 0;
+    for (const row of rows) {
+      const found = tracks.find((t) => t.video_id === row.id);
+      if (!found) continue;
+      await invoke("playlist_remove_track", {
+        playlistId,
+        delayMs: 0,
+        row: {
+          video_id: found.video_id,
+          set_video_id: found.set_video_id || "",
+          title: found.title || "",
+          artist: found.artist || "",
+          duration: found.duration || 0,
+          thumbnail: found.thumbnail || "",
+          like_status: found.like_status || "",
+          index: tracks.indexOf(found),
+        },
+      });
+      undone += 1;
+    }
+    toast(undone ? `Отменено: ${undone}` : "Уже нечего отменять");
+  } catch (e) {
+    showError(e);
+  }
+}
+
+/* ---------- the add-to-playlist popover ---------- */
+
+let popoverEl = null;
+
+function closePopover() {
+  if (popoverEl) {
+    popoverEl.remove();
+    popoverEl = null;
+  }
+}
+
+/// Playlists that can take a track right now: the user's own YouTube lists and
+/// the ones they built here. Nothing outside the app is asked about.
+async function collectTargets() {
+  const targets = [];
+  for (const entry of allPlaylists()) {
+    if (entry.custom) {
+      targets.push({ kind: "local", id: entry.id, name: playlistTitle(entry), owned: true });
+      continue;
+    }
+    if (!entry.ytId || String(entry.ytId).startsWith("RD")) continue;
+    const known = knownOwned.get(entry.ytId);
+    if (known === true) {
+      targets.push({ kind: "yt", id: entry.ytId, name: playlistTitle(entry), owned: true });
+    }
+  }
+  return targets;
+}
+
+/// Which targets already hold all (or some) of these rows. Read from the
+/// snapshots and the store: no network, no polling.
+async function membershipOf(rows, targets) {
+  const keys = rows.map(itemKey);
+  for (const target of targets) {
+    let present = new Set();
+    try {
+      if (target.kind === "yt") {
+        const snapshot = await invoke("get_playlist_snapshot", { playlistId: target.id });
+        present = new Set(((snapshot && snapshot.tracks) || []).map((t) => `yt:${t.video_id}`));
+      } else {
+        const list = (playlistStore.custom || []).find((c) => c.id === target.id);
+        present = new Set(((list && list.tracks) || []).map(itemKey));
+      }
+    } catch (e) {
+      present = new Set();
+    }
+    target.all = keys.every((k) => present.has(k));
+    target.some = keys.some((k) => present.has(k));
+  }
+}
+
+async function openAddPopover(rows) {
+  closeContextMenu();
+  closePopover();
+  if (!rows.length) return;
+  const targets = await collectTargets();
+  await membershipOf(rows, targets);
+
+  const box = document.createElement("div");
+  box.className = "popover";
+  box.setAttribute("role", "dialog");
+  box.setAttribute("aria-label", "Добавить в плейлист");
+
+  const search = document.createElement("input");
+  search.type = "text";
+  search.placeholder = "Поиск плейлиста…";
+  search.setAttribute("aria-label", "Поиск плейлиста");
+  box.appendChild(search);
+
+  const list = document.createElement("div");
+  list.className = "popover-list";
+  list.setAttribute("role", "listbox");
+  box.appendChild(list);
+
+  const render = (query) => {
+    list.innerHTML = "";
+    const needle = (query || "").trim().toLowerCase();
+    const shown = targets.filter((t) => !needle || t.name.toLowerCase().includes(needle));
+    const fresh = document.createElement("div");
+    fresh.className = "popover-row";
+    fresh.tabIndex = 0;
+    fresh.innerHTML = `<span class="tick">＋</span><span>Новый плейлист…</span>`;
+    fresh.onclick = (e) => {
+      e.stopPropagation();
+      askNewPlaylistTarget(rows);
+    };
+    list.appendChild(fresh);
+    if (!shown.length) {
+      const empty = document.createElement("div");
+      empty.className = "popover-empty";
+      empty.textContent = "Ничего не нашлось";
+      list.appendChild(empty);
+      return;
+    }
+    for (const target of shown) {
+      const row = document.createElement("div");
+      row.className = "popover-row";
+      row.tabIndex = 0;
+      row.setAttribute("role", "option");
+      row.setAttribute("aria-selected", target.all ? "true" : "false");
+      const tick = document.createElement("span");
+      tick.className = "tick";
+      tick.textContent = target.all ? "✓" : target.some ? "◐" : "";
+      const name = document.createElement("span");
+      name.textContent = target.name;
+      const kind = document.createElement("span");
+      kind.className = "kind";
+      kind.textContent = target.kind === "yt" ? "YouTube" : "локальный";
+      row.append(tick, name, kind);
+      row.onclick = (e) => {
+        e.stopPropagation();
+        closePopover();
+        addRowsToPlaylist(target, rows);
+      };
+      list.appendChild(row);
+    }
+  };
+  search.addEventListener("input", () => render(search.value));
+  render("");
+
+  document.body.appendChild(box);
+  const rect = box.getBoundingClientRect();
+  box.style.left = `${Math.max(8, Math.min(lastCtxX, window.innerWidth - rect.width - 12))}px`;
+  box.style.top = `${Math.max(8, Math.min(lastCtxY, window.innerHeight - rect.height - 12))}px`;
+  popoverEl = box;
+  search.focus();
+}
+
+async function askNewPlaylistTarget(rows) {
+  closePopover();
+  openContextMenu(lastCtxX, lastCtxY, [
+    {
+      label: "YouTube (приватный)",
+      run: async () => {
+        const title = await askPlaylistTitle("");
+        if (title === null) return;
+        const id = await invoke("create_account_playlist", { title });
+        await loadUserPlaylists();
+        await addRowsToPlaylist(
+          { kind: "yt", id, name: title || "Новый плейлист", owned: true },
+          rows
+        );
+      },
+    },
+    {
+      label: "Локальный",
+      run: async () => {
+        const title = await askPlaylistTitle("");
+        if (title === null) return;
+        const store = await invoke("create_playlist", { title });
+        await loadPlaylistStore();
+        const created = (store.custom || []).slice(-1)[0];
+        if (created) {
+          await addRowsToPlaylist(
+            { kind: "local", id: created.id, name: created.title, owned: true },
+            rows
+          );
+        }
+      },
+    },
+  ]);
+}
+
+/// A small dialog with a checkbox, for the duplicate question.
+function askChoice(title, text, buttons, options = {}) {
+  return new Promise((resolve) => {
+    const wrap = document.createElement("div");
+    wrap.className = "modal-backdrop";
+    const box = document.createElement("div");
+    box.className = "modal-box";
+    box.setAttribute("role", "dialog");
+    box.setAttribute("aria-modal", "true");
+    const head = document.createElement("div");
+    head.className = "modal-title";
+    head.textContent = title;
+    const body = document.createElement("p");
+    body.className = "hint";
+    body.textContent = text;
+    box.append(head, body);
+
+    let checkbox = null;
+    if (options.checkbox) {
+      const label = document.createElement("label");
+      label.className = "modal-check";
+      checkbox = document.createElement("input");
+      checkbox.type = "checkbox";
+      const span = document.createElement("span");
+      span.textContent = options.checkbox;
+      label.append(checkbox, span);
+      box.appendChild(label);
+    }
+
+    const row = document.createElement("div");
+    row.className = "modal-actions";
+    const finish = (value) => {
+      wrap.remove();
+      resolve(checkbox && checkbox.checked ? { action: value, all: true } : value);
+    };
+    buttons.forEach((button, index) => {
+      const el = document.createElement("button");
+      el.className = button.danger ? "btn danger" : index === 0 ? "btn primary" : "btn";
+      el.textContent = button.label;
+      el.onclick = () => finish(button.value);
+      row.appendChild(el);
+    });
+    box.appendChild(row);
+    wrap.appendChild(box);
+    wrap.addEventListener("click", (e) => {
+      if (e.target === wrap) finish("cancel");
+    });
+    document.body.appendChild(wrap);
+    const first = row.querySelector("button");
+    if (first) first.focus();
+    box.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") finish("cancel");
+    });
+  });
+}
+
+async function addRowsToPlaylist(target, rows) {
+  const ytRows = rows.filter((r) => r.id);
+  const localRows = rows.filter((r) => r.path);
+  if (target.kind === "local") {
+    try {
+      let addedLocal = 0;
+      if (localRows.length) {
+        const added = await invoke("add_tracks_to_playlist", {
+          id: target.id,
+          paths: localRows.map((r) => r.path),
+        });
+        addedLocal += added || 0;
+      }
+      let addedYt = 0;
+      if (ytRows.length) {
+        const store = await invoke("playlist_add_youtube_rows", {
+          id: target.id,
+          tracks: ytRows.map((r) => ({
+            video_id: r.id,
+            title: r.title || "",
+            artist: r.artist || "",
+            duration: r.duration || 0,
+            thumbnail: r.thumbnail || "",
+          })),
+        });
+        const list = ((store.custom || []).find((c) => c.id === target.id) || {}).tracks || [];
+        addedYt = list.filter((t) => t.kind === "youtube").length;
+      }
+      await loadPlaylistStore();
+      const total = addedLocal + (addedYt ? ytRows.length : 0);
+      toast(
+        total ? `Добавлено в «${target.name}»: ${total}` : `Уже есть в «${target.name}»`,
+        {
+          undo: total
+            ? async () => {
+                for (const row of rows) {
+                  await invoke("remove_item_from_playlist", {
+                    id: target.id,
+                    key: itemKey(row),
+                  });
+                }
+                await loadPlaylistStore();
+                toast("Возвращено");
+              }
+            : undefined,
+        }
+      );
+      if (currentPlaylistEntry && currentPlaylistEntry.id === target.id) {
+        const fresh = allPlaylists().find((p) => p.id === target.id);
+        if (fresh) await openSidebarPlaylist(fresh);
+      }
+    } catch (e) {
+      showError(e);
+    }
+    return;
+  }
+
+  // A YouTube playlist.
+  if (!target.owned) {
+    toast("Этот плейлист только для чтения");
+    return;
+  }
+  if (!ytRows.length) {
+    toast("Локальные файлы на YouTube не отправляются: свяжи плейлист с YouTube");
+    return;
+  }
+  const snapshot = await invoke("get_playlist_snapshot", { playlistId: target.id }).catch(
+    () => null
+  );
+  const present = new Set(((snapshot && snapshot.tracks) || []).map((t) => t.video_id));
+  const duplicates = ytRows.filter((r) => present.has(r.id));
+  let toSend = ytRows;
+  if (duplicates.length) {
+    const answer = await askChoice(
+      "Такие треки уже есть",
+      `${plural(duplicates.length, "трек", "трека", "треков")} уже есть в «${target.name}». Добавить ещё раз?`,
+      [
+        { label: "Добавить ещё раз", value: "add" },
+        { label: "Пропустить", value: "skip" },
+        { label: "Отмена", value: "cancel" },
+      ],
+      duplicates.length > 1 ? { checkbox: "Так же для всех остальных" } : {}
+    );
+    const action = typeof answer === "string" ? answer : answer.action;
+    if (action === "cancel") return;
+    if (action === "skip") toSend = ytRows.filter((r) => !present.has(r.id));
+  }
+  if (!toSend.length) {
+    toast(`Все эти треки уже есть в «${target.name}»`);
+    return;
+  }
+  try {
+    await invoke("playlist_add_tracks", {
+      playlistId: target.id,
+      tracks: toSend.map((r) => ({
+        video_id: r.id,
+        title: r.title || "",
+        artist: r.artist || "",
+        duration: r.duration || 0,
+        thumbnail: r.thumbnail || "",
+      })),
+    });
+    toast(`Добавлено в «${target.name}»: ${toSend.length}`, {
+      undo: () => undoAddRows(target.id, toSend),
+    });
+    if (currentYtPlaylistId === target.id) await reloadYtPlaylist();
+  } catch (e) {
+    showError(e);
+  }
+}
+
+/* ---------- drag and drop ---------- */
+
+function startRowDrag(event, entry) {
+  const rows = rowsForAction(entry);
+  dragRows = rows;
+  if (event.dataTransfer) {
+    event.dataTransfer.effectAllowed = "copyMove";
+    // Some backends need a payload to start the drag at all.
+    event.dataTransfer.setData("text/plain", "fasttube-rows");
+  }
+}
+
+function onRowDragOver(event, element, entry) {
+  if (!dragRows || !dragRows.length || !editableHere()) return;
+  const rect = element.getBoundingClientRect();
+  const after = event.clientY - rect.top > rect.height / 2;
+  event.preventDefault();
+  element.classList.toggle("drop-before", !after);
+  element.classList.toggle("drop-after", after);
+}
+
+async function onRowDrop(event, element, entry) {
+  if (!dragRows || !dragRows.length) return;
+  event.preventDefault();
+  const rect = element.getBoundingClientRect();
+  const after = event.clientY - rect.top > rect.height / 2;
+  element.classList.remove("drop-before", "drop-after");
+  const rows = dragRows;
+  dragRows = null;
+  if (!editableHere()) return;
+  await moveRows(rows, entry, after);
+}
+
+/// Moves the dragged rows so they sit where they were dropped.
+async function moveRows(rows, targetEntry, after) {
+  const entry = currentPlaylistEntry;
+  if (!entry) return;
+  try {
+    if (entry.custom) {
+      const key = itemKey(rows[0]);
+      let before = "";
+      const view = trackRows.map((e) => e.row);
+      const at = view.indexOf(targetEntry.row);
+      const next = after ? view[at + 1] : targetEntry.row;
+      if (next) before = itemKey(next);
+      const moved = await invoke("move_item_in_playlist", {
+        id: entry.id,
+        key,
+        before,
+      });
+      if (moved) {
+        await loadPlaylistStore();
+        const fresh = allPlaylists().find((p) => p.id === entry.id);
+        if (fresh) await openSidebarPlaylist(fresh);
+        toast("Перемещено");
+      }
+      return;
+    }
+    // A YouTube playlist: the order is the per-item ids.
+    const row = rows[0];
+    if (!row.setVideoId) {
+      showError("у строки нет id строки плейлиста — обнови список");
+      return;
+    }
+    const list = currentYtTracks.slice();
+    const from = list.findIndex((t) => t.set_video_id === row.setVideoId);
+    if (from < 0) return;
+    const [moved] = list.splice(from, 1);
+    const targetIndex = list.findIndex((t) => t.video_id === targetEntry.row.id);
+    if (targetIndex < 0) {
+      list.splice(from, 0, moved);
+      return;
+    }
+    list.splice(after ? targetIndex + 1 : targetIndex, 0, moved);
+    const at = list.indexOf(moved);
+    const before = at + 1 < list.length ? list[at + 1].set_video_id || "" : "";
+    currentYtTracks = list;
+    setYtTracks(list, false, null);
+    await invoke("playlist_move_track", {
+      playlistId: currentYtPlaylistId,
+      setVideoId: row.setVideoId,
+      beforeSetVideoId: before,
+    });
+    toast("Перемещено");
+  } catch (e) {
+    showError(e);
+    await reloadYtPlaylist();
+  }
+}
+
+async function dropRowsOnPlaylist(entry) {
+  const rows = dragRows;
+  dragRows = null;
+  if (!rows || !rows.length) return;
+  if (entry.custom) {
+    await addRowsToPlaylist({ kind: "local", id: entry.id, name: playlistTitle(entry), owned: true }, rows);
+    return;
+  }
+  if (entry.ytId === "LM") {
+    const liked = rows.filter((r) => r.id);
+    for (const row of liked) {
+      if (!isLiked(row)) await toggleLike(row);
+    }
+    toast(`В «Понравившиеся»: ${liked.length}`);
+    return;
+  }
+  if (!entry.ytId) {
+    toast("Это папка с файлами: плейлист только для чтения");
+    return;
+  }
+  await addRowsToPlaylist(
+    {
+      kind: "yt",
+      id: entry.ytId,
+      name: playlistTitle(entry),
+      owned: knownOwned.get(entry.ytId) === true,
+    },
+    rows
+  );
+}
+
+/* ---------- keyboard: Delete, Ctrl+A, Alt+arrows ---------- */
+
+function inTextField(target) {
+  if (!target) return false;
+  const tag = target.tagName;
+  return tag === "INPUT" || tag === "TEXTAREA" || target.isContentEditable;
+}
+
+document.addEventListener("keydown", (event) => {
+  if (inTextField(event.target)) return;
+  if (!trackListEl || !document.querySelector("#player:not(.hidden)")) return;
+
+  if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "a") {
+    if (!trackRows.length) return;
+    event.preventDefault();
+    sel.clear();
+    trackRows.forEach((e) => sel.add(e.orig));
+    paintSelection();
+    return;
+  }
+  if (event.key === "Delete" || event.key === "Backspace") {
+    const rows = selectedRows();
+    if (!rows.length) return;
+    event.preventDefault();
+    removeRows(rows);
+    return;
+  }
+  if (event.altKey && (event.key === "ArrowUp" || event.key === "ArrowDown")) {
+    const rows = selectedRows();
+    if (!rows.length) return;
+    event.preventDefault();
+    moveSelectedBy(event.key === "ArrowUp" ? -1 : 1);
+    return;
+  }
+  if (event.key === "Escape") {
+    clearSelection();
+    closePopover();
+  }
+});
+
+/// Alt+↑/↓: the same move as dragging one row, expressed in ids.
+async function moveSelectedBy(delta) {
+  const rows = selectedRows();
+  if (!rows.length) return;
+  const entry = currentPlaylistEntry;
+  if (!entry) return;
+  if (entry.custom) {
+    const view = trackRows.map((e) => e.row);
+    const at = view.indexOf(rows[0]);
+    const target = view[at + delta];
+    if (!target) return;
+    await moveRows([rows[0]], { row: target }, delta > 0);
+    return;
+  }
+  if (!currentYtPlaylistOwned) {
+    toast("Плейлист только для чтения");
+    return;
+  }
+  const row = rows[0];
+  if (!row.setVideoId) return;
+  const list = currentYtTracks.slice();
+  const from = list.findIndex((t) => t.set_video_id === row.setVideoId);
+  const to = from + delta;
+  if (from < 0 || to < 0 || to >= list.length) return;
+  const [moved] = list.splice(from, 1);
+  list.splice(to, 0, moved);
+  const before = to + 1 < list.length ? list[to + 1].set_video_id || "" : "";
+  currentYtTracks = list;
+  setYtTracks(list, false, null);
+  try {
+    await invoke("playlist_move_track", {
+      playlistId: currentYtPlaylistId,
+      setVideoId: row.setVideoId,
+      beforeSetVideoId: before,
+    });
+  } catch (e) {
+    showError(e);
+    await reloadYtPlaylist();
+  }
+}
+
+/* ---------- the playlist header: sync state and actions ---------- */
+
+function formatAgo(then) {
+  if (!then) return "";
+  const seconds = Math.max(0, Math.round(Date.now() / 1000 - then));
+  if (seconds < 60) return "только что";
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) return `${plural(minutes, "минуту", "минуты", "минут")} назад`;
+  const hours = Math.round(minutes / 60);
+  return `${plural(hours, "час", "часа", "часов")} назад`;
+}
+
+function renderSyncStatus(status) {
+  const el = $("lh-status");
+  if (!el) return;
+  el.className = "lh-status";
+  el.textContent = "";
+  if (!currentPlaylistEntry || !currentYtPlaylistId) {
+    if (currentPlaylistEntry && currentPlaylistEntry.custom) {
+      const count = (playlistStore.custom || []).find((c) => c.id === currentPlaylistEntry.id);
+      const total = count ? count.tracks.length : 0;
+      el.textContent = `${plural(total, "трек", "трека", "треков")} · локальный плейлист`;
+    }
+    return;
+  }
+  if (!currentYtPlaylistOwned) {
+    const badge = document.createElement("span");
+    badge.className = "lh-badge";
+    badge.textContent = "Только чтение";
+    el.appendChild(badge);
+    return;
+  }
+  const cached = status || syncStatusCache[currentYtPlaylistId];
+  if (!cached) {
+    el.textContent = "";
+    return;
+  }
+  if (cached.state === "error") {
+    el.className = "lh-status error";
+    const text = document.createElement("span");
+    text.textContent = `Ошибка: ${cached.error || "не удалось отправить изменения"}`;
+    const retry = document.createElement("button");
+    retry.className = "btn small";
+    retry.textContent = "Повторить";
+    retry.onclick = () => {
+      invoke("sync_playlist_now", { playlistId: currentYtPlaylistId }).catch(showError);
+    };
+    el.append(text, retry);
+    return;
+  }
+  if (cached.state === "syncing") {
+    el.className = "lh-status pending";
+    el.textContent = "Синхронизация…";
+    return;
+  }
+  if (cached.pending > 0) {
+    el.className = "lh-status pending";
+    el.textContent = `Ожидает сети (${plural(cached.pending, "изменение", "изменения", "изменений")})`;
+    return;
+  }
+  el.className = "lh-status ok";
+  el.textContent = cached.last_synced_at
+    ? `Синхронизировано · ${formatAgo(cached.last_synced_at)}`
+    : "Синхронизировано";
+}
+
+async function refreshSyncStatus() {
+  if (!currentYtPlaylistId) {
+    renderSyncStatus(null);
+    return;
+  }
+  try {
+    const status = await invoke("get_sync_status", { playlistId: currentYtPlaylistId });
+    if (status) syncStatusCache[currentYtPlaylistId] = status;
+    renderSyncStatus(status);
+  } catch (e) {
+    renderSyncStatus(null);
+  }
+}
+
+if (window.__TAURI__ && event && event.listen) {
+  event.listen("sync-status", (e) => {
+    const payload = e.payload || {};
+    if (!payload.id) return;
+    syncStatusCache[payload.id] = payload;
+    if (payload.id === currentYtPlaylistId) renderSyncStatus(payload);
+  });
+  event.listen("playlist-synced", (e) => {
+    const payload = e.payload || {};
+    if (payload.id !== currentYtPlaylistId) return;
+    refreshSyncStatus();
+    const changed = (payload.added || 0) + (payload.removed || 0) + (payload.moved || 0);
+    if (changed > 0) {
+      toast(`Плейлист обновился: +${payload.added || 0} / −${payload.removed || 0}`);
+    }
+  });
+  event.listen("playlist-sync-failed", (e) => {
+    const payload = e.payload || {};
+    if (payload.id !== currentYtPlaylistId) return;
+    showError(`Не удалось отправить изменения: ${payload.error || ""}`);
+    refreshSyncStatus();
+  });
+}
+
+function openPlaylistActions(entry) {
+  const items = [];
+  const yt = entry.ytId;
+  if (entry.custom && entry.linkedId) {
+    items.push({ label: "Отвязать от YouTube", run: () => unlinkPlaylist(entry) });
+  } else if (entry.custom && entry.youtube > 0) {
+    items.push({ label: "Связать с YouTube…", run: () => linkPlaylistToYoutube(entry) });
+  }
+  if (entry.custom) {
+    items.push({ label: "Экспорт в M3U…", run: () => exportPlaylistM3u(entry) });
+  }
+  items.push({
+    label: "Переименовать…",
+    run: () => renameCurrentPlaylist(entry),
+  });
+  if (yt && currentYtPlaylistOwned) {
+    items.push({ label: "Описание…", run: () => editPlaylistDescription(entry) });
+    items.push({ label: "Приватность…", run: () => pickPrivacy(entry) });
+  }
+  if (yt && currentYtPlaylistOwned) {
+    items.push({
+      label: "Удалить на YouTube…",
+      danger: true,
+      run: () => deleteYtPlaylist(entry),
+    });
+  }
+  if (entry.custom) {
+    items.push({
+      label: "Удалить плейлист…",
+      danger: true,
+      run: () => deleteCustomPlaylistWithUndo(entry),
+    });
+  }
+  if (yt && !currentYtPlaylistOwned) {
+    items.push({ label: "Сохранить в медиатеку", run: () => savePlaylistToLibrary(yt) });
+    items.push({ label: "Сделать копию…", run: () => copyPlaylistToAccount(yt, playlistTitle(entry)) });
+  }
+  openContextMenu(lastCtxX, lastCtxY, items);
+}
+
+async function renameCurrentPlaylist(entry) {
+  const title = await askPlaylistTitle(playlistTitle(entry));
+  if (title === null) return;
+  try {
+    if (entry.custom) {
+      await invoke("rename_playlist", { id: entry.id, title });
+    } else if (entry.ytId && currentYtPlaylistOwned) {
+      await invoke("playlist_edit_meta", {
+        playlistId: entry.ytId,
+        title,
+        description: "",
+        privacy: "",
+      });
+    } else {
+      await invoke("rename_playlist", { id: entry.id, title });
+    }
+    await loadPlaylistStore();
+    await loadUserPlaylists();
+    renderSidebar();
+    if ($("lh-title")) $("lh-title").textContent = title || playlistTitle(entry);
+  } catch (e) {
+    showError(e);
+  }
+}
+
+async function editPlaylistDescription(entry) {
+  const snapshot = await invoke("get_playlist_snapshot", { playlistId: entry.ytId }).catch(
+    () => null
+  );
+  const current = (snapshot && snapshot.privacy) || "";
+  const text = await askPlaylistTitle(
+    (snapshot && snapshot.description) || "Описание плейлиста"
+  );
+  if (text === null) return;
+  try {
+    await invoke("playlist_edit_meta", {
+      playlistId: entry.ytId,
+      title: "",
+      description: text,
+      privacy: "",
+    });
+    toast("Описание обновится на YouTube");
+    void current;
+  } catch (e) {
+    showError(e);
+  }
+}
+
+async function pickPrivacy(entry) {
+  openContextMenu(lastCtxX, lastCtxY, [
+    { label: "Private", run: () => setPrivacy(entry, "PRIVATE") },
+    { label: "Unlisted", run: () => setPrivacy(entry, "UNLISTED") },
+    { label: "Public", run: () => setPrivacy(entry, "PUBLIC") },
+  ]);
+}
+
+async function setPrivacy(entry, privacy) {
+  try {
+    await invoke("playlist_edit_meta", {
+      playlistId: entry.ytId,
+      title: "",
+      description: "",
+      privacy,
+    });
+    toast(`Приватность: ${privacy.toLowerCase()}`);
+  } catch (e) {
+    showError(e);
+  }
+}
+
+async function deleteYtPlaylist(entry) {
+  const ok = await askConfirm(
+    `Удалить «${playlistTitle(entry)}» на YouTube? Это необратимо.`
+  );
+  if (!ok) return;
+  try {
+    await invoke("playlist_delete", { playlistId: entry.ytId });
+    knownOwned.delete(entry.ytId);
+    toast("Плейлист будет удалён на YouTube");
+    await loadUserPlaylists();
+    await loadPlaylistStore();
+    renderSidebar();
+    if (currentYtPlaylistId === entry.ytId) {
+      currentYtPlaylistId = null;
+      currentYtTracks = [];
+      ytRows = [];
+      ytListVersion++;
+      refresh();
+    }
+  } catch (e) {
+    showError(e);
+  }
+}
+
+/// Deleting a local playlist keeps everything needed to put it back.
+async function deleteCustomPlaylistWithUndo(entry) {
+  const ok = await askConfirm(`Удалить «${playlistTitle(entry)}»?`);
+  if (!ok) return;
+  const list = (playlistStore.custom || []).find((c) => c.id === entry.id);
+  if (!list) return;
+  const copy = JSON.parse(JSON.stringify(list));
+  const meta = (playlistStore.meta || {})[entry.id] || null;
+  const pinned = (playlistStore.pinned || []).includes(entry.id);
+  const hidden = (playlistStore.hidden || []).includes(entry.id);
+  try {
+    await invoke("delete_playlist", { id: entry.id });
+    await loadPlaylistStore();
+    renderSidebar();
+    if (currentLocalPlaylistId === entry.id) {
+      currentLocalPlaylistId = null;
+      trackList = [];
+      clearSelection();
+      refresh();
+    }
+    toast(`«${playlistTitle(entry)}» удалён`, {
+      undo: async () => {
+        await invoke("restore_custom_playlist", {
+          playlist: copy,
+          pinned,
+          hidden,
+          meta,
+        });
+        await loadPlaylistStore();
+        renderSidebar();
+        toast("Плейлист вернулся");
+      },
+    });
+  } catch (e) {
+    showError(e);
+  }
+}
+
+/* ---------- listing helpers ---------- */
+
+function showTracksEmpty(text) {
+  if (!trackListEl) return;
+  trackListEl.innerHTML = "";
+  const box = document.createElement("div");
+  box.className = "tracks-empty";
+  box.textContent = text;
+  trackListEl.appendChild(box);
+}
+
+function showSkeleton(count = 6) {
+  if (!trackListEl) return;
+  trackListEl.innerHTML = "";
+  for (let i = 0; i < count; i++) {
+    const row = document.createElement("div");
+    row.className = "skeleton-row";
+    trackListEl.appendChild(row);
+  }
 }

@@ -306,6 +306,49 @@ impl SyncService {
         self.engine.lock().snapshot(playlist_id)
     }
 
+    /// Undo of a deferred removal: the operation leaves the journal and the row
+    /// goes back into the snapshot without a single request to YouTube.
+    pub fn undo_remove(&self, op_id: &str) -> bool {
+        let events = {
+            let mut engine = self.engine.lock();
+            let Some(op) = engine.cancel(op_id) else {
+                return false;
+            };
+            if op.kind == OpKind::Remove {
+                let payload = &op.payload;
+                let text = |key: &str| {
+                    payload
+                        .get(key)
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string()
+                };
+                let number = |key: &str| payload.get(key).and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let index = payload
+                    .get("index")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as usize;
+                let track = SnapshotTrack {
+                    video_id: text("video_id"),
+                    set_video_id: text("set_video_id"),
+                    title: text("title"),
+                    artist: text("artist"),
+                    duration: number("duration"),
+                    thumbnail: text("thumbnail"),
+                    like_status: text("like_status"),
+                    temp_id: String::new(),
+                };
+                engine.restore_row(&op.playlist_id, index, track);
+            }
+            vec![SyncEvent::Status {
+                id: op.playlist_id.clone(),
+                status: engine.status(&op.playlist_id),
+            }]
+        };
+        self.report(events);
+        true
+    }
+
     pub fn enqueue(&self, op: Op) {
         let events = self.engine.lock().enqueue(op);
         self.report(events);
