@@ -12,6 +12,10 @@ use std::collections::HashMap;
 /// How long a snapshot is trusted before a background re-read.
 pub const STALE_AFTER_SECS: f64 = 120.0;
 
+/// YouTube does not like a burst of writes: at most one request in this window,
+/// whichever playlist it belongs to.
+pub const MIN_WRITE_GAP_SECS: f64 = 0.3;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SyncState {
@@ -50,6 +54,8 @@ pub struct SyncEngine<A: PlaylistApi> {
     last_synced: HashMap<String, f64>,
     errors: HashMap<String, String>,
     clock: Box<dyn Fn() -> f64 + Send + Sync>,
+    /// When the last write to YouTube started (0 = never).
+    last_write_at: f64,
 }
 
 impl<A: PlaylistApi> SyncEngine<A> {
@@ -63,6 +69,7 @@ impl<A: PlaylistApi> SyncEngine<A> {
             last_synced: HashMap::new(),
             errors: HashMap::new(),
             clock,
+            last_write_at: 0.0,
         }
     }
 
@@ -304,16 +311,23 @@ impl<A: PlaylistApi> SyncEngine<A> {
             if state != OpState::Pending || due > now {
                 continue;
             }
-            if !touched.contains(&playlist_id) {
-                touched.push(playlist_id.clone());
-            }
             if account != self.account {
+                // Not ours: it does not even get a slot in the write window.
                 blocked.push(playlist_id);
                 continue;
             }
             if blocked.contains(&playlist_id) {
                 continue;
             }
+            if !touched.contains(&playlist_id) {
+                touched.push(playlist_id.clone());
+            }
+            // Everything the journal holds is a write, so the gap covers all of
+            // it: stop here and let the next tick take the rest.
+            if self.last_write_at > 0.0 && now - self.last_write_at < MIN_WRITE_GAP_SECS {
+                break;
+            }
+            self.last_write_at = now;
             self.ops[index].state = OpState::Running;
             match self.execute(kind, &playlist_id, &payload) {
                 Ok(()) => {
@@ -642,6 +656,7 @@ mod tests {
             let value = self.0.clone();
             Box::new(move || value.load(Ordering::Relaxed) as f64)
         }
+
     }
 
     fn engine(tag: &str, api: FakeApi) -> (SyncEngine<FakeApi>, Arc<AtomicU64>, SnapshotStore) {
@@ -681,7 +696,7 @@ mod tests {
     #[test]
     fn operations_run_in_the_order_they_were_queued() {
         let api = FakeApi::default();
-        let (mut engine, _clock, store) = engine("order", api);
+        let (mut engine, clock, store) = engine("order", api);
         store.save("PL", &snapshot(&[("a", "sa")])).unwrap();
 
         engine.enqueue(add_op("PL", &[("x", "pending:1")]));
@@ -696,10 +711,15 @@ mod tests {
         engine.enqueue(remove);
 
         let events = engine.tick();
+        // One write per window: the removal waits for the next tick.
+        assert_eq!(engine.api().calls(), vec!["add:PL:x:dup=false"]);
+        assert!(!events.is_empty());
+
+        clock.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        engine.tick();
 
         assert_eq!(engine.api().calls(), vec!["add:PL:x:dup=false", "remove:PL:a"]);
         assert!(engine.ops().is_empty(), "both finished");
-        assert!(!events.is_empty());
         let _ = std::fs::remove_dir_all(store.base());
     }
 
@@ -875,6 +895,47 @@ mod tests {
             engine.snapshot("PL").is_none(),
             "a different account must not see the previous snapshots"
         );
+        let _ = std::fs::remove_dir_all(store.base());
+    }
+
+    #[test]
+    fn writes_keep_a_gap_between_them() {
+        let api = FakeApi::default();
+        let store = store("pace");
+        store.save("PL", &snapshot(&[("a", "sa"), ("b", "sb"), ("c", "sc")])).unwrap();
+
+        // A clock that can express fractions of a second.
+        let millis = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1_000_000));
+        let clock = {
+            let value = millis.clone();
+            Box::new(move || value.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1000.0)
+        };
+        let mut engine = SyncEngine::new(api, store.clone(), "acc".to_string(), clock);
+
+        for id in ["a", "b", "c"] {
+            engine.enqueue(Op::new(
+                OpKind::Remove,
+                "PL",
+                "acc",
+                serde_json::json!({"video_id": id, "set_video_id": format!("s{id}")}),
+                1000.0,
+            ));
+        }
+
+        engine.tick();
+        assert_eq!(engine.api().calls().len(), 1, "one write per window");
+
+        millis.store(1_000_100, std::sync::atomic::Ordering::Relaxed);
+        engine.tick();
+        assert_eq!(engine.api().calls().len(), 1, "still inside the window");
+
+        millis.store(1_000_400, std::sync::atomic::Ordering::Relaxed);
+        engine.tick();
+        assert_eq!(engine.api().calls().len(), 2);
+
+        millis.store(1_000_800, std::sync::atomic::Ordering::Relaxed);
+        engine.tick();
+        assert_eq!(engine.api().calls().len(), 3);
         let _ = std::fs::remove_dir_all(store.base());
     }
 
