@@ -82,6 +82,55 @@ function interpolatedElapsed() {
   return base + (performance.now() - lastStateAt) / 1000;
 }
 
+// A seek is applied asynchronously, so the next snapshot still carries the old
+// position and the bar visibly jumps back for a second. Hold the target until
+// the engine agrees with it (or the seek clearly failed).
+let seekPending = null;
+const SEEK_SETTLE_SECS = 0.75;
+const SEEK_SETTLE_MS = 1200;
+
+function applySeek(secs) {
+  if (!(secs >= 0)) return;
+  if (!lastState) {
+    invoke("seek", { secs }).catch(() => {});
+    return;
+  }
+  const total = lastState.total || 0;
+  const target = total > 0 ? Math.min(secs, total) : secs;
+  seekPending = {
+    target,
+    at: performance.now(),
+    idx: lastState.idx,
+    playing: lastState.status === "playing",
+  };
+  invoke("seek", { secs: target }).catch(() => {});
+  // Paint the target at once: waiting for the engine to echo it back is what
+  // made the handle flick backwards.
+  const max = total > 0 ? total : 100;
+  if (seekEl.max !== String(max)) seekEl.max = max;
+  setValue(seekEl, target);
+  setText($("time-elapsed"), fmt(target));
+}
+
+/// The position to draw: the seek target while the engine is catching up,
+/// the interpolated snapshot otherwise.
+function currentElapsed() {
+  if (!lastState) return seekPending ? seekPending.target : 0;
+  if (seekPending) {
+    const settled =
+      lastState.idx === seekPending.idx &&
+      Math.abs((lastState.elapsed || 0) - seekPending.target) <= SEEK_SETTLE_SECS;
+    const stale = performance.now() - seekPending.at > SEEK_SETTLE_MS;
+    if (settled || stale || lastState.idx !== seekPending.idx) {
+      seekPending = null;
+    } else {
+      const drift = seekPending.playing ? (performance.now() - seekPending.at) / 1000 : 0;
+      return seekPending.target + drift;
+    }
+  }
+  return interpolatedElapsed();
+}
+
 /* ---------- modes ---------- */
 
 function applyMode(m) {
@@ -1602,8 +1651,8 @@ seekEl.addEventListener("input", () => {
   $("time-elapsed").textContent = fmt(seekDragValue);
 });
 seekEl.addEventListener("change", () => {
-  invoke("seek", { secs: seekDragValue });
   seekDragging = false;
+  applySeek(seekDragValue);
 });
 
 const volumeEl = $("volume");
@@ -1904,7 +1953,7 @@ function renderState(state) {
   }
 
   const total = state ? state.total : 0;
-  const elapsed = state ? state.elapsed : 0;
+  const elapsed = state ? currentElapsed() : 0;
   setText($("time-total"), fmt(total));
   if (!seekDragging) {
     const max = total > 0 ? total : 100;
@@ -2013,8 +2062,9 @@ function tickProgress() {
   if (lastState.status !== "playing") return;
   const total = lastState.total || 0;
   if (!(total > 0)) return;
-  setValue(seekEl, Math.min(total, interpolatedElapsed()));
-  setText($("time-elapsed"), fmt(interpolatedElapsed()));
+  const now = currentElapsed();
+  setValue(seekEl, Math.min(total, now));
+  setText($("time-elapsed"), fmt(now));
 }
 
 function renderApiStatus(s) {
@@ -2169,7 +2219,7 @@ async function loadLyricsForCurrent() {
         div.className = "lyric-line";
         div.dataset.time = l.time;
         div.textContent = l.text;
-        div.onclick = () => invoke("seek", { secs: l.time });
+        div.onclick = () => applySeek(l.time);
         body.appendChild(div);
       });
     } else if (r.plain) {
@@ -2372,10 +2422,10 @@ window.addEventListener("keydown", (e) => {
     invoke("toggle_pause").then(refresh);
   } else if (e.code === "ArrowLeft") {
     e.preventDefault();
-    invoke("seek", { secs: Math.max(0, (lastState ? lastState.elapsed : 0) - 5) });
+    applySeek(Math.max(0, (lastState ? lastState.elapsed : 0) - 5));
   } else if (e.code === "ArrowRight") {
     e.preventDefault();
-    invoke("seek", { secs: (lastState ? lastState.elapsed : 0) + 5 });
+    applySeek((lastState ? lastState.elapsed : 0) + 5);
   } else if (e.code === "ArrowUp") {
     e.preventDefault();
     changeVolume(0.05);
