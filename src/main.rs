@@ -1675,6 +1675,10 @@ struct TrackPage {
 
 #[derive(Serialize, Deserialize, Clone, Default)]
 struct CachedTracks {
+    /// Bumped whenever the stored shape changes: a cached page written by an
+    /// older build is silently dropped instead of being served.
+    #[serde(default)]
+    version: u32,
     #[serde(default)]
     saved_at: f64,
     #[serde(default)]
@@ -1705,11 +1709,18 @@ fn track_cache_file(key: &str) -> std::path::PathBuf {
         .join(format!("{safe}.json"))
 }
 
+/// Version 2 added `set_video_id` to every row: without it YouTube refuses to
+/// remove a track, so v1 pages are worthless.
+const TRACK_CACHE_VERSION: u32 = 2;
+
 fn load_track_cache(key: &str) -> Option<CachedTracks> {
     let path = track_cache_file(key);
     let raw = std::fs::read_to_string(&path).ok()?;
     let cached: CachedTracks = serde_json::from_str(&raw).ok()?;
-    if cached.tracks.is_empty() || now_secs() - cached.saved_at > TRACK_CACHE_TTL {
+    if cached.version < TRACK_CACHE_VERSION
+        || cached.tracks.is_empty()
+        || now_secs() - cached.saved_at > TRACK_CACHE_TTL
+    {
         return None;
     }
     Some(cached)
@@ -1732,6 +1743,7 @@ fn save_track_page(key: &str, offset: i32, tracks: &[SearchTrack], total: i32) {
     if total > 0 {
         cached.total = total;
     }
+    cached.version = TRACK_CACHE_VERSION;
     cached.saved_at = now_secs();
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);

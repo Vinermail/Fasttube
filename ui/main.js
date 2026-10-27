@@ -1137,6 +1137,8 @@ function buildSearchRow(section, index) {
 
 function openSearchPlaylist(item) {
   hideError();
+  currentLocalPlaylistId = null;
+  currentYtPlaylistId = item.playlist_id || item.id;
   loadTrackPages(
     "get_playlist_tracks",
     { playlistId: item.playlist_id || item.id },
@@ -2998,9 +3000,11 @@ async function reloadYtPlaylist() {
 
 /// "Добавить в плейлист YouTube…" for a track row.
 async function addVideoToYtPlaylist(videoId, title) {
-  const lists = ytPlaylists.slice();
+  // The list you are looking at is where this track already is: offering it
+  // makes the menu look broken.
+  const lists = ytPlaylists.filter((p) => p.ytId !== currentYtPlaylistId);
   if (!lists.length) {
-    showError("в аккаунте нет плейлистов, куда это положить");
+    showError("других плейлистов в аккаунте нет — этот трек уже здесь");
     return;
   }
   const items = lists.map((p) => ({
