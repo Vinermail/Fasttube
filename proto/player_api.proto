@@ -215,6 +215,9 @@ message PlaylistTracksResponse {
   string error = 2;
   // Total number of tracks in the playlist (0 = unknown, keep paging).
   int32 total = 3;
+  // False for a playlist saved from someone else, and for generated mixes:
+  // both are read-only here.
+  bool owned = 4;
 }
 
 message ParseAuthHeadersRequest {
@@ -276,4 +279,5 @@ service PlayerApi {
   rpc RemovePlaylistItems(RemovePlaylistItemsRequest) returns (PlaylistEditResponse);
   rpc CreateAccountPlaylist(CreatePlaylistRequest) returns (PlaylistEditResponse);
   rpc DeleteAccountPlaylist(DeletePlaylistRequest) returns (PlaylistEditResponse);
+  rpc RemoveFromLibrary(DeletePlaylistRequest) returns (PlaylistEditResponse);
 }

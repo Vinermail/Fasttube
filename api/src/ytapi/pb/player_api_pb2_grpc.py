@@ -144,6 +144,11 @@ class PlayerApiStub:
                 request_serializer=player__api__pb2.DeletePlaylistRequest.SerializeToString,
                 response_deserializer=player__api__pb2.PlaylistEditResponse.FromString,
                 _registered_method=True)
+        self.RemoveFromLibrary = channel.unary_unary(
+                '/player.PlayerApi/RemoveFromLibrary',
+                request_serializer=player__api__pb2.DeletePlaylistRequest.SerializeToString,
+                response_deserializer=player__api__pb2.PlaylistEditResponse.FromString,
+                _registered_method=True)
 
 
 class PlayerApiServicer:
@@ -281,6 +286,12 @@ class PlayerApiServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def RemoveFromLibrary(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_PlayerApiServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -391,6 +402,11 @@ def add_PlayerApiServicer_to_server(servicer, server):
             ),
             'DeleteAccountPlaylist': grpc.unary_unary_rpc_method_handler(
                     servicer.DeleteAccountPlaylist,
+                    request_deserializer=player__api__pb2.DeletePlaylistRequest.FromString,
+                    response_serializer=player__api__pb2.PlaylistEditResponse.SerializeToString,
+            ),
+            'RemoveFromLibrary': grpc.unary_unary_rpc_method_handler(
+                    servicer.RemoveFromLibrary,
                     request_deserializer=player__api__pb2.DeletePlaylistRequest.FromString,
                     response_serializer=player__api__pb2.PlaylistEditResponse.SerializeToString,
             ),
@@ -987,6 +1003,33 @@ class PlayerApi:
             request,
             target,
             '/player.PlayerApi/DeleteAccountPlaylist',
+            player__api__pb2.DeletePlaylistRequest.SerializeToString,
+            player__api__pb2.PlaylistEditResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def RemoveFromLibrary(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/player.PlayerApi/RemoveFromLibrary',
             player__api__pb2.DeletePlaylistRequest.SerializeToString,
             player__api__pb2.PlaylistEditResponse.FromString,
             options,

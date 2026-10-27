@@ -360,6 +360,26 @@ let playlistStore = { pinned: [], hidden: [], meta: {}, custom: [] };
 let hiddenOpen = false;
 let currentLocalPlaylistId = null;
 let currentYtPlaylistId = null;
+let currentYtPlaylistOwned = false;
+// Ownership learned from every page we have seen: editing is offered only for
+// playlists the account actually owns.
+const knownOwned = new Map();
+
+async function playlistOwned(entry) {
+  if (!entry.ytId) return false;
+  if (knownOwned.has(entry.ytId)) return knownOwned.get(entry.ytId);
+  try {
+    const page = await invoke("get_playlist_tracks", {
+      playlistId: entry.ytId,
+      offset: 0,
+      limit: 1,
+    });
+    knownOwned.set(entry.ytId, !!page.owned);
+    return !!page.owned;
+  } catch (_) {
+    return false;
+  }
+}
 
 function allPlaylists() {
   const custom = (playlistStore.custom || []).map((c) => ({
@@ -427,7 +447,7 @@ function sidebarRow(entry) {
   div.addEventListener("contextmenu", (e) => {
     e.preventDefault();
     e.stopPropagation();
-    openPlaylistMenu(e.clientX, e.clientY, entry);
+    openPlaylistMenu(e.clientX, e.clientY, entry).catch((err) => showError(err));
   });
   return div;
 }
@@ -512,6 +532,7 @@ async function openSidebarPlaylist(entry) {
 }
 
 function applyLocalTrackList(infos, title) {
+  currentYtPlaylistOwned = false;
   trackList = infos.map((t) => ({
     title: t.title,
     artist: t.artist,
@@ -577,9 +598,12 @@ document.addEventListener("keydown", (e) => {
 });
 window.addEventListener("blur", closeContextMenu);
 
-function openPlaylistMenu(x, y, entry) {
+async function openPlaylistMenu(x, y, entry) {
   const pinned = (playlistStore.pinned || []).includes(entry.id);
   const ytId = entry.ytId || null;
+  const mix = !!ytId && ytId.startsWith("RD");
+  // Saved (not owned) playlists are read-only here; generated mixes never are.
+  const owned = ytId && !mix ? await playlistOwned(entry) : false;
   const hidden = (playlistStore.hidden || []).includes(entry.id);
   const items = [
     {
@@ -630,7 +654,7 @@ function openPlaylistMenu(x, y, entry) {
       },
     });
   }
-  if (ytId) {
+  if (ytId && owned) {
     items.push({
       label: "Добавить треки на YouTube…",
       run: () => pickTracksForYtPlaylist(ytId, playlistTitle(entry)),
@@ -647,7 +671,30 @@ function openPlaylistMenu(x, y, entry) {
       await loadPlaylistStore();
     },
   });
-  if (ytId) {
+  if (ytId && !owned && !mix) {
+    items.push({
+      label: "Убрать из медиатеки…",
+      danger: true,
+      run: async () => {
+        const ok = await askConfirm(
+          `Убрать «${playlistTitle(entry)}» из медиатеки? Плейлист останется на YouTube.`
+        );
+        if (!ok) return;
+        await invoke("remove_from_library", { playlistId: ytId });
+        knownOwned.delete(ytId);
+        if (currentYtPlaylistId === ytId) {
+          currentYtPlaylistId = null;
+          currentYtTracks = [];
+          ytRows = [];
+          ytListVersion++;
+          refresh();
+        }
+        await loadUserPlaylists();
+        await loadPlaylistStore();
+      },
+    });
+  }
+  if (ytId && owned) {
     items.push({
       label: "Удалить на YouTube…",
       danger: true,
@@ -888,6 +935,10 @@ async function loadTrackPages(command, args, meta) {
     if (page.error) throw new Error(page.error);
     const tracks = page.tracks || [];
     if (page.total > 0) total = page.total;
+    if (currentYtPlaylistId) {
+      currentYtPlaylistOwned = !!page.owned;
+      knownOwned.set(currentYtPlaylistId, !!page.owned);
+    }
     if (first) {
       setMode("youtube");
       setYtTracks(tracks, false, meta(tracks, total));
@@ -2247,7 +2298,7 @@ function buildRow(entry, i) {
         run: () => addVideoToYtPlaylist(row.id, row.title),
       });
     }
-    if (currentYtPlaylistId && !row.setVideoId) {
+    if (currentYtPlaylistId && currentYtPlaylistOwned && !row.setVideoId) {
       // A page cached before the rows carried their per-item id: one refetch
       // makes removal possible again.
       items.push({
@@ -2258,7 +2309,7 @@ function buildRow(entry, i) {
         },
       });
     }
-    if (currentYtPlaylistId && row.setVideoId) {
+    if (currentYtPlaylistId && currentYtPlaylistOwned && row.setVideoId) {
       items.push({
         label: "Убрать из плейлиста",
         danger: true,

@@ -290,10 +290,24 @@ fn shared_client(proxy: Option<&str>) -> Result<reqwest::Client> {
     Ok(client)
 }
 
-/// Probe request: the total size, and whether the server honours ranges.
+/// The probe asks for a byte range and keeps the answer: those bytes are the
+/// first chunk of the file, there is no reason to download them twice.
+const PROBE_BYTES: u64 = 1024 * 1024;
+
+/// `Content-Range: bytes 0-1048575/19300593` → `19300593`.
+fn total_from_content_range(value: &str) -> Option<u64> {
+    let total = value.rsplit('/').next()?.trim();
+    if total.is_empty() || total == "*" {
+        return None;
+    }
+    total.parse::<u64>().ok()
+}
+
+/// Probe request: the total size, whether the server honours ranges, and the
+/// response itself, whose body becomes the first chunk.
 /// A connection failure usually means the proxy came or went, so the cached
 /// answer is dropped and the request is repeated once.
-async fn probe(url: &str) -> Result<(reqwest::Client, reqwest::Response)> {
+async fn probe(url: &str) -> Result<(reqwest::Client, reqwest::Response, u64, bool)> {
     let mut retried = false;
     loop {
         let proxy = crate::net::detect_proxy_async().await;
@@ -301,11 +315,22 @@ async fn probe(url: &str) -> Result<(reqwest::Client, reqwest::Response)> {
         let attempt = client
             .get(url)
             .header("User-Agent", USER_AGENT)
-            .header("Range", "bytes=0-")
+            .header("Range", format!("bytes=0-{}", PROBE_BYTES - 1))
             .send()
             .await;
         match attempt {
-            Ok(response) => return Ok((client, response.error_for_status()?)),
+            Ok(response) => {
+                let response = response.error_for_status()?;
+                let partial = response.status() == reqwest::StatusCode::PARTIAL_CONTENT;
+                let total = response
+                    .headers()
+                    .get(reqwest::header::CONTENT_RANGE)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(total_from_content_range)
+                    .or_else(|| response.content_length())
+                    .unwrap_or(0);
+                return Ok((client, response, total, partial));
+            }
             Err(e) if !retried && (e.is_connect() || e.is_timeout()) => {
                 crate::net::invalidate_proxy_cache();
                 retried = true;
@@ -317,9 +342,8 @@ async fn probe(url: &str) -> Result<(reqwest::Client, reqwest::Response)> {
 
 pub async fn download(url: &str, dest: &Path, handle: &ProgressHandle) -> Result<()> {
     let started = std::time::Instant::now();
-    let (client, response) = probe(url).await?;
+    let (client, response, total, partial) = probe(url).await?;
 
-    let total = response.content_length().unwrap_or(0);
     let probe_ms = started.elapsed().as_millis();
     handle.total.store(total, Ordering::Relaxed);
     handle.bytes.store(0, Ordering::Relaxed);
@@ -330,15 +354,21 @@ pub async fn download(url: &str, dest: &Path, handle: &ProgressHandle) -> Result
     std::fs::create_dir_all(parent)?;
     let tmp = dest.with_extension("part");
 
-    let chunks = chunk_count(total);
-    let parallel =
-        total > PARALLEL_THRESHOLD && chunks >= 2 && response.status() == reqwest::StatusCode::PARTIAL_CONTENT;
-    if parallel {
-        drop(response);
-        parallel_download(&client, url, &tmp, total, chunks, handle, started).await?;
+    let head = response.content_length().unwrap_or(0);
+    let chunks = chunk_count(total.saturating_sub(head));
+    let parallel = partial
+        && total > PARALLEL_THRESHOLD
+        && chunks >= 2
+        && head > 0
+        && head < total;
+    let written = if parallel {
+        parallel_download(&client, url, &tmp, total, head, chunks, handle, started, response)
+            .await?
     } else {
         sequential_download(response, &tmp, handle, started).await?;
-    }
+        0
+    };
+    let _ = written;
 
     tokio::fs::rename(&tmp, dest).await?;
     handle.done.store(true, Ordering::Relaxed);
@@ -349,14 +379,15 @@ pub async fn download(url: &str, dest: &Path, handle: &ProgressHandle) -> Result
     let secs = elapsed.as_secs_f64().max(0.001);
     let bytes = handle.bytes.load(Ordering::Relaxed);
     eprintln!(
-        "[perf] download_ms={} probe_ms={} ttfb_ms={} bytes={} mbps={:.2} parallel={} chunks={}",
+        "[perf] download_ms={} probe_ms={} ttfb_ms={} bytes={} mbps={:.2} parallel={} chunks={} head={}",
         elapsed.as_millis(),
         probe_ms,
         handle.first_byte_ms.load(Ordering::Relaxed),
         bytes,
         bytes as f64 / secs / 1_000_000.0,
         parallel,
-        if parallel { chunks } else { 1 }
+        if parallel { chunks + 1 } else { 1 },
+        head
     );
     Ok(())
 }
@@ -418,29 +449,73 @@ async fn sequential_download(
     Ok(())
 }
 
+/// Streams a response body into the file at `start`, counting bytes.
+async fn write_stream(
+    response: reqwest::Response,
+    tmp: &Path,
+    start: u64,
+    bytes: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    first_byte: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    started: std::time::Instant,
+) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+
+    let file = tokio::fs::OpenOptions::new().write(true).open(tmp).await?;
+    let mut writer = seek_for_write(start, file).await?;
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        let _ = first_byte.compare_exchange(
+            0,
+            started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+        writer.write_all(&chunk).await?;
+        bytes.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+    }
+    writer.flush().await?;
+    Ok(())
+}
+
+/// `head` bytes are already in hand (the probe response); everything after them
+/// is fetched in parallel ranges.
+#[allow(clippy::too_many_arguments)]
 async fn parallel_download(
     client: &reqwest::Client,
     url: &str,
     tmp: &Path,
     total: u64,
+    head: u64,
     chunks: u64,
     handle: &ProgressHandle,
     started: std::time::Instant,
-) -> Result<()> {
-    use tokio::io::AsyncWriteExt;
-
+    probe: reqwest::Response,
+) -> Result<u64> {
     let file = tokio::fs::File::create(tmp).await?;
     file.set_len(total).await?;
     drop(file);
 
-    let chunk_size = total.div_ceil(chunks);
     let mut tasks = Vec::new();
+
+    // The bytes the probe already delivered: no second request for them.
+    {
+        let tmp = tmp.to_path_buf();
+        let bytes = handle.bytes.clone();
+        let first_byte = handle.first_byte_ms.clone();
+        tasks.push(tokio::spawn(async move {
+            write_stream(probe, &tmp, 0, bytes, first_byte, started).await
+        }));
+    }
+
+    let rest = total.saturating_sub(head);
+    let chunk_size = rest.div_ceil(chunks.max(1));
     for i in 0..chunks {
-        let start = i * chunk_size;
+        let start = head + i * chunk_size;
         if start >= total {
             break;
         }
-        let end = ((i + 1) * chunk_size - 1).min(total - 1);
+        let end = ((i + 1) * chunk_size + head - 1).min(total - 1);
         let client = client.clone();
         let url = url.to_string();
         let tmp = tmp.to_path_buf();
@@ -457,29 +532,13 @@ async fn parallel_download(
             if resp.status() != reqwest::StatusCode::PARTIAL_CONTENT {
                 anyhow::bail!("chunk request returned {}", resp.status());
             }
-            let file = tokio::fs::OpenOptions::new().write(true).open(&tmp).await?;
-            let mut writer = seek_for_write(start, file).await?;
-            let mut stream = resp.bytes_stream();
-            while let Some(chunk) = stream.next().await {
-                let chunk = chunk?;
-                // First byte from any chunk task wins.
-                let _ = first_byte.compare_exchange(
-                    0,
-                    started.elapsed().as_millis().min(u64::MAX as u128) as u64,
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                );
-                writer.write_all(&chunk).await?;
-                bytes.fetch_add(chunk.len() as u64, Ordering::Relaxed);
-            }
-            writer.flush().await?;
-            Ok::<(), anyhow::Error>(())
+            write_stream(resp, &tmp, start, bytes, first_byte, started).await
         }));
     }
     for task in tasks {
         task.await??;
     }
-    Ok(())
+    Ok(head)
 }
 
 struct CountingSink {
@@ -705,8 +764,114 @@ mod tests {
         assert_eq!(entries[0].size, 10);
         std::fs::remove_dir_all(&dir).unwrap();
     }
-}
 
+    #[test]
+    fn content_range_gives_the_total_size() {
+        assert_eq!(
+            total_from_content_range("bytes 0-1048575/19300593"),
+            Some(19300593)
+        );
+        // A suffix range still reports the full size.
+        assert_eq!(total_from_content_range("bytes 524288-1048575/4096"), Some(4096));
+        // YouTube answers the last probe with "0-.../1522".
+        assert_eq!(total_from_content_range("bytes 0-1521/1522"), Some(1522));
+    }
+
+    #[test]
+    fn an_unknown_or_broken_content_range_is_not_a_size() {
+        assert_eq!(total_from_content_range("bytes 0-1023/*"), None);
+        assert_eq!(total_from_content_range(""), None);
+        assert_eq!(total_from_content_range("garbage"), None);
+        assert_eq!(total_from_content_range("bytes 0-1023/abc"), None);
+    }
+
+
+    /// Serves `payload` and honours Range, recording where each request starts.
+    async fn serve(payload: Vec<u8>) -> (String, std::sync::Arc<parking_lot::Mutex<Vec<(u64, u64)>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let ranges = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let seen = ranges.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let payload = payload.clone();
+                let seen = seen.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 2048];
+                    let n = socket.read(&mut buf).await.unwrap_or(0);
+                    let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let mut start = 0u64;
+                    let mut end = payload.len() as u64 - 1;
+                    for line in request.lines() {
+                        let lower = line.to_ascii_lowercase();
+                        if let Some(rest) = lower.strip_prefix("range: bytes=") {
+                            let mut parts = rest.split('-');
+                            start = parts.next().unwrap_or("0").trim().parse().unwrap_or(0);
+                            end = parts
+                                .next()
+                                .and_then(|v| v.trim().parse().ok())
+                                .unwrap_or(payload.len() as u64 - 1);
+                        }
+                    }
+                    seen.lock().push((start, end));
+                    let body = &payload[start as usize..=(end as usize).min(payload.len() - 1)];
+                    let header = format!(
+                        "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {}-{}/{}\r\nConnection: close\r\n\r\n",
+                        body.len(),
+                        start,
+                        (end as usize).min(payload.len() - 1),
+                        payload.len()
+                    );
+                    let _ = socket.write_all(header.as_bytes()).await;
+                    let _ = socket.write_all(body).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        (format!("http://127.0.0.1:{port}/file.bin"), ranges)
+    }
+
+    #[tokio::test]
+    async fn the_probe_response_is_used_as_the_first_chunk() {
+        // No system proxy: the test server is local, and the proxy choice is
+        // process-wide, so this serialises with the net tests.
+        let _guard = crate::net::test_proxy_lock();
+        crate::net::set_override(Some(None));
+        let payload = sample(3 * 1024 * 1024 + 1234);
+        let (url, ranges) = serve(payload.clone()).await;
+
+        let dir = std::env::temp_dir().join(format!("ft-probe-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("out.bin");
+        let handle = ProgressHandle::default();
+        let result = download(&url, &dest, &handle).await;
+        crate::net::set_override(None);
+
+        result.expect("download failed");
+        let written = std::fs::read(&dest).unwrap();
+        assert_eq!(written.len(), payload.len(), "size mismatch");
+        assert!(written == payload, "the bytes are not the served ones");
+
+        // The probe asked for the first megabyte and its body was written, so no
+        // later request starts at zero again.
+        let seen = ranges.lock().clone();
+        assert_eq!(
+            seen.iter().filter(|(start, _)| *start == 0).count(),
+            1,
+            "the first chunk was downloaded twice: {seen:?}"
+        );
+        assert!(seen.len() >= 2, "nothing was fetched in parallel: {seen:?}");
+        let total: u64 = seen.iter().map(|(a, b)| b - a + 1).sum();
+        assert_eq!(total, payload.len() as u64, "ranges overlap: {seen:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+}
 impl tokio::io::AsyncWrite for CountingSink {
     fn poll_write(
         mut self: std::pin::Pin<&mut Self>,

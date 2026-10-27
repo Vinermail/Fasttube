@@ -877,6 +877,24 @@ async fn create_account_playlist(
 }
 
 /// Deletes a playlist on the YouTube account. There is no undo.
+/// Drops a saved playlist out of the account's library; it stays on YouTube.
+#[tauri::command]
+async fn remove_from_library(
+    playlist_id: String,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    ensure_session_fresh(&app, &state).await;
+    let resp = grpc::remove_from_library(&playlist_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    if !resp.ok {
+        return Err(resp.error);
+    }
+    drop_playlist_cache(&playlist_id);
+    Ok(())
+}
+
 #[tauri::command]
 async fn delete_account_playlist(
     playlist_id: String,
@@ -1681,6 +1699,9 @@ struct TrackPage {
     total: i32,
     /// "disk" when this answer came from the cache, "net" otherwise.
     source: String,
+    /// False for a playlist saved from someone else, and for generated mixes:
+    /// the UI must not offer editing there.
+    owned: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Default)]
@@ -1689,6 +1710,9 @@ struct CachedTracks {
     /// older build is silently dropped instead of being served.
     #[serde(default)]
     version: u32,
+    /// Remembered with the rows: a saved foreign playlist must not look own.
+    #[serde(default)]
+    owned: bool,
     #[serde(default)]
     saved_at: f64,
     #[serde(default)]
@@ -1719,9 +1743,9 @@ fn track_cache_file(key: &str) -> std::path::PathBuf {
         .join(format!("{safe}.json"))
 }
 
-/// Version 2 added `set_video_id` to every row: without it YouTube refuses to
-/// remove a track, so v1 pages are worthless.
-const TRACK_CACHE_VERSION: u32 = 2;
+/// v2 added `set_video_id` to every row (without it YouTube refuses to remove a
+/// track); v3 added `owned`, which decides whether editing is offered at all.
+const TRACK_CACHE_VERSION: u32 = 3;
 
 fn load_track_cache(key: &str) -> Option<CachedTracks> {
     let path = track_cache_file(key);
@@ -1738,7 +1762,7 @@ fn load_track_cache(key: &str) -> Option<CachedTracks> {
 
 /// Merges one page into the cache file: pages arrive in order, so the file
 /// grows to `offset + tracks.len()`.
-fn save_track_page(key: &str, offset: i32, tracks: &[SearchTrack], total: i32) {
+fn save_track_page(key: &str, offset: i32, tracks: &[SearchTrack], total: i32, owned: bool) {
     let path = track_cache_file(key);
     let mut cached = std::fs::read_to_string(&path)
         .ok()
@@ -1755,6 +1779,7 @@ fn save_track_page(key: &str, offset: i32, tracks: &[SearchTrack], total: i32) {
         cached.total = total;
     }
     cached.version = TRACK_CACHE_VERSION;
+    cached.owned = owned;
     cached.saved_at = now_secs();
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
@@ -1829,6 +1854,7 @@ async fn fetch_track_page(
             tracks: cached.tracks[..end].to_vec(),
             total: cached.total,
             source: "disk".to_string(),
+            owned: cached.owned,
         });
     }
 
@@ -1843,12 +1869,13 @@ async fn fetch_track_page(
     }
     let tracks: Vec<SearchTrack> = resp.tracks.into_iter().map(to_search_track).collect();
     if !tracks.is_empty() {
-        save_track_page(key, offset, &tracks, resp.total);
+        save_track_page(key, offset, &tracks, resp.total, resp.owned);
     }
     Ok(TrackPage {
         tracks,
         total: resp.total,
         source: "net".to_string(),
+        owned: resp.owned,
     })
 }
 
@@ -3612,6 +3639,7 @@ fn main() {
             create_account_playlist,
             delete_account_playlist,
             refresh_playlist_tracks,
+            remove_from_library,
             set_developer_mode,
             open_devtools
         ])

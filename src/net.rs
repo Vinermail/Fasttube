@@ -21,6 +21,14 @@ static PROXY_CACHE: OnceLock<Mutex<Option<(Option<String>, Instant)>>> = OnceLoc
 /// `Some(None)` means "no proxy at all", `Some(Some(url))` is an explicit one.
 static PROXY_OVERRIDE: OnceLock<Mutex<Option<Option<String>>>> = OnceLock::new();
 
+/// The proxy choice is process-wide: tests that touch it (including the
+/// downloader's, which must talk to a local server directly) take this lock.
+#[cfg(test)]
+pub(crate) fn test_proxy_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn override_slot() -> &'static Mutex<Option<Option<String>>> {
     PROXY_OVERRIDE.get_or_init(|| Mutex::new(None))
 }
@@ -104,17 +112,13 @@ pub fn detect_proxy() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    /// The proxy state is process-wide, so these tests must not overlap.
-    static SERIAL: Mutex<()> = Mutex::new(());
 
     /// Probing three ports with a 400 ms budget each is the slow path; a cached
     /// answer must not repeat it (and must survive invalidation the way the
     /// retry path expects).
     #[test]
     fn proxy_lookup_is_cached_and_invalidatable() {
-        let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = test_proxy_lock();
         set_override(None);
         invalidate_proxy_cache();
         let started = Instant::now();
@@ -139,7 +143,7 @@ mod tests {
     /// What the settings pick must win over anything the probe would find.
     #[test]
     fn the_explicit_choice_beats_probing() {
-        let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = test_proxy_lock();
         set_override(Some(Some("socks5h://10.1.2.3:9050".to_string())));
         assert_eq!(
             detect_proxy_cached().as_deref(),

@@ -264,6 +264,12 @@ class PlayerApiServicer(player_api_pb2_grpc.PlayerApiServicer):
             ok=bool(result.get("ok")), error=result.get("error", "")
         )
 
+    def RemoveFromLibrary(self, request, context):
+        result = youtube.remove_from_library(request.playlist_id)
+        return player_api_pb2.PlaylistEditResponse(
+            ok=bool(result.get("ok")), error=result.get("error", "")
+        )
+
     def CreateAccountPlaylist(self, request, context):
         result = youtube.create_account_playlist(request.title)
         return player_api_pb2.PlaylistEditResponse(
@@ -294,6 +300,7 @@ class PlayerApiServicer(player_api_pb2_grpc.PlayerApiServicer):
             tracks=[_to_pb_track(t) for t in result.get("tracks", [])],
             error=result.get("error", ""),
             total=result.get("total", 0),
+            owned=bool(result.get("owned", False)),
         )
 
     def GetLikedSongs(self, request, context):
@@ -302,6 +309,7 @@ class PlayerApiServicer(player_api_pb2_grpc.PlayerApiServicer):
             tracks=[_to_pb_track(t) for t in result.get("tracks", [])],
             error=result.get("error", ""),
             total=result.get("total", 0),
+            owned=True,
         )
 
     def SetSession(self, request, context):

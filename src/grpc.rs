@@ -309,6 +309,20 @@ pub async fn create_account_playlist(title: &str) -> Result<PlaylistEditResponse
     Ok(resp.into_inner())
 }
 
+/// Drops a saved playlist out of the account's library (it stays on YouTube).
+pub async fn remove_from_library(playlist_id: &str) -> Result<PlaylistEditResponse> {
+    let mut client = connect().await?;
+    let resp = client
+        .remove_from_library(with_timeout(
+            DeletePlaylistRequest {
+                playlist_id: playlist_id.to_string(),
+            },
+            CALL_TIMEOUT,
+        ))
+        .await?;
+    Ok(resp.into_inner())
+}
+
 /// Deletes a playlist on the account. There is no undo.
 pub async fn delete_account_playlist(playlist_id: &str) -> Result<PlaylistEditResponse> {
     let mut client = connect().await?;

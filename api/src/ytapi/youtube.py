@@ -107,6 +107,47 @@ def _cached_lib(key: str, ttl: int, loader):
     return data
 
 
+def _edit_status(result) -> tuple[bool, str]:
+    """ytmusicapi does not raise when YouTube refuses: it returns a status
+    string or the whole response. Only SUCCEEDED counts as done."""
+    if isinstance(result, str):
+        return ("SUCCEEDED" in result.upper()), result
+    if isinstance(result, dict):
+        status = str(result.get("status") or "").upper()
+        if status:
+            return ("SUCCEEDED" in status), status
+        # Some endpoints answer with the action list and no status at all.
+        if result.get("actions") or result.get("playlistEditResults"):
+            return True, "OK"
+        return False, json.dumps(result)[:300]
+    return False, repr(result)
+
+
+def _looks_like_duplicate(result) -> bool:
+    text = json.dumps(result).upper() if not isinstance(result, str) else result.upper()
+    return "DUPLICATE" in text or "ALREADY" in text
+
+
+def _refuse_unowned(playlist_id: str) -> dict | None:
+    """A saved (not owned) playlist cannot be edited, and a mix is generated:
+    both are rejected here, before any request leaves the process."""
+    if _is_mix(playlist_id):
+        return {"ok": False, "error": "автоматический микс менять нельзя"}
+    owned = _playlist_owned(playlist_id)
+    if owned is False:
+        return {
+            "ok": False,
+            "error": "это сохранённый чужой плейлист — менять его нельзя (только убрать из медиатеки)",
+        }
+    return None
+
+
+def _playlist_owned(playlist_id: str) -> bool | None:
+    with _playlist_lock:
+        entry = _PLAYLISTS.get(f"playlist:{playlist_id}")
+        return None if entry is None else bool(entry.get("owned"))
+
+
 def create_account_playlist(title: str) -> dict:
     """Creates a private playlist on the account and returns its id."""
     ytm = _session_client()
@@ -118,6 +159,13 @@ def create_account_playlist(title: str) -> dict:
     except Exception as e:
         log.exception("create_playlist failed")
         return {"ok": False, "error": str(e), "id": ""}
+    if isinstance(created, dict):
+        ok, status = _edit_status(created)
+        return {
+            "ok": ok,
+            "error": "" if ok else f"YouTube отказал: {status}",
+            "id": str(created.get("playlistId") or ""),
+        }
     if not isinstance(created, str) or not created:
         return {"ok": False, "error": "YouTube не вернул id плейлиста", "id": ""}
     invalidate_account_caches()
@@ -126,15 +174,22 @@ def create_account_playlist(title: str) -> dict:
 
 def delete_account_playlist(playlist_id: str) -> dict:
     """Deletes a playlist on the account. There is no undo."""
+    refused = _refuse_unowned(playlist_id)
+    if refused:
+        return refused
     ytm = _session_client()
     if ytm is None:
         return {"ok": False, "error": "нужен вход в аккаунт YouTube"}
     try:
-        ytm.delete_playlist(playlist_id)
+        result = ytm.delete_playlist(playlist_id)
     except Exception as e:
         log.exception("delete_playlist failed")
         return {"ok": False, "error": str(e)}
+    ok, status = _edit_status(result)
+    if not ok:
+        return {"ok": False, "error": f"YouTube не подтвердил удаление: {status}"}
     invalidate_account_caches()
+    _forget_playlist(playlist_id)
     return {"ok": True, "error": ""}
 
 
@@ -142,14 +197,22 @@ def add_playlist_items(playlist_id: str, video_ids: list[str]) -> dict:
     """Appends tracks to one of the account's playlists (writes to YouTube)."""
     if not video_ids:
         return {"ok": True, "error": ""}
+    refused = _refuse_unowned(playlist_id)
+    if refused:
+        return refused
     ytm = _session_client()
     if ytm is None:
         return {"ok": False, "error": "нужен вход в аккаунт YouTube"}
     try:
-        ytm.add_playlist_items(playlist_id, videoIds=list(video_ids))
+        result = ytm.add_playlist_items(playlist_id, videoIds=list(video_ids))
     except Exception as e:
         log.exception("add_playlist_items failed")
         return {"ok": False, "error": str(e)}
+    ok, status = _edit_status(result)
+    if not ok:
+        if _looks_like_duplicate(result):
+            return {"ok": False, "error": "уже есть в плейлисте"}
+        return {"ok": False, "error": f"YouTube отказал: {status}"}
     # The cached list is stale the moment the write lands.
     invalidate_account_caches()
     return {"ok": True, "error": ""}
@@ -171,15 +234,41 @@ def remove_playlist_items(playlist_id: str, items: list[dict]) -> dict:
             "ok": False,
             "error": "у этих строк нет id строки плейлиста — обнови список",
         }
+    refused = _refuse_unowned(playlist_id)
+    if refused:
+        return refused
     ytm = _session_client()
     if ytm is None:
         return {"ok": False, "error": "нужен вход в аккаунт YouTube"}
     try:
-        ytm.remove_playlist_items(playlist_id, videos)
+        result = ytm.remove_playlist_items(playlist_id, videos)
     except Exception as e:
         log.exception("remove_playlist_items failed")
         return {"ok": False, "error": str(e)}
+    ok, status = _edit_status(result)
+    if not ok:
+        return {"ok": False, "error": f"YouTube не подтвердил удаление: {status}"}
     invalidate_account_caches()
+    return {"ok": True, "error": ""}
+
+
+def remove_from_library(playlist_id: str) -> dict:
+    """Drops a saved playlist out of the account's library (it stays on YouTube)."""
+    if _is_mix(playlist_id):
+        return {"ok": False, "error": "автоматический микс нельзя убрать из медиатеки"}
+    ytm = _session_client()
+    if ytm is None:
+        return {"ok": False, "error": "нужен вход в аккаунт YouTube"}
+    try:
+        result = ytm.rate_playlist(playlist_id, "INDIFFERENT")
+    except Exception as e:
+        log.exception("rate_playlist failed")
+        return {"ok": False, "error": str(e)}
+    ok, status = _edit_status(result)
+    if not ok:
+        return {"ok": False, "error": f"YouTube не подтвердил удаление из медиатеки: {status}"}
+    invalidate_account_caches()
+    _forget_playlist(playlist_id)
     return {"ok": True, "error": ""}
 
 
@@ -234,8 +323,9 @@ def invalidate_account_caches() -> None:
         _LIB_CACHE.clear()
     with _home_lock:
         _HOME_CACHE.clear()
-    with _playlist_lock:
-        _PLAYLISTS.clear()
+    # Also bumps the generation, so a background playlist load that started
+    # before this reset cannot store the previous account's tracks.
+    invalidate_playlists()
 
 
 _load_resolve_cache()
@@ -1513,8 +1603,19 @@ PLAYLIST_PAGE = 100
 _PLAYLIST_TTL = 4 * 3600
 
 _playlist_lock = threading.Lock()
-# "playlist:<id>" / "liked" -> {"tracks", "total", "complete", "at", "loading"}
+# "playlist:<id>" / "liked" -> {"tracks", "total", "owned", "complete", "at",
+# "loading", "done"}
 _PLAYLISTS: dict[str, dict] = {}
+
+# Bumped by every account invalidation. A background load remembers the value
+# it started with, so a fetch that began before a logout/session change cannot
+# write its (other account's) tracks into the fresh cache.
+_playlist_generation = 0
+
+
+def _generation() -> int:
+    with _playlist_lock:
+        return _playlist_generation
 
 
 def _playlist_state(key: str) -> dict | None:
@@ -1525,8 +1626,18 @@ def _playlist_state(key: str) -> dict | None:
         return None
 
 
-def _store_playlist(key: str, tracks: list[dict], total: int, complete: bool) -> None:
+def _store_playlist(
+    key: str,
+    tracks: list[dict],
+    total: int,
+    complete: bool,
+    owned: bool = False,
+    generation: int | None = None,
+) -> None:
     with _playlist_lock:
+        if generation is not None and generation != _playlist_generation:
+            # The cache was cleared while this fetch was in flight.
+            return
         previous = _PLAYLISTS.get(key)
         # Keep the same event across a replacement: a request already waiting on
         # it must be woken by the background load, not by a copy.
@@ -1536,6 +1647,7 @@ def _store_playlist(key: str, tracks: list[dict], total: int, complete: bool) ->
         _PLAYLISTS[key] = {
             "tracks": tracks,
             "total": total,
+            "owned": owned,
             "complete": complete,
             "at": time.time(),
             "loading": False,
@@ -1551,9 +1663,11 @@ def _ensure_full_load(key: str, fetch_all) -> None:
             return
         entry["loading"] = True
 
+    generation = _generation()
+
     def run() -> None:
         try:
-            tracks, total = fetch_all()
+            tracks, total, owned = fetch_all()
         except Exception as e:  # keep the first page usable, cache nothing
             log.warning("full playlist load failed (%s): %s", key, e)
             with _playlist_lock:
@@ -1562,7 +1676,7 @@ def _ensure_full_load(key: str, fetch_all) -> None:
                     entry["loading"] = False
                     entry["done"].set()
             return
-        _store_playlist(key, tracks, total, True)
+        _store_playlist(key, tracks, total, True, owned, generation)
 
     threading.Thread(target=run, name="playlist-load", daemon=True).start()
 
@@ -1586,8 +1700,16 @@ def _wait_for_more(key: str, page: list[dict], offset: int, limit: int, timeout:
 
 def invalidate_playlists() -> None:
     """Drop the paged caches (a session change means other lists)."""
+    global _playlist_generation
     with _playlist_lock:
         _PLAYLISTS.clear()
+        _playlist_generation += 1
+
+
+def _forget_playlist(playlist_id: str) -> None:
+    """Drops one playlist's page cache (after it was edited or deleted)."""
+    with _playlist_lock:
+        _PLAYLISTS.pop(f"playlist:{playlist_id}", None)
 
 
 def _is_mix(playlist_id: str) -> bool:
@@ -1621,8 +1743,11 @@ def _playlist_rows(data: dict) -> list[dict]:
     return tracks
 
 
-def _fetch_playlist_page(ytm, playlist_id: str, limit: int) -> tuple[list[dict], int]:
-    """One request: `limit` tracks plus the playlist's own track count."""
+def _fetch_playlist_page(
+    ytm, playlist_id: str, limit: int
+) -> tuple[list[dict], int, bool]:
+    """One request: `limit` tracks, the playlist's own track count, and whether
+    the account owns it (a saved foreign playlist cannot be edited)."""
     if _is_mix(playlist_id):
         try:
             data = ytm.get_watch_playlist(playlistId=playlist_id, limit=MIX_TRACK_LIMIT) or {}
@@ -1634,19 +1759,20 @@ def _fetch_playlist_page(ytm, playlist_id: str, limit: int) -> tuple[list[dict],
             # Some mixes answer the watch endpoint with nothing usable.
             data = ytm.get_playlist(playlist_id, limit=limit) or {}
             tracks = _playlist_rows(data)
-        return tracks, len(tracks)
+        return tracks, len(tracks), False
     data = ytm.get_playlist(playlist_id, limit=limit) or {}
     tracks = _playlist_rows(data)
     total = int(data.get("trackCount") or 0) or len(tracks)
-    return tracks, max(total, len(tracks))
+    return tracks, max(total, len(tracks)), bool(data.get("owned"))
 
 
-def _fetch_playlist_all(ytm, playlist_id: str) -> tuple[list[dict], int]:
+def _fetch_playlist_all(ytm, playlist_id: str) -> tuple[list[dict], int, bool]:
     if _is_mix(playlist_id):
         return _fetch_playlist_page(ytm, playlist_id, MIX_TRACK_LIMIT)
     data = ytm.get_playlist(playlist_id, limit=None) or {}
     tracks = _playlist_rows(data)
-    return tracks, max(int(data.get("trackCount") or 0), len(tracks))
+    total = max(int(data.get("trackCount") or 0), len(tracks))
+    return tracks, total, bool(data.get("owned"))
 
 
 def playlist_tracks(playlist_id: str, offset: int = 0, limit: int = PLAYLIST_PAGE) -> dict:
@@ -1667,21 +1793,22 @@ def playlist_tracks(playlist_id: str, offset: int = 0, limit: int = PLAYLIST_PAG
             ytm = _session_client()
             if ytm is None:
                 return {"tracks": [], "error": "not signed in", "total": 0}
-            tracks, total = _fetch_playlist_page(ytm, playlist_id, PLAYLIST_PAGE)
+            tracks, total, owned = _fetch_playlist_page(ytm, playlist_id, PLAYLIST_PAGE)
         except Exception as e:
             log.exception("get_playlist failed")
-            return {"tracks": [], "error": str(e), "total": 0}
+            return {"tracks": [], "error": str(e), "total": 0, "owned": False}
         complete = len(tracks) >= total
-        _store_playlist(key, tracks, total, complete)
+        _store_playlist(key, tracks, total, complete, owned, _generation())
         if not complete:
             _ensure_full_load(key, lambda: _fetch_playlist_all(ytm, playlist_id))
-        entry = _playlist_state(key) or {"tracks": tracks, "total": total}
+        entry = _playlist_state(key) or {"tracks": tracks, "total": total, "owned": owned}
 
     page = _page(entry["tracks"], offset, limit)
     return {
         "tracks": _wait_for_more(key, page, offset, limit),
         "error": "",
         "total": int(entry["total"]),
+        "owned": bool(entry.get("owned")),
     }
 
 
@@ -1707,22 +1834,23 @@ def liked_songs(offset: int = 0, limit: int = PLAYLIST_PAGE) -> dict:
             return {"tracks": [], "error": str(e), "total": 0}
         # YouTube does not always report a count here: 0 means "keep asking
         # until a short page comes back".
-        _store_playlist(key, tracks, max(total, len(tracks)), False)
+        _store_playlist(key, tracks, max(total, len(tracks)), False, True, _generation())
 
-        def fetch_all() -> tuple[list[dict], int]:
+        def fetch_all() -> tuple[list[dict], int, bool]:
             ytm2 = _session_client()
             if ytm2 is None:
                 raise RuntimeError("not signed in")
             data = ytm2.get_liked_songs(limit=None) or {}
             rows = _playlist_rows(data)
-            return rows, len(rows)
+            return rows, len(rows), True
 
         _ensure_full_load(key, fetch_all)
-        entry = _playlist_state(key) or {"tracks": tracks, "total": total}
+        entry = _playlist_state(key) or {"tracks": tracks, "total": total, "owned": True}
 
     page = _page(entry["tracks"], offset, limit)
     return {
         "tracks": _wait_for_more(key, page, offset, limit),
         "error": "",
         "total": int(entry["total"]),
+        "owned": True,
     }
