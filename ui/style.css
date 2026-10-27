@@ -2083,16 +2083,32 @@ input[type="range"]::-moz-range-thumb {
   color: var(--fg);
 }
 
+/* .item is block level (one ellipsised line); a row with a cover needs its own
+   line box, otherwise the 26 px image and the text share a 17 px baseline and
+   the title lands on top of the artwork. */
+.pl-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 26px;
+}
+
 .pl-item .pin-mark {
+  flex: 0 0 auto;
   font-size: 10px;
-  margin-right: 4px;
   opacity: 0.9;
 }
 
 .pl-item .pl-name {
+  flex: 1 1 auto;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.pl-item .count {
+  flex: 0 0 auto;
 }
 
 .pl-new {
