@@ -591,6 +591,7 @@ function applyLocalTrackList(infos, title) {
     artist: t.artist,
     duration: t.duration,
     path: t.path,
+    thumbnail: t.cover ? convertFileSrc(t.cover) : "",
   }));
   trackListKey = null;
   const coverPath = (infos.find((t) => t.cover) || {}).cover;
@@ -2421,6 +2422,7 @@ function buildRow(entry, i) {
     (isActive
       ? `<div class="t-idx"><span class="eq"><i></i><i></i><i></i></span></div>`
       : `<div class="t-idx">${i + 1}</div>`) +
+    `<div class="t-thumb">♪</div>` +
     `<div class="t-title">${escapeHtml(row.title)}</div>` +
     `<div class="t-artist">${escapeHtml(row.artist || "")}</div>` +
     `<button class="t-heart${liked ? " on" : ""}" title="${
@@ -2428,6 +2430,19 @@ function buildRow(entry, i) {
     }" aria-pressed="${liked ? "true" : "false"}">${liked ? "♥" : "♡"}</button>` +
     `<div class="t-dur">${dur}</div>`;
 
+  // The cover is set as a property, not through the markup: a URL from the
+  // network must never be able to close the attribute it sits in.
+  if (row.thumbnail) {
+    const slot = div.querySelector(".t-thumb");
+    const img = document.createElement("img");
+    img.loading = "lazy";
+    img.alt = "";
+    img.decoding = "async";
+    img.src = row.thumbnail;
+    img.onerror = () => img.remove();
+    slot.textContent = "";
+    slot.appendChild(img);
+  }
   div.querySelector(".t-heart").addEventListener("click", (e) => {
     e.stopPropagation();
     toggleLike(row);
@@ -2532,6 +2547,7 @@ async function refreshTracks(key, activeIndex) {
       artist: t.artist,
       duration: t.duration,
       path: t.path,
+      thumbnail: t.cover ? convertFileSrc(t.cover) : "",
     }));
     trackListKey = key;
     renderTracks($("tracks"), applyFilterSort(trackList, key), activeIndex, key + ":" + filterText + ":" + sortMode);
