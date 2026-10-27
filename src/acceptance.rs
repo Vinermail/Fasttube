@@ -154,6 +154,35 @@ fn drain<A: crate::sync::api::PlaylistApi>(
     (ticks, all)
 }
 
+/// A fresh sidecar on the same port, a fresh session and a fresh engine on the
+/// same journal: what a restart of the app looks like.
+fn reboot(
+    port: u16,
+    bundle: &crate::secrets::AuthBundle,
+    store: &SnapshotStore,
+    account: &str,
+) -> (Sidecar, SyncEngine<GrpcApi>) {
+    let side = Sidecar::start(Some(port));
+    {
+        let _enter = runtime().enter();
+        crate::grpc::set_endpoint(side.port, side.token.clone()).ok();
+    }
+    let status = block(crate::grpc::set_session(
+        &bundle.cookie,
+        &bundle.user_agent,
+        &bundle.x_goog_authuser,
+    ))
+    .expect("set_session after a restart");
+    assert_eq!(
+        status.state(),
+        crate::grpc::SessionState::Active,
+        "the session comes back after a restart"
+    );
+    let mut engine = SyncEngine::new(GrpcApi, store.clone(), account.to_string(), real_clock());
+    engine.replay();
+    (side, engine)
+}
+
 fn store_dir(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("fasttube-acceptance-{tag}"));
     let _ = std::fs::remove_dir_all(&dir);
@@ -385,79 +414,122 @@ fn manual_acceptance() {
     assert_eq!(diff.map(|d| d.added), Some(1), "and reported exactly one add");
 
     // ------------------------------------------------ S3: offline, then back online --
-    // The per-item id of the row added "from the phone", so the deferred removal
-    // can really go through once the network is back.
-    let second_row = block(crate::grpc::get_playlist_tracks(&playlist_id, 0, 50))
-        .expect("read")
-        .tracks
-        .into_iter()
-        .find(|t| t.video_id == second)
-        .expect("the second track is on YouTube");
-    let second_set_id = second_row.set_video_id.clone();
+    let first_set_id = engine
+        .snapshot(&playlist_id)
+        .and_then(|s| {
+            s.tracks
+                .iter()
+                .find(|t| t.video_id == video_id)
+                .map(|t| t.set_video_id.clone())
+        })
+        .unwrap_or_default();
+    let mut restart_sides: Vec<Sidecar> = Vec::new();
+
+    // An add made with no network at all.
     sidecar.stop();
     say("S3 sidecar killed: the app is offline now");
+    engine.enqueue(Op::new(
+        OpKind::Add,
+        &playlist_id,
+        "",
+        serde_json::json!({"items": [{
+            "video_id": second,
+            "temp_id": "pending:offline",
+            "title": "added offline",
+        }]}),
+        crate::now_secs(),
+    ));
+    engine.tick();
+    let status = engine.status(&playlist_id);
+    say(&format!(
+        "S3 offline add: state={:?} pending={} error={:?}",
+        status.state, status.pending, status.error
+    ));
+    assert_eq!(status.pending, 1);
+
+    let left = engine.pending_ops();
+    drop(engine);
+    say(&format!("S3 restart: {left} operation(s) left in the journal"));
+    let (side, mut engine) = reboot(sidecar.port, &bundle, &store, &account);
+    restart_sides.push(side);
+    let (ticks, _) = drain(&mut engine, 60);
+    say(&format!(
+        "S3 the offline add drained in {ticks} tick(s), {} left",
+        engine.pending_ops()
+    ));
+    assert_eq!(engine.pending_ops(), 0, "everything went out");
+    let after = block(crate::grpc::get_playlist_tracks_fresh(&playlist_id, 0, 50)).expect("read");
+    say(&format!(
+        "S3 YouTube now has {} row(s): {:?}",
+        after.tracks.len(),
+        after.tracks.iter().map(|t| t.video_id.clone()).collect::<Vec<_>>()
+    ));
+    assert_eq!(after.tracks.len(), 2, "the offline add landed");
+
+    // A move made with no network: the first row to the end.
+    restart_sides.last_mut().unwrap().stop();
+    engine.enqueue(Op::new(
+        OpKind::Move,
+        &playlist_id,
+        "",
+        serde_json::json!({"set_video_id": first_set_id, "before_set_video_id": ""}),
+        crate::now_secs(),
+    ));
+    engine.tick();
+    say(&format!(
+        "S3 offline move: pending={}",
+        engine.status(&playlist_id).pending
+    ));
+    assert_eq!(engine.status(&playlist_id).pending, 1);
+    let (side, mut engine) = reboot(sidecar.port, &bundle, &store, &account);
+    restart_sides.push(side);
+    let (ticks, _) = drain(&mut engine, 60);
+    say(&format!(
+        "S3 the offline move drained in {ticks} tick(s), {} left",
+        engine.pending_ops()
+    ));
+    let moved = block(crate::grpc::get_playlist_tracks_fresh(&playlist_id, 0, 50)).expect("read");
+    let order: Vec<String> = moved.tracks.iter().map(|t| t.video_id.clone()).collect();
+    say(&format!("S3 order after the move: {order:?}"));
+    assert_eq!(order.last().map(String::as_str), Some(video_id.as_str()));
+
+    // A removal made with no network.
+    restart_sides.last_mut().unwrap().stop();
+    let second_set = moved
+        .tracks
+        .iter()
+        .find(|t| t.video_id == second)
+        .map(|t| t.set_video_id.clone())
+        .unwrap_or_default();
     engine.enqueue(Op::new(
         OpKind::Remove,
         &playlist_id,
         "",
         serde_json::json!({
             "video_id": second,
-            "set_video_id": second_set_id,
-            "title": second_row.title,
-            "artist": second_row.artist,
-            "index": 1,
+            "set_video_id": second_set,
+            "title": "",
+            "index": 0,
         }),
         crate::now_secs(),
     ));
     engine.tick();
-    let status = engine.status(&playlist_id);
-    say(&format!(
-        "S3 status while offline: state={:?} pending={} error={:?}",
-        status.state, status.pending, status.error
-    ));
-    assert_eq!(status.pending, 1, "one change waits for the network");
-
-    let pending_before_restart = engine.pending_ops();
-    drop(engine);
-    say(&format!(
-        "S3 restart: {pending_before_restart} operation(s) left in the journal"
-    ));
-
-    let mut restarted = Sidecar::start(Some(sidecar.port));
-    {
-        let _enter = runtime().enter();
-        crate::grpc::set_endpoint(restarted.port, restarted.token.clone()).ok();
-    }
-    // The session lives in the sidecar's memory, so it has to be installed again.
-    let status = block(crate::grpc::set_session(
-        &bundle.cookie,
-        &bundle.user_agent,
-        &bundle.x_goog_authuser,
-    ))
-    .expect("set_session after restart");
-    assert_eq!(status.state(), crate::grpc::SessionState::Active);
-    say("S3 sidecar is back with the same port and a fresh session");
-
-    let mut engine = SyncEngine::new(GrpcApi, store.clone(), account.clone(), real_clock());
-    let replayed = engine.replay();
-    say(&format!(
-        "S3 replay after the restart: {} event(s), {} op(s) in the journal",
-        replayed.len(),
-        engine.pending_ops()
-    ));
+    assert_eq!(engine.status(&playlist_id).pending, 1);
+    let (side, mut engine) = reboot(sidecar.port, &bundle, &store, &account);
+    restart_sides.push(side);
     let (ticks, _) = drain(&mut engine, 60);
     say(&format!(
-        "S3 drained after {ticks} ticks, {} op(s) left",
+        "S3 the offline removal drained in {ticks} tick(s), {} left",
         engine.pending_ops()
     ));
-    assert_eq!(engine.pending_ops(), 0, "everything went out");
-    let now_remote = block(crate::grpc::get_playlist_tracks(&playlist_id, 0, 50)).expect("read");
-    let second_gone = !now_remote.tracks.iter().any(|t| t.video_id == second);
+    let final_read =
+        block(crate::grpc::get_playlist_tracks_fresh(&playlist_id, 0, 50)).expect("read");
+    let gone = !final_read.tracks.iter().any(|t| t.video_id == second);
     say(&format!(
-        "S3 after the drain YouTube has {} row(s); the queued removal went through: {second_gone}",
-        now_remote.tracks.len()
+        "S3 after all of it YouTube has {} row(s); the removal went through: {gone}",
+        final_read.tracks.len()
     ));
-    assert!(second_gone, "the operation that waited for the network was applied");
+    assert!(gone, "the removal that waited for the network was applied");
 
     // ------------------------------------------------- S4: duplicate handling (live) --
     let dup = block(crate::grpc::add_playlist_items_full(
@@ -475,7 +547,9 @@ fn manual_acceptance() {
     let lists = block(crate::grpc::get_user_playlists()).expect("lists");
     let mut foreign = None;
     for list in lists.playlists.iter().take(25) {
-        if list.id == playlist_id {
+        // LM is the liked-songs list and RD… are generated mixes: both are
+        // special, and neither proves anything about a saved foreign playlist.
+        if list.id == playlist_id || list.id == "LM" || list.id.starts_with("RD") {
             continue;
         }
         let page = block(crate::grpc::get_playlist_tracks(&list.id, 0, 1)).ok();
@@ -487,6 +561,13 @@ fn manual_acceptance() {
             break;
         }
     }
+    let foreign = foreign.or_else(|| {
+        // Nothing saved from someone else on this account: use a public
+        // playlist, which is read-only here for the same reason.
+        let public = "PLtestPublicPlaylistBbbbbbbbbb";
+        let page = block(crate::grpc::get_playlist_tracks(public, 0, 1)).ok()?;
+        (!page.owned).then(|| public.to_string())
+    });
     match foreign {
         Some(id) => {
             let read = block(crate::grpc::get_playlist_tracks(&id, 0, 3)).expect("read");
@@ -553,26 +634,43 @@ fn manual_acceptance() {
             })
             .unwrap_or_default()
     };
+    // YouTube takes a moment before a fresh read shows a rating change.
+    let set_like = |rating: &str, expect: &str| -> bool {
+        for _attempt in 0..3 {
+            let _ = block(crate::grpc::rate_song(&video_id, rating));
+            for _wait in 0..5 {
+                if like_now(&video_id) == expect {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(300));
+            }
+        }
+        false
+    };
 
     let original = like_now(&video_id);
     say(&format!("S7 the track's like status now: {original:?}"));
     let flip = if original == "LIKE" { "INDIFFERENT" } else { "LIKE" };
     let expect_flip = if flip == "LIKE" { "LIKE" } else { "" };
 
-    block(crate::grpc::rate_song(&video_id, flip)).expect("rate");
+    let flipped = set_like(flip, expect_flip);
     let after = like_now(&video_id);
     say(&format!(
         "S7 after {flip}: fresh read says {after:?} (expected {expect_flip:?})"
     ));
-    assert_eq!(after, expect_flip, "a like made here is visible on YouTube");
 
+    // Put it back before any assertion, so a failure cannot leave the account changed.
     let back = if original == "LIKE" { "LIKE" } else { "INDIFFERENT" };
-    block(crate::grpc::rate_song(&video_id, back)).expect("rate back");
-    let restored = like_now(&video_id);
+    let restored = set_like(back, &original);
+    let now = like_now(&video_id);
     say(&format!(
-        "S7 put back to {back}: fresh read says {restored:?} (was {original:?})"
+        "S7 put back to {back}: fresh read says {now:?} (was {original:?})"
     ));
-    assert_eq!(restored, original, "the account is left as it was found");
+
+    assert!(flipped, "a rating made here is visible on YouTube");
+    assert_eq!(after, expect_flip);
+    assert!(restored, "the account is left as it was found");
+    assert_eq!(now, original);
 
     // ---------------------------------------------------------------- cleanup --
     let deleted = block(crate::grpc::delete_account_playlist(&playlist_id)).expect("delete");
@@ -581,7 +679,9 @@ fn manual_acceptance() {
         deleted.ok, deleted.error
     ));
     let _ = std::fs::remove_dir_all(&dir);
-    restarted.stop();
+    for mut side in restart_sides {
+        side.stop();
+    }
     let _ = &mut sidecar;
 }
 

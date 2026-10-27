@@ -252,7 +252,8 @@ def test_a_succeeded_add_without_ids_reads_the_rows_back(monkeypatch):
     assert ("read", "PL1") in client.calls
 
 
-def test_a_succeeded_add_that_is_not_there_is_reported(monkeypatch):
+def test_a_read_back_that_lags_behind_keeps_the_add(monkeypatch):
+    # YouTube says SUCCEEDED; a read right after may not show the row yet.
     client = Client(
         {
             "add": {"status": "STATUS_SUCCEEDED", "playlistEditResults": []},
@@ -260,8 +261,9 @@ def test_a_succeeded_add_that_is_not_there_is_reported(monkeypatch):
         }
     )
     use(monkeypatch, client)
+    monkeypatch.setattr(youtube.time, "sleep", lambda _s: None)
 
     result = youtube.add_playlist_items("PL1", ["v1"])
 
-    assert result["ok"] is False
-    assert "не подтвердил" in result["error"]
+    assert result["ok"] is True, "the status is YouTube's own word"
+    assert result["items"] == []

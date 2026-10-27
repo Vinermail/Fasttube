@@ -323,15 +323,15 @@ def add_playlist_items(
             else:
                 # The answer did not list the new rows (it does for some
                 # playlists only): read the playlist back and find them.
-                try:
-                    rows = _fresh_rows(ytm, playlist_id)
-                except Exception as e:
-                    # The status said it worked; an unreadable read-back is not
-                    # proof otherwise, so the add stands.
-                    log.warning("cannot read back %s after an add: %s", playlist_id, e)
-                    rows = None
-                if rows is not None:
-                    wanted_here = set(chunk)
+                # YouTube needs a moment before a fresh read shows the new row.
+                wanted_here = set(chunk)
+                for attempt in range(3):
+                    try:
+                        rows = _fresh_rows(ytm, playlist_id)
+                    except Exception as e:
+                        log.warning("cannot read back %s after an add: %s", playlist_id, e)
+                        rows = None
+                        break
                     for row in rows:
                         video = row.get("video_id", "")
                         if video in wanted_here:
@@ -342,9 +342,19 @@ def add_playlist_items(
                                     "set_video_id": row.get("set_video_id", ""),
                                 }
                             )
-                    if wanted_here:
-                        failed.extend(sorted(wanted_here))
-                        first_error = first_error or "YouTube не подтвердил добавление"
+                    if not wanted_here:
+                        break
+                    if attempt < 2:
+                        time.sleep(0.25)
+                if wanted_here:
+                    # The status said it worked, and a read that lags behind is
+                    # not proof otherwise: the journal reconciles on the next
+                    # revalidation.
+                    log.info(
+                        "add to %s: %s row(s) not visible yet after the answer",
+                        playlist_id,
+                        len(wanted_here),
+                    )
             continue
         failed.extend(chunk)
         first_error = first_error or (
