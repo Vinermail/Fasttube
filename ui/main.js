@@ -805,6 +805,11 @@ async function openPlaylistMenu(x, y, entry) {
 /* ---------- small dialogs (rename, new playlist, confirm) ---------- */
 
 function askPlaylistTitle(initial) {
+  return askText("Название плейлиста", "Пустое имя вернёт название из источника.", initial);
+}
+
+/// The same modal for any one-line answer.
+function askText(title, hintText, initial) {
   return new Promise((resolve) => {
     const wrap = document.createElement("div");
     wrap.className = "modal-backdrop";
@@ -812,13 +817,13 @@ function askPlaylistTitle(initial) {
     box.className = "modal-box";
     const label = document.createElement("div");
     label.className = "modal-title";
-    label.textContent = "Название плейлиста";
+    label.textContent = title;
     const input = document.createElement("input");
     input.className = "modal-input";
     input.value = initial || "";
     const hint = document.createElement("p");
     hint.className = "hint";
-    hint.textContent = "Пустое имя вернёт название из источника.";
+    hint.textContent = hintText || "";
     const row = document.createElement("div");
     row.className = "modal-actions";
     const cancel = document.createElement("button");
@@ -4546,14 +4551,14 @@ async function renameCurrentPlaylist(entry) {
 }
 
 async function editPlaylistDescription(entry) {
-  const snapshot = await invoke("get_playlist_snapshot", { playlistId: entry.ytId }).catch(
-    () => null
+  // The snapshot does not carry the description, so it starts empty and only
+  // what the user types is sent.
+  const text = await askText(
+    "Описание плейлиста",
+    "Пустое поле оставит описание без изменений.",
+    ""
   );
-  const current = (snapshot && snapshot.privacy) || "";
-  const text = await askPlaylistTitle(
-    (snapshot && snapshot.description) || "Описание плейлиста"
-  );
-  if (text === null) return;
+  if (text === null || !text.trim()) return;
   try {
     await invoke("playlist_edit_meta", {
       playlistId: entry.ytId,
@@ -4562,7 +4567,6 @@ async function editPlaylistDescription(entry) {
       privacy: "",
     });
     toast("Описание обновится на YouTube");
-    void current;
   } catch (e) {
     showError(e);
   }
