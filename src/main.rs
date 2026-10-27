@@ -122,6 +122,12 @@ struct Settings {
     normalize_level: String,
     #[serde(default = "default_true")]
     volume_curve: bool,
+    /// Slider position (0..1), restored on start.
+    #[serde(default = "default_volume")]
+    volume: f32,
+    /// Restored too: an app that was left muted must not start loud.
+    #[serde(default)]
+    muted: bool,
     /// Off by default: using the account with yt-dlp can get it rate-limited.
     #[serde(default)]
     streaming_account: bool,
@@ -171,12 +177,18 @@ fn default_true() -> bool {
     true
 }
 
+fn default_volume() -> f32 {
+    0.8
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
             audio_quality: default_quality(),
             normalize_level: default_normalize_level(),
             volume_curve: true,
+            volume: default_volume(),
+            muted: false,
             streaming_account: false,
             cache_limit_mb: default_cache_limit_mb(),
             search_filter: default_search_filter(),
@@ -204,6 +216,26 @@ fn load_settings() -> Settings {
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default()
+}
+
+/// Writes settings at most every 400 ms: the volume slider would otherwise
+/// rewrite settings.json sixty times a second while it is dragged.
+fn spawn_settings_flusher(app: tauri::AppHandle) {
+    std::thread::Builder::new()
+        .name("settings-flusher".to_string())
+        .spawn(move || {
+            use std::sync::atomic::Ordering;
+            let state = app.state::<AppState>();
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(400));
+                if !state.settings_dirty.swap(false, Ordering::SeqCst) {
+                    continue;
+                }
+                let snapshot = state.settings.lock().clone();
+                save_settings(&snapshot);
+            }
+        })
+        .expect("failed to spawn the settings flusher");
 }
 
 fn save_settings(settings: &Settings) {
@@ -632,6 +664,8 @@ struct AppState {
     /// When the session was last validated (for the "check before loading"
     /// rule). `None` = never checked in this process.
     session_checked: Mutex<Option<std::time::Instant>>,
+    /// Set by anything that changes settings, cleared when the flusher saves.
+    settings_dirty: std::sync::atomic::AtomicBool,
 }
 
 fn track_to_info(t: &Track) -> engine::TrackInfo {
@@ -883,7 +917,37 @@ fn seek(secs: f64, state: tauri::State<AppState>) {
 
 #[tauri::command]
 fn set_volume(volume: f32, state: tauri::State<AppState>) {
+    let volume = volume.clamp(0.0, 1.0);
     state.engine.lock().send(Cmd::SetVolume(volume));
+    {
+        let mut settings = state.settings.lock();
+        settings.volume = volume;
+        // Dragging the slider while muted means "I want to hear it again".
+        if settings.muted {
+            settings.muted = false;
+            state.engine.lock().send(Cmd::SetMuted(false));
+        }
+    }
+    // Dragging fires dozens of events: the flusher writes them, not this call.
+    state
+        .settings_dirty
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Mutes or unmutes the whole app and returns the new state.
+#[tauri::command]
+fn toggle_mute(state: tauri::State<AppState>) -> bool {
+    let muted = {
+        let mut settings = state.settings.lock();
+        settings.muted = !settings.muted;
+        settings.muted
+    };
+    state.engine.lock().send(Cmd::SetMuted(muted));
+    save_settings(&state.settings.lock().clone());
+    state
+        .settings_dirty
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    muted
 }
 
 #[tauri::command]
@@ -2767,14 +2831,22 @@ fn main() {
         sleep_until: Mutex::new(None),
         loudness: load_loudness(),
         session_checked: Mutex::new(None),
+        settings_dirty: std::sync::atomic::AtomicBool::new(false),
     };
     let api_status = app_state.api_status.clone();
     {
-        let curve = app_state.settings.lock().volume_curve;
-        app_state
-            .engine
-            .lock()
-            .send(Cmd::SetVolumeCurve(curve));
+        let (curve, volume, muted) = {
+            let settings = app_state.settings.lock();
+            (
+                settings.volume_curve,
+                settings.volume.clamp(0.0, 1.0),
+                settings.muted,
+            )
+        };
+        let engine = app_state.engine.lock().clone();
+        engine.send(Cmd::SetVolumeCurve(curve));
+        engine.send(Cmd::SetVolume(volume));
+        engine.send(Cmd::SetMuted(muted));
     }
     let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let sidecar_shutdown = shutdown.clone();
@@ -2788,6 +2860,7 @@ fn main() {
             spawn_resume_saver(app.handle().clone());
             spawn_session_bootstrap(app.handle().clone());
             spawn_cache_sweeper(app.handle().clone());
+            spawn_settings_flusher(app.handle().clone());
             if let Some(dir) = initial_dir {
                 let handle = app.handle().clone();
                 std::thread::Builder::new()
@@ -2884,7 +2957,8 @@ fn main() {
             prev_track,
             stop,
             seek,
-            set_volume
+            set_volume,
+            toggle_mute
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
@@ -2895,6 +2969,9 @@ fn main() {
             tauri::RunEvent::Exit | tauri::RunEvent::ExitRequested { .. }
         ) {
             shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+            // Last chance for a volume change made in the final 400 ms.
+            let state = _handle.state::<AppState>();
+            save_settings(&state.settings.lock().clone());
             sidecar.kill();
         }
     });

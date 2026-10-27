@@ -1990,3 +1990,36 @@ input[type="range"]::-moz-range-thumb {
   display: none;
 }
 
+
+/* Mute switch next to the volume slider: small, quiet, red only while muted. */
+.mute-btn {
+  background: transparent;
+  border: none;
+  color: var(--fg);
+  font-size: 14px;
+  line-height: 1;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border-radius: 7px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  opacity: 0.8;
+  transition: opacity 0.15s, background 0.15s;
+}
+
+.mute-btn:hover {
+  background: var(--bg3);
+  opacity: 1;
+}
+
+.mute-btn.muted {
+  color: var(--red);
+  opacity: 1;
+}
+
+.pb-vol.is-muted input[type="range"] {
+  opacity: 0.4;
+}

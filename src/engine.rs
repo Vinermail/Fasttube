@@ -26,6 +26,8 @@ pub enum Cmd {
     ClearGains,
     /// Toggle the perceptual (exponential) volume curve.
     SetVolumeCurve(bool),
+    /// Mute the whole app without losing the slider position.
+    SetMuted(bool),
 }
 
 /// What the engine tells the rest of the app about playback.
@@ -58,6 +60,8 @@ pub struct Snapshot {
     pub elapsed: f64,
     pub total: f64,
     pub volume: f32,
+    /// Output muted: `volume` keeps the level the user picked.
+    pub muted: bool,
     pub speed: f32,
     pub track: Option<TrackInfo>,
 }
@@ -136,6 +140,18 @@ impl Status {
     }
 }
 
+/// The level handed to the mixer: the perceptual curve first, mute last, so
+/// unmuting restores exactly the level the slider is still showing.
+fn output_level(volume: f32, muted: bool, curve: bool) -> f32 {
+    let volume = volume.clamp(0.0, 1.0);
+    if muted {
+        return 0.0;
+    }
+    // Human loudness perception is logarithmic: with the exponent the slider
+    // position maps roughly linearly to perceived loudness.
+    if curve { volume.powf(3.0) } else { volume }
+}
+
 struct Engine {
     _device: rodio::MixerDeviceSink,
     player: Player,
@@ -143,6 +159,8 @@ struct Engine {
     idx: usize,
     total: Duration,
     volume: f32,
+    /// Silence without touching `volume`.
+    muted: bool,
     speed: f32,
     gain: f32,
     target_gain: f32,
@@ -180,6 +198,7 @@ impl Engine {
             idx: 0,
             total: Duration::ZERO,
             volume: 0.8,
+            muted: false,
             speed: 1.0,
             gain: 1.0,
             target_gain: 1.0,
@@ -225,6 +244,7 @@ impl Engine {
             elapsed: self.player.get_pos().as_secs_f64(),
             total: self.total.as_secs_f64(),
             volume: self.volume,
+            muted: self.muted,
             speed: self.speed,
             track: self.playlist.tracks.get(self.idx).map(|t| TrackInfo {
                 title: t.title.clone(),
@@ -303,17 +323,10 @@ impl Engine {
     }
 
     fn apply_volume(&self) {
-        // Perceptual volume curve (exponent 3): human loudness perception is
-        // logarithmic, so a linear slider feels wrong. With the curve the
-        // slider position maps roughly linearly to perceived loudness.
-        let user = if self.curve {
-            self.volume.powf(3.0)
-        } else {
-            self.volume
-        };
+        let level = output_level(self.volume, self.muted, self.curve);
         // Safety net: gains are peak-limited elsewhere (never boosting into
         // clipping), the 4.0 cap only guards against corrupt cached values.
-        self.player.set_volume((user * self.gain).clamp(0.0, 4.0));
+        self.player.set_volume((level * self.gain).clamp(0.0, 4.0));
     }
 
     fn set_volume_curve(&mut self, enabled: bool) {
@@ -430,6 +443,15 @@ impl Engine {
         self.dirty = true;
     }
 
+    fn set_muted(&mut self, muted: bool) {
+        if self.muted == muted {
+            return;
+        }
+        self.muted = muted;
+        self.apply_volume();
+        self.dirty = true;
+    }
+
     fn set_speed(&mut self, speed: f32) {
         self.speed = speed.clamp(0.25, 3.0);
         self.player.set_speed(self.speed);
@@ -445,7 +467,29 @@ fn run(
     let mut engine: Option<Engine> = None;
     let mut last_publish = Instant::now();
     let mut pending_curve: Option<bool> = None;
+    let mut pending_volume: Option<f32> = None;
+    let mut pending_muted: Option<bool> = None;
     let mut seen_starts: u64 = 0;
+
+    /// The engine is created on the first playlist: volume, mute and the curve
+    /// can arrive before that, so they are kept until the device exists.
+    fn apply_pending(
+        engine: &mut Engine,
+        curve: &mut Option<bool>,
+        volume: &mut Option<f32>,
+        muted: &mut Option<bool>,
+    ) {
+        if let Some(c) = curve.take() {
+            engine.curve = c;
+        }
+        if let Some(v) = volume.take() {
+            engine.volume = v.clamp(0.0, 1.0);
+        }
+        if let Some(m) = muted.take() {
+            engine.muted = m;
+        }
+        engine.apply_volume();
+    }
 
     loop {
         // While playing the loop has to look at the decoder (end of track) and
@@ -478,10 +522,12 @@ fn run(
                     if engine.is_none() {
                         match Engine::create() {
                             Ok(mut e) => {
-                                if let Some(c) = pending_curve.take() {
-                                    e.curve = c;
-                                    e.apply_volume();
-                                }
+                                apply_pending(
+                                    &mut e,
+                                    &mut pending_curve,
+                                    &mut pending_volume,
+                                    &mut pending_muted,
+                                );
                                 engine = Some(e);
                             }
                             Err(err) => {
@@ -497,10 +543,12 @@ fn run(
                     if engine.is_none() {
                         match Engine::create() {
                             Ok(mut e) => {
-                                if let Some(c) = pending_curve.take() {
-                                    e.curve = c;
-                                    e.apply_volume();
-                                }
+                                apply_pending(
+                                    &mut e,
+                                    &mut pending_curve,
+                                    &mut pending_volume,
+                                    &mut pending_muted,
+                                );
                                 engine = Some(e);
                             }
                             Err(err) => {
@@ -545,6 +593,8 @@ fn run(
                 Cmd::SetVolume(v) => {
                     if let Some(e) = engine.as_mut() {
                         e.set_volume(v);
+                    } else {
+                        pending_volume = Some(v);
                     }
                 }
                 Cmd::SetSpeed(s) => {
@@ -560,6 +610,13 @@ fn run(
                 Cmd::ClearGains => {
                     if let Some(e) = engine.as_mut() {
                         e.clear_gains();
+                    }
+                }
+                Cmd::SetMuted(muted) => {
+                    if let Some(e) = engine.as_mut() {
+                        e.set_muted(muted);
+                    } else {
+                        pending_muted = Some(muted);
                     }
                 }
                 Cmd::SetVolumeCurve(enabled) => {
@@ -721,4 +778,26 @@ mod tests {
         std::thread::sleep(Duration::from_millis(300));
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    use super::output_level;
+
+    #[test]
+    fn mute_is_silence_whatever_the_slider_says() {
+        assert_eq!(output_level(1.0, true, true), 0.0);
+        assert_eq!(output_level(0.42, true, false), 0.0);
+    }
+
+    #[test]
+    fn the_curve_only_shapes_the_level() {
+        assert!((output_level(0.5, false, true) - 0.125).abs() < 1e-6);
+        assert!((output_level(0.5, false, false) - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn unmuting_restores_the_same_level() {
+        let level = output_level(0.7, false, true);
+        assert!((output_level(0.7, false, true) - level).abs() < 1e-6);
+        assert!(level > 0.0);
+    }
+
 }

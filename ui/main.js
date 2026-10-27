@@ -1619,6 +1619,49 @@ volumeEl.addEventListener("change", () => {
   volumeDragging = false;
 });
 
+/* ---------- mute ---------- */
+
+const muteEl = $("mute-btn");
+let muteRendered = null;
+
+function renderMute(muted) {
+  const on = !!muted;
+  setText(muteEl, on ? "🔇" : "🔊");
+  muteEl.classList.toggle("muted", on);
+  muteEl.title = on ? "Включить звук (M)" : "Заглушить (M)";
+  muteEl.setAttribute("aria-pressed", on ? "true" : "false");
+  const box = muteEl.closest(".pb-vol");
+  if (box) box.classList.toggle("is-muted", on);
+  // The slider keeps its position while muted: dim it, do not move it.
+  muteRendered = on;
+}
+
+function toggleMute() {
+  return invoke("toggle_mute")
+    .then((muted) => {
+      renderMute(muted);
+      if (lastState) lastState.muted = muted;
+      refresh();
+    })
+    .catch((e) => showError(e));
+}
+
+muteEl.onclick = () => toggleMute();
+
+// Before anything plays there is no engine snapshot, so the saved level and
+// the switch come from settings — otherwise the app would show 80% and
+// "unmuted" until the first track starts.
+invoke("get_settings")
+  .then((s) => {
+    const v = typeof s.volume === "number" ? s.volume : 0.8;
+    if (!volumeDragging) {
+      volumeEl.value = String(Math.round(v * 100));
+      $("volume-value").textContent = Math.round(v * 100) + "%";
+    }
+    renderMute(!!s.muted);
+  })
+  .catch(() => {});
+
 /* ---------- main rendering ---------- */
 
 const ROW_H = 46;
@@ -1809,6 +1852,9 @@ function renderState(state) {
     const pct = Math.round(state.volume * 100);
     setValue(volumeEl, pct);
     setText($("volume-value"), pct + "%");
+  }
+  if (state && !!state.muted !== muteRendered) {
+    renderMute(state.muted);
   }
 
   if (mode === "youtube") {
@@ -2232,6 +2278,7 @@ $("btn-sleep-cancel").onclick = async () => {
 function changeVolume(delta) {
   if (!lastState) return;
   const v = Math.min(1, Math.max(0, lastState.volume + delta));
+  lastState.muted = false;
   volumeEl.value = Math.round(v * 100);
   $("volume-value").textContent = Math.round(v * 100) + "%";
   invoke("set_volume", { volume: v }).catch(() => {});
@@ -2250,6 +2297,11 @@ window.addEventListener("keydown", (e) => {
   }
   const tag = (document.activeElement && document.activeElement.tagName) || "";
   if (tag === "INPUT" || tag === "TEXTAREA") return;
+  if (e.code === "KeyM" && !e.ctrlKey && !e.metaKey && !e.altKey) {
+    e.preventDefault();
+    toggleMute();
+    return;
+  }
   if (e.code === "Space") {
     e.preventDefault();
     invoke("toggle_pause").then(refresh);
