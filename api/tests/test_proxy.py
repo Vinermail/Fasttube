@@ -49,3 +49,42 @@ def test_http_proxies_pass_through_untouched():
         assert youtube.YT_DLP_OPTS["proxy"] == "http://192.168.1.10:8080"
     finally:
         youtube.set_proxy("none")
+
+
+def test_account_playlist_edits_go_through_the_client(monkeypatch):
+    import ytapi.youtube as yt
+
+    class Client:
+        def __init__(self):
+            self.calls = []
+
+        def add_playlist_items(self, playlist_id, videoIds=None):
+            self.calls.append(("add", playlist_id, list(videoIds or [])))
+
+        def remove_playlist_items(self, playlist_id, videos):
+            self.calls.append(("remove", playlist_id, videos))
+
+        def create_playlist(self, title, description, privacy_status=None):
+            self.calls.append(("create", title, privacy_status))
+            return "PLnew"
+
+        def delete_playlist(self, playlist_id):
+            self.calls.append(("delete", playlist_id))
+
+    client = Client()
+    monkeypatch.setattr(yt, "_session_client", lambda: client)
+
+    assert yt.add_playlist_items("PL1", ["v1", "v2"])["ok"]
+    assert client.calls[-1] == ("add", "PL1", ["v1", "v2"])
+
+    # A row without setVideoId cannot be removed: the same video may be in the
+    # list twice, and YouTube needs the per-item id.
+    assert not yt.remove_playlist_items("PL1", [{"video_id": "v1", "set_video_id": ""}])["ok"]
+    assert yt.remove_playlist_items("PL1", [{"video_id": "v1", "set_video_id": "abc"}])["ok"]
+    assert client.calls[-1] == ("remove", "PL1", [{"videoId": "v1", "setVideoId": "abc"}])
+
+    assert yt.create_account_playlist("Тест")["id"] == "PLnew"
+    assert client.calls[-1] == ("create", "Тест", "PRIVATE")
+
+    assert yt.delete_account_playlist("PLnew")["ok"]
+    assert client.calls[-1] == ("delete", "PLnew")

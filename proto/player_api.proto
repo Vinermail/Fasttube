@@ -18,6 +18,38 @@ message Track {
   string album = 4;
   double duration_secs = 5;
   string thumbnail = 6;
+  // YouTube's per-item id: removing a track from a playlist needs it.
+  string set_video_id = 7;
+}
+
+message AddPlaylistItemsRequest {
+  string playlist_id = 1;
+  repeated string video_ids = 2;
+}
+
+message PlaylistItemRef {
+  string video_id = 1;
+  string set_video_id = 2;
+}
+
+message RemovePlaylistItemsRequest {
+  string playlist_id = 1;
+  repeated PlaylistItemRef items = 2;
+}
+
+message PlaylistEditResponse {
+  bool ok = 1;
+  string error = 2;
+  // Set by CreateAccountPlaylist.
+  string id = 3;
+}
+
+message CreatePlaylistRequest {
+  string title = 1;
+}
+
+message DeletePlaylistRequest {
+  string playlist_id = 1;
 }
 
 message SearchRequest {
@@ -240,4 +272,8 @@ service PlayerApi {
   rpc ValidateSession(Empty) returns (SessionStatus);
   rpc ClearSession(Empty) returns (SessionStatus);
   rpc SetProxy(SetProxyRequest) returns (SetProxyResponse);
+  rpc AddPlaylistItems(AddPlaylistItemsRequest) returns (PlaylistEditResponse);
+  rpc RemovePlaylistItems(RemovePlaylistItemsRequest) returns (PlaylistEditResponse);
+  rpc CreateAccountPlaylist(CreatePlaylistRequest) returns (PlaylistEditResponse);
+  rpc DeleteAccountPlaylist(DeletePlaylistRequest) returns (PlaylistEditResponse);
 }

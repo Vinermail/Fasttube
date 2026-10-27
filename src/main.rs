@@ -107,6 +107,9 @@ struct SearchTrack {
     artist: String,
     duration_secs: f64,
     thumbnail: String,
+    /// YouTube's per-item id inside a playlist ("" outside one).
+    #[serde(default)]
+    set_video_id: String,
 }
 
 #[derive(Serialize, Clone)]
@@ -813,6 +816,111 @@ fn cover_file(id: &str, source: &str) -> std::path::PathBuf {
     downloader::data_dir()
         .join("covers")
         .join(format!("{safe}.{ext}"))
+}
+
+/// Drops the cached copy of a playlist after it was edited on YouTube.
+fn drop_playlist_cache(playlist_id: &str) {
+    let key = format!("playlist:{playlist_id}");
+    let path = track_cache_file(&key);
+    if let Err(e) = std::fs::remove_file(&path)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!("[cache] cannot drop {key}: {e}");
+    }
+}
+
+#[tauri::command]
+async fn add_playlist_tracks(
+    playlist_id: String,
+    video_ids: Vec<String>,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<usize, String> {
+    if video_ids.is_empty() {
+        return Ok(0);
+    }
+    // Writing to the account needs the session to be the fresh one.
+    ensure_session_fresh(&app, &state).await;
+    let resp = grpc::add_playlist_items(&playlist_id, &video_ids)
+        .await
+        .map_err(|e| e.to_string())?;
+    if !resp.ok {
+        return Err(resp.error);
+    }
+    drop_playlist_cache(&playlist_id);
+    Ok(video_ids.len())
+}
+
+#[derive(Deserialize)]
+struct PlaylistItemRefDto {
+    #[serde(default)]
+    video_id: String,
+    #[serde(default)]
+    set_video_id: String,
+}
+
+/// Creates a private playlist on the YouTube account.
+#[tauri::command]
+async fn create_account_playlist(
+    title: String,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    ensure_session_fresh(&app, &state).await;
+    let resp = grpc::create_account_playlist(&title)
+        .await
+        .map_err(|e| e.to_string())?;
+    if !resp.ok {
+        return Err(resp.error);
+    }
+    Ok(resp.id)
+}
+
+/// Deletes a playlist on the YouTube account. There is no undo.
+#[tauri::command]
+async fn delete_account_playlist(
+    playlist_id: String,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    ensure_session_fresh(&app, &state).await;
+    let resp = grpc::delete_account_playlist(&playlist_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    if !resp.ok {
+        return Err(resp.error);
+    }
+    drop_playlist_cache(&playlist_id);
+    Ok(())
+}
+
+#[tauri::command]
+async fn remove_playlist_tracks(
+    playlist_id: String,
+    items: Vec<PlaylistItemRefDto>,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let refs: Vec<grpc::PlaylistItemRef> = items
+        .into_iter()
+        .filter(|i| !i.video_id.is_empty() && !i.set_video_id.is_empty())
+        .map(|i| grpc::PlaylistItemRef {
+            video_id: i.video_id,
+            set_video_id: i.set_video_id,
+        })
+        .collect();
+    if refs.is_empty() {
+        return Err("в этом списке нельзя удалять треки (нужен вход в аккаунт)".to_string());
+    }
+    ensure_session_fresh(&app, &state).await;
+    let resp = grpc::remove_playlist_items(&playlist_id, &refs)
+        .await
+        .map_err(|e| e.to_string())?;
+    if !resp.ok {
+        return Err(resp.error);
+    }
+    drop_playlist_cache(&playlist_id);
+    Ok(())
 }
 
 #[tauri::command]
@@ -1650,6 +1758,7 @@ fn to_search_track(t: grpc::Track) -> SearchTrack {
         artist: t.artist,
         duration_secs: t.duration_secs,
         thumbnail: t.thumbnail,
+        set_video_id: t.set_video_id,
     }
 }
 
@@ -2634,13 +2743,7 @@ async fn recommend_tracks(
         .map_err(|e| e.to_string())?;
     Ok(tracks
         .into_iter()
-        .map(|t| SearchTrack {
-            video_id: t.video_id,
-            title: t.title,
-            artist: t.artist,
-            duration_secs: t.duration_secs,
-            thumbnail: t.thumbnail,
-        })
+        .map(to_search_track)
         .collect())
 }
 
@@ -3481,6 +3584,10 @@ fn main() {
             add_tracks_to_playlist,
             remove_track_from_playlist,
             open_custom_playlist,
+            add_playlist_tracks,
+            remove_playlist_tracks,
+            create_account_playlist,
+            delete_account_playlist,
             set_developer_mode,
             open_devtools
         ])

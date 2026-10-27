@@ -76,6 +76,7 @@ def _to_pb_track(t: dict) -> player_api_pb2.Track:
         album=t.get("album", ""),
         duration_secs=t.get("duration_secs", 0.0),
         thumbnail=t.get("thumbnail", ""),
+        set_video_id=t.get("set_video_id", ""),
     )
 
 
@@ -248,6 +249,31 @@ class PlayerApiServicer(player_api_pb2_grpc.PlayerApiServicer):
             has_auth=result.get("has_auth", False),
             hint=result.get("hint", ""),
             error=result.get("error", ""),
+        )
+
+    def AddPlaylistItems(self, request, context):
+        result = youtube.add_playlist_items(request.playlist_id, list(request.video_ids))
+        return player_api_pb2.PlaylistEditResponse(
+            ok=bool(result.get("ok")), error=result.get("error", "")
+        )
+
+    def RemovePlaylistItems(self, request, context):
+        items = [{"video_id": i.video_id, "set_video_id": i.set_video_id} for i in request.items]
+        result = youtube.remove_playlist_items(request.playlist_id, items)
+        return player_api_pb2.PlaylistEditResponse(
+            ok=bool(result.get("ok")), error=result.get("error", "")
+        )
+
+    def CreateAccountPlaylist(self, request, context):
+        result = youtube.create_account_playlist(request.title)
+        return player_api_pb2.PlaylistEditResponse(
+            ok=bool(result.get("ok")), error=result.get("error", ""), id=result.get("id", "")
+        )
+
+    def DeleteAccountPlaylist(self, request, context):
+        result = youtube.delete_account_playlist(request.playlist_id)
+        return player_api_pb2.PlaylistEditResponse(
+            ok=bool(result.get("ok")), error=result.get("error", "")
         )
 
     def SetProxy(self, request, context):

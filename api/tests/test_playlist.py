@@ -66,6 +66,8 @@ def test_a_mix_is_opened_through_watch_playlist(monkeypatch):
             "album": "Album",
             "duration_secs": 123.0,
             "thumbnail": "https://i.ytimg.com/a=s200",
+            # YouTube's per-item id: needed to remove this row later.
+            "set_video_id": "",
         }
     ]
 

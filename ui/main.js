@@ -359,6 +359,7 @@ let ytPlaylists = [];
 let playlistStore = { pinned: [], hidden: [], meta: {}, custom: [] };
 let hiddenOpen = false;
 let currentLocalPlaylistId = null;
+let currentYtPlaylistId = null;
 
 function allPlaylists() {
   const custom = (playlistStore.custom || []).map((c) => ({
@@ -461,12 +462,6 @@ function renderSidebar() {
   }
   rest.forEach((p) => el.appendChild(sidebarRow(p)));
 
-  const newBtn = document.createElement("button");
-  newBtn.className = "btn pl-new";
-  newBtn.textContent = "＋ Свой плейлист";
-  newBtn.onclick = () => createCustomPlaylist();
-  el.appendChild(newBtn);
-
   if (hiddenIds.length) {
     const folder = document.createElement("div");
     folder.className = "pl-group pl-hidden-toggle";
@@ -499,6 +494,7 @@ async function openSidebarPlaylist(entry) {
     }
     // A YouTube playlist.
     currentLocalPlaylistId = null;
+    currentYtPlaylistId = entry.ytId;
     const ytId = entry.ytId;
     await loadTrackPages(
       "get_playlist_tracks",
@@ -553,7 +549,10 @@ function openContextMenu(x, y, items) {
     const row = document.createElement("div");
     row.className = "ctx-item" + (item.danger ? " danger" : "");
     row.textContent = item.label;
-    row.onclick = () => {
+    row.onclick = (e) => {
+      // The document-level click listener would otherwise remove the menu the
+      // handler is about to open (a submenu, or the "add to" list).
+      e.stopPropagation();
       closeContextMenu();
       Promise.resolve()
         .then(item.run)
@@ -580,6 +579,7 @@ window.addEventListener("blur", closeContextMenu);
 
 function openPlaylistMenu(x, y, entry) {
   const pinned = (playlistStore.pinned || []).includes(entry.id);
+  const ytId = entry.ytId || null;
   const hidden = (playlistStore.hidden || []).includes(entry.id);
   const items = [
     {
@@ -630,6 +630,16 @@ function openPlaylistMenu(x, y, entry) {
       },
     });
   }
+  if (ytId) {
+    items.push({
+      label: "Добавить треки на YouTube…",
+      run: () => pickTracksForYtPlaylist(ytId, playlistTitle(entry)),
+    });
+  }
+  items.push({
+    label: "Создать плейлист…",
+    run: () => askWhereToCreate(),
+  });
   items.push({
     label: hidden ? "Показать в списке" : "Скрыть в папку",
     run: async () => {
@@ -637,6 +647,28 @@ function openPlaylistMenu(x, y, entry) {
       await loadPlaylistStore();
     },
   });
+  if (ytId) {
+    items.push({
+      label: "Удалить на YouTube…",
+      danger: true,
+      run: async () => {
+        const ok = await askConfirm(
+          `Удалить «${playlistTitle(entry)}» на YouTube? Это необратимо.`
+        );
+        if (!ok) return;
+        await invoke("delete_account_playlist", { playlistId: ytId });
+        if (currentYtPlaylistId === ytId) {
+          currentYtPlaylistId = null;
+          currentYtTracks = [];
+          ytRows = [];
+          ytListVersion++;
+          refresh();
+        }
+        await loadUserPlaylists();
+        await loadPlaylistStore();
+      },
+    });
+  }
   if (entry.custom) {
     items.push({
       label: "Удалить плейлист",
@@ -802,6 +834,7 @@ function setYtTracks(tracks, append, meta) {
     title: t.title,
     artist: t.artist,
     duration: t.duration_secs,
+    setVideoId: t.set_video_id || "",
   }));
   if (meta) {
     setListHeader(meta);
@@ -834,6 +867,7 @@ function appendYtTracks(tracks) {
     title: t.title,
     artist: t.artist,
     duration: t.duration_secs,
+    setVideoId: t.set_video_id || "",
   }));
   ytListVersion++;
   trackListEl = $("tracks");
@@ -2205,6 +2239,24 @@ function buildRow(entry, i) {
         label: "Добавить в плейлист…",
         run: () => addTrackToPlaylist(row.path),
       });
+    } else if (row.id) {
+      items.push({
+        label: "Добавить в плейлист YouTube…",
+        run: () => addVideoToYtPlaylist(row.id, row.title),
+      });
+    }
+    if (currentYtPlaylistId && row.setVideoId) {
+      items.push({
+        label: "Убрать из плейлиста",
+        danger: true,
+        run: async () => {
+          await invoke("remove_playlist_tracks", {
+            playlistId: currentYtPlaylistId,
+            items: [{ videoId: row.id, setVideoId: row.setVideoId }],
+          });
+          await reloadYtPlaylist();
+        },
+      });
     }
     if (currentLocalPlaylistId && String(currentLocalPlaylistId).startsWith("custom:")) {
       items.push({
@@ -2937,3 +2989,87 @@ document.addEventListener(
   },
   true
 );
+
+/// Re-reads the YouTube playlist that is on screen after it was edited.
+async function reloadYtPlaylist() {
+  if (!currentYtPlaylistId) return;
+  await loadTrackPages("get_playlist_tracks", { playlistId: currentYtPlaylistId }, () => null);
+}
+
+/// "Добавить в плейлист YouTube…" for a track row.
+async function addVideoToYtPlaylist(videoId, title) {
+  const lists = ytPlaylists.slice();
+  if (!lists.length) {
+    showError("в аккаунте нет плейлистов, куда это положить");
+    return;
+  }
+  const items = lists.map((p) => ({
+    label: `${playlistTitle(p)} (${p.tracks || 0})`,
+    run: async () => {
+      await invoke("add_playlist_tracks", { playlistId: p.ytId, videoIds: [videoId] });
+      await loadPlaylistStore();
+      if (currentYtPlaylistId === p.ytId) await reloadYtPlaylist();
+    },
+  }));
+  openContextMenu(lastCtxX, lastCtxY, items);
+}
+
+/// "Добавить треки на YouTube…" from the playlist menu: offers what is on
+/// screen and what is queued, because a playlist cannot be its own source.
+async function pickTracksForYtPlaylist(ytId, name) {
+  const sources = [];
+  const shown = (currentYtTracks || []).filter((t) => t.video_id);
+  if (shown.length) {
+    sources.push({
+      label: `Все треки на экране (${shown.length})`,
+      run: async () => {
+        await invoke("add_playlist_tracks", {
+          playlistId: ytId,
+          videoIds: shown.map((t) => t.video_id),
+        });
+        await loadPlaylistStore();
+        if (currentYtPlaylistId === ytId) await reloadYtPlaylist();
+      },
+    });
+  }
+  const queue = (queueInfo && queueInfo.items) || [];
+  if (queue.length) {
+    sources.push({
+      label: `Вся очередь (${queue.length})`,
+      run: async () => {
+        await invoke("add_playlist_tracks", {
+          playlistId: ytId,
+          videoIds: queue.map((t) => t.id),
+        });
+        await loadPlaylistStore();
+        if (currentYtPlaylistId === ytId) await reloadYtPlaylist();
+      },
+    });
+  }
+  if (!sources.length) {
+    showError(`нечего добавить в «${name}»: открой любой список с треками`);
+    return;
+  }
+  openContextMenu(lastCtxX, lastCtxY, sources);
+}
+
+/// "Создать плейлист…" has two homes: the disk (files) and the account.
+async function askWhereToCreate() {
+  openContextMenu(lastCtxX, lastCtxY, [
+    {
+      label: "Локальный (из файлов)",
+      run: () => createCustomPlaylist(),
+    },
+    {
+      label: "На YouTube (приватный)",
+      run: async () => {
+        const title = await askPlaylistTitle("");
+        if (title === null) return;
+        const id = await invoke("create_account_playlist", { title });
+        await loadUserPlaylists();
+        const entry = allPlaylists().find((p) => p.ytId === id);
+        if (entry) await openSidebarPlaylist(entry);
+      },
+    },
+  ]);
+}

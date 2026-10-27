@@ -12,7 +12,9 @@ pub mod proto {
 pub use proto::{
     AlbumRequest, AlbumResponse, ArtistRequest, ArtistResponse, Empty, HealthResponse,
     HomeRequest, LikedSongsRequest, LyricsRequest, LyricsResponse, ParseAuthHeadersRequest,
-    SetProxyRequest, SetProxyResponse,
+    AddPlaylistItemsRequest, CreatePlaylistRequest, DeletePlaylistRequest, PlaylistEditResponse,
+    PlaylistItemRef as PbPlaylistItemRef,
+    RemovePlaylistItemsRequest, SetProxyRequest, SetProxyResponse,
     Shelf,
     PlaylistTracksRequest, PlaylistTracksResponse, PrefetchResolveRequest, RecommendRequest,
     ResolveRequest, ResolveResponse, SearchRequest, SearchSection, SessionState, SessionStatus,
@@ -281,6 +283,83 @@ pub async fn get_playlist_tracks(
                 limit,
             },
             PLAYLIST_TIMEOUT,
+        ))
+        .await?;
+    Ok(resp.into_inner())
+}
+
+/// One row to remove from an account playlist: YouTube needs its own per-item
+/// id, because the same video may appear twice.
+pub struct PlaylistItemRef {
+    pub video_id: String,
+    pub set_video_id: String,
+}
+
+/// Creates a playlist on the account (private) and returns its id.
+pub async fn create_account_playlist(title: &str) -> Result<PlaylistEditResponse> {
+    let mut client = connect().await?;
+    let resp = client
+        .create_account_playlist(with_timeout(
+            CreatePlaylistRequest {
+                title: title.to_string(),
+            },
+            CALL_TIMEOUT,
+        ))
+        .await?;
+    Ok(resp.into_inner())
+}
+
+/// Deletes a playlist on the account. There is no undo.
+pub async fn delete_account_playlist(playlist_id: &str) -> Result<PlaylistEditResponse> {
+    let mut client = connect().await?;
+    let resp = client
+        .delete_account_playlist(with_timeout(
+            DeletePlaylistRequest {
+                playlist_id: playlist_id.to_string(),
+            },
+            CALL_TIMEOUT,
+        ))
+        .await?;
+    Ok(resp.into_inner())
+}
+
+/// Appends tracks to an account playlist (this writes to YouTube).
+pub async fn add_playlist_items(
+    playlist_id: &str,
+    video_ids: &[String],
+) -> Result<PlaylistEditResponse> {
+    let mut client = connect().await?;
+    let resp = client
+        .add_playlist_items(with_timeout(
+            AddPlaylistItemsRequest {
+                playlist_id: playlist_id.to_string(),
+                video_ids: video_ids.to_vec(),
+            },
+            CALL_TIMEOUT,
+        ))
+        .await?;
+    Ok(resp.into_inner())
+}
+
+/// Removes tracks from an account playlist (this writes to YouTube).
+pub async fn remove_playlist_items(
+    playlist_id: &str,
+    items: &[PlaylistItemRef],
+) -> Result<PlaylistEditResponse> {
+    let mut client = connect().await?;
+    let resp = client
+        .remove_playlist_items(with_timeout(
+            RemovePlaylistItemsRequest {
+                playlist_id: playlist_id.to_string(),
+                items: items
+                    .iter()
+                    .map(|i| PbPlaylistItemRef {
+                        video_id: i.video_id.clone(),
+                        set_video_id: i.set_video_id.clone(),
+                    })
+                    .collect(),
+            },
+            CALL_TIMEOUT,
         ))
         .await?;
     Ok(resp.into_inner())

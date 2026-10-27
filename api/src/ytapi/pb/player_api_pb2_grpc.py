@@ -124,6 +124,26 @@ class PlayerApiStub:
                 request_serializer=player__api__pb2.SetProxyRequest.SerializeToString,
                 response_deserializer=player__api__pb2.SetProxyResponse.FromString,
                 _registered_method=True)
+        self.AddPlaylistItems = channel.unary_unary(
+                '/player.PlayerApi/AddPlaylistItems',
+                request_serializer=player__api__pb2.AddPlaylistItemsRequest.SerializeToString,
+                response_deserializer=player__api__pb2.PlaylistEditResponse.FromString,
+                _registered_method=True)
+        self.RemovePlaylistItems = channel.unary_unary(
+                '/player.PlayerApi/RemovePlaylistItems',
+                request_serializer=player__api__pb2.RemovePlaylistItemsRequest.SerializeToString,
+                response_deserializer=player__api__pb2.PlaylistEditResponse.FromString,
+                _registered_method=True)
+        self.CreateAccountPlaylist = channel.unary_unary(
+                '/player.PlayerApi/CreateAccountPlaylist',
+                request_serializer=player__api__pb2.CreatePlaylistRequest.SerializeToString,
+                response_deserializer=player__api__pb2.PlaylistEditResponse.FromString,
+                _registered_method=True)
+        self.DeleteAccountPlaylist = channel.unary_unary(
+                '/player.PlayerApi/DeleteAccountPlaylist',
+                request_serializer=player__api__pb2.DeletePlaylistRequest.SerializeToString,
+                response_deserializer=player__api__pb2.PlaylistEditResponse.FromString,
+                _registered_method=True)
 
 
 class PlayerApiServicer:
@@ -237,6 +257,30 @@ class PlayerApiServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def AddPlaylistItems(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def RemovePlaylistItems(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def CreateAccountPlaylist(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def DeleteAccountPlaylist(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_PlayerApiServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -329,6 +373,26 @@ def add_PlayerApiServicer_to_server(servicer, server):
                     servicer.SetProxy,
                     request_deserializer=player__api__pb2.SetProxyRequest.FromString,
                     response_serializer=player__api__pb2.SetProxyResponse.SerializeToString,
+            ),
+            'AddPlaylistItems': grpc.unary_unary_rpc_method_handler(
+                    servicer.AddPlaylistItems,
+                    request_deserializer=player__api__pb2.AddPlaylistItemsRequest.FromString,
+                    response_serializer=player__api__pb2.PlaylistEditResponse.SerializeToString,
+            ),
+            'RemovePlaylistItems': grpc.unary_unary_rpc_method_handler(
+                    servicer.RemovePlaylistItems,
+                    request_deserializer=player__api__pb2.RemovePlaylistItemsRequest.FromString,
+                    response_serializer=player__api__pb2.PlaylistEditResponse.SerializeToString,
+            ),
+            'CreateAccountPlaylist': grpc.unary_unary_rpc_method_handler(
+                    servicer.CreateAccountPlaylist,
+                    request_deserializer=player__api__pb2.CreatePlaylistRequest.FromString,
+                    response_serializer=player__api__pb2.PlaylistEditResponse.SerializeToString,
+            ),
+            'DeleteAccountPlaylist': grpc.unary_unary_rpc_method_handler(
+                    servicer.DeleteAccountPlaylist,
+                    request_deserializer=player__api__pb2.DeletePlaylistRequest.FromString,
+                    response_serializer=player__api__pb2.PlaylistEditResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -817,6 +881,114 @@ class PlayerApi:
             '/player.PlayerApi/SetProxy',
             player__api__pb2.SetProxyRequest.SerializeToString,
             player__api__pb2.SetProxyResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def AddPlaylistItems(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/player.PlayerApi/AddPlaylistItems',
+            player__api__pb2.AddPlaylistItemsRequest.SerializeToString,
+            player__api__pb2.PlaylistEditResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def RemovePlaylistItems(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/player.PlayerApi/RemovePlaylistItems',
+            player__api__pb2.RemovePlaylistItemsRequest.SerializeToString,
+            player__api__pb2.PlaylistEditResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def CreateAccountPlaylist(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/player.PlayerApi/CreateAccountPlaylist',
+            player__api__pb2.CreatePlaylistRequest.SerializeToString,
+            player__api__pb2.PlaylistEditResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def DeleteAccountPlaylist(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/player.PlayerApi/DeleteAccountPlaylist',
+            player__api__pb2.DeletePlaylistRequest.SerializeToString,
+            player__api__pb2.PlaylistEditResponse.FromString,
             options,
             channel_credentials,
             insecure,

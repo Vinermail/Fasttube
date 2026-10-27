@@ -107,6 +107,79 @@ def _cached_lib(key: str, ttl: int, loader):
     return data
 
 
+def create_account_playlist(title: str) -> dict:
+    """Creates a private playlist on the account and returns its id."""
+    ytm = _session_client()
+    if ytm is None:
+        return {"ok": False, "error": "нужен вход в аккаунт YouTube", "id": ""}
+    title = (title or "").strip() or "Новый плейлист"
+    try:
+        created = ytm.create_playlist(title, "Создано в Fasttube", privacy_status="PRIVATE")
+    except Exception as e:
+        log.exception("create_playlist failed")
+        return {"ok": False, "error": str(e), "id": ""}
+    if not isinstance(created, str) or not created:
+        return {"ok": False, "error": "YouTube не вернул id плейлиста", "id": ""}
+    invalidate_account_caches()
+    return {"ok": True, "error": "", "id": created}
+
+
+def delete_account_playlist(playlist_id: str) -> dict:
+    """Deletes a playlist on the account. There is no undo."""
+    ytm = _session_client()
+    if ytm is None:
+        return {"ok": False, "error": "нужен вход в аккаунт YouTube"}
+    try:
+        ytm.delete_playlist(playlist_id)
+    except Exception as e:
+        log.exception("delete_playlist failed")
+        return {"ok": False, "error": str(e)}
+    invalidate_account_caches()
+    return {"ok": True, "error": ""}
+
+
+def add_playlist_items(playlist_id: str, video_ids: list[str]) -> dict:
+    """Appends tracks to one of the account's playlists (writes to YouTube)."""
+    if not video_ids:
+        return {"ok": True, "error": ""}
+    ytm = _session_client()
+    if ytm is None:
+        return {"ok": False, "error": "нужен вход в аккаунт YouTube"}
+    try:
+        ytm.add_playlist_items(playlist_id, videoIds=list(video_ids))
+    except Exception as e:
+        log.exception("add_playlist_items failed")
+        return {"ok": False, "error": str(e)}
+    # The cached list is stale the moment the write lands.
+    invalidate_account_caches()
+    return {"ok": True, "error": ""}
+
+
+def remove_playlist_items(playlist_id: str, items: list[dict]) -> dict:
+    """Removes tracks from one of the account's playlists (writes to YouTube).
+
+    Each item needs the `setVideoId` YouTube gave that row: a video id alone is
+    ambiguous when the same song appears twice.
+    """
+    videos = [
+        {"videoId": i.get("video_id", ""), "setVideoId": i.get("set_video_id", "")}
+        for i in items
+        if i.get("video_id") and i.get("set_video_id")
+    ]
+    if not videos:
+        return {"ok": False, "error": "не выбраны треки для удаления"}
+    ytm = _session_client()
+    if ytm is None:
+        return {"ok": False, "error": "нужен вход в аккаунт YouTube"}
+    try:
+        ytm.remove_playlist_items(playlist_id, videos)
+    except Exception as e:
+        log.exception("remove_playlist_items failed")
+        return {"ok": False, "error": str(e)}
+    invalidate_account_caches()
+    return {"ok": True, "error": ""}
+
+
 def set_proxy(url: str) -> dict:
     """Route every request through `url` ("" or "none" means no proxy).
 
@@ -1539,6 +1612,7 @@ def _playlist_rows(data: dict) -> list[dict]:
                 "album": (t.get("album") or {}).get("name") or "",
                 "duration_secs": float(t.get("duration_seconds") or 0.0),
                 "thumbnail": pick_thumbnail(t.get("thumbnails"), THUMB_ROW),
+                "set_video_id": t.get("setVideoId") or "",
             }
         )
     return tracks
