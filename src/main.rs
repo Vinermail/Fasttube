@@ -13,6 +13,7 @@ mod playlists_store;
 mod queue;
 mod secrets;
 mod sidecar;
+mod sync;
 
 use downloader::ProgressHandle;
 use engine::{Cmd, EngineHandle, Snapshot};
@@ -751,6 +752,8 @@ struct AppState {
     settings_dirty: std::sync::atomic::AtomicBool,
     /// Pins, hidden playlists, renames and the user's own playlists.
     playlists: Mutex<playlists_store::Store>,
+    /// Playlist snapshots + the outbox worker; created once the app handle exists.
+    sync: Mutex<Option<std::sync::Arc<sync::SyncService>>>,
 }
 
 fn track_to_info(t: &Track) -> engine::TrackInfo {
@@ -778,6 +781,25 @@ fn to_playlist_info(pl: &Playlist) -> PlaylistInfo {
         name: pl.name.clone(),
         tracks: pl.tracks.len(),
     }
+}
+
+/// Builds the sync service once the window exists, replays the journal left by
+/// the previous run, then drains the outbox a few times a second.
+fn spawn_playlist_sync(app: tauri::AppHandle) {
+    let state = app.state::<AppState>();
+    let account = state.api_status.read().account_name.clone();
+    let service = sync::SyncService::new(app.clone(), account, downloader::data_dir());
+    *state.sync.lock() = Some(service.clone());
+    service.attach();
+
+    std::thread::Builder::new()
+        .name("playlist-sync".to_string())
+        .spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_millis(700));
+            service.tick();
+            service.periodic();
+        })
+        .expect("failed to spawn the sync worker");
 }
 
 fn playlist_store_file() -> std::path::PathBuf {
@@ -949,6 +971,156 @@ async fn remove_playlist_tracks(
 #[tauri::command]
 fn refresh_playlist_tracks(playlist_id: String) {
     drop_playlist_cache(&playlist_id);
+}
+
+/// Sync state of one playlist: pending operations, last read, last error.
+#[tauri::command]
+fn get_sync_status(playlist_id: String, state: tauri::State<AppState>) -> Option<sync::SyncStatus> {
+    state
+        .sync
+        .lock()
+        .as_ref()
+        .map(|service| service.status(&playlist_id))
+}
+
+/// The ↻ button: re-read the playlist from YouTube now, whatever the snapshot age.
+#[tauri::command]
+fn sync_playlist_now(playlist_id: String, state: tauri::State<AppState>) {
+    if let Some(service) = state.sync.lock().as_ref() {
+        service.refresh_now(&playlist_id);
+    }
+}
+
+#[derive(Deserialize)]
+struct NewTrackDto {
+    #[serde(default)]
+    video_id: String,
+    #[serde(default)]
+    title: String,
+}
+
+/// Adds tracks to a playlist: shown at once, sent by the worker.
+#[tauri::command]
+fn playlist_add_tracks(
+    playlist_id: String,
+    tracks: Vec<NewTrackDto>,
+    state: tauri::State<AppState>,
+) -> Result<(), String> {
+    let service = state.sync.lock().clone().ok_or("sync is not ready")?;
+    let now = now_secs();
+    let items: Vec<serde_json::Value> = tracks
+        .into_iter()
+        .filter(|t| !t.video_id.is_empty())
+        .map(|t| {
+            serde_json::json!({
+                "video_id": t.video_id,
+                "temp_id": sync::model::temp_id(now),
+                "title": t.title,
+            })
+        })
+        .collect();
+    if items.is_empty() {
+        return Err("нечего добавлять".to_string());
+    }
+    service.enqueue(sync::Op::new(
+        sync::OpKind::Add,
+        &playlist_id,
+        "",
+        serde_json::json!({ "items": items }),
+        now,
+    ));
+    Ok(())
+}
+
+#[tauri::command]
+fn playlist_remove_track(
+    playlist_id: String,
+    video_id: String,
+    set_video_id: String,
+    state: tauri::State<AppState>,
+) -> Result<(), String> {
+    let service = state.sync.lock().clone().ok_or("sync is not ready")?;
+    service.enqueue(sync::Op::new(
+        sync::OpKind::Remove,
+        &playlist_id,
+        "",
+        serde_json::json!({ "video_id": video_id, "set_video_id": set_video_id }),
+        now_secs(),
+    ));
+    Ok(())
+}
+
+#[tauri::command]
+fn playlist_move_track(
+    playlist_id: String,
+    set_video_id: String,
+    before_set_video_id: String,
+    state: tauri::State<AppState>,
+) -> Result<(), String> {
+    let service = state.sync.lock().clone().ok_or("sync is not ready")?;
+    service.enqueue(sync::Op::new(
+        sync::OpKind::Move,
+        &playlist_id,
+        "",
+        serde_json::json!({
+            "set_video_id": set_video_id,
+            "before_set_video_id": before_set_video_id,
+        }),
+        now_secs(),
+    ));
+    Ok(())
+}
+
+#[tauri::command]
+fn playlist_rate_song(
+    video_id: String,
+    rating: String,
+    state: tauri::State<AppState>,
+) -> Result<(), String> {
+    let service = state.sync.lock().clone().ok_or("sync is not ready")?;
+    service.enqueue(sync::Op::new(
+        sync::OpKind::Like,
+        "",
+        "",
+        serde_json::json!({ "video_id": video_id, "rating": rating }),
+        now_secs(),
+    ));
+    Ok(())
+}
+
+#[tauri::command]
+fn playlist_library(
+    playlist_id: String,
+    save: bool,
+    state: tauri::State<AppState>,
+) -> Result<(), String> {
+    let service = state.sync.lock().clone().ok_or("sync is not ready")?;
+    service.enqueue(sync::Op::new(
+        sync::OpKind::Library,
+        &playlist_id,
+        "",
+        serde_json::json!({ "save": save }),
+        now_secs(),
+    ));
+    Ok(())
+}
+
+/// Tells the sync engine which playlist is on screen (background refresh).
+#[tauri::command]
+fn set_open_playlist(playlist_id: Option<String>, state: tauri::State<AppState>) {
+    if let Some(service) = state.sync.lock().as_ref() {
+        service.set_open(playlist_id);
+    }
+}
+
+/// The snapshot as the app last saw it (what the UI shows before the network).
+#[tauri::command]
+fn get_playlist_snapshot(playlist_id: String, state: tauri::State<AppState>) -> Option<sync::Snapshot> {
+    state
+        .sync
+        .lock()
+        .as_ref()
+        .and_then(|service| service.snapshot(&playlist_id))
 }
 
 #[tauri::command]
@@ -1920,6 +2092,14 @@ fn set_session_status(app: &tauri::AppHandle, info: &SessionInfo) {
         status.account_name = info.account_name.clone();
         status.auth_ok = info.state == "active";
         *state.session_checked.lock() = Some(std::time::Instant::now());
+        let account = info.account_name.clone();
+        let service = state.sync.lock().clone();
+        drop(status);
+        if let Some(service) = service {
+            service.set_account(account);
+            // A fresh sign-in resumes whatever was waiting for it.
+            service.set_auth_ok(info.state == "active");
+        }
     }
 }
 
@@ -3491,6 +3671,7 @@ fn main() {
         session_checked: Mutex::new(None),
         settings_dirty: std::sync::atomic::AtomicBool::new(false),
         playlists: Mutex::new(load_json(&playlist_store_file())),
+        sync: Mutex::new(None),
     };
     let api_status = app_state.api_status.clone();
     {
@@ -3523,6 +3704,7 @@ fn main() {
             spawn_session_bootstrap(app.handle().clone());
             spawn_cache_sweeper(app.handle().clone());
             spawn_settings_flusher(app.handle().clone());
+            spawn_playlist_sync(app.handle().clone());
             if let Some(dir) = initial_dir {
                 let handle = app.handle().clone();
                 std::thread::Builder::new()
@@ -3640,6 +3822,15 @@ fn main() {
             delete_account_playlist,
             refresh_playlist_tracks,
             remove_from_library,
+            get_sync_status,
+            sync_playlist_now,
+            get_playlist_snapshot,
+            set_open_playlist,
+            playlist_add_tracks,
+            playlist_remove_track,
+            playlist_move_track,
+            playlist_rate_song,
+            playlist_library,
             set_developer_mode,
             open_devtools
         ])

@@ -12,9 +12,9 @@ pub mod proto {
 pub use proto::{
     AlbumRequest, AlbumResponse, ArtistRequest, ArtistResponse, Empty, HealthResponse,
     HomeRequest, LikedSongsRequest, LyricsRequest, LyricsResponse, ParseAuthHeadersRequest,
-    AddPlaylistItemsRequest, CreatePlaylistRequest, DeletePlaylistRequest, PlaylistEditResponse,
-    PlaylistItemRef as PbPlaylistItemRef,
-    RemovePlaylistItemsRequest, SetProxyRequest, SetProxyResponse,
+    AddPlaylistItemsRequest, CreatePlaylistRequest, DeletePlaylistRequest, EditPlaylistMetaRequest,
+    MovePlaylistItemRequest, PlaylistEditResponse, PlaylistItemRef as PbPlaylistItemRef,
+    RateSongRequest, RemovePlaylistItemsRequest, SetProxyRequest, SetProxyResponse,
     Shelf,
     PlaylistTracksRequest, PlaylistTracksResponse, PrefetchResolveRequest, RecommendRequest,
     ResolveRequest, ResolveResponse, SearchRequest, SearchSection, SessionState, SessionStatus,
@@ -283,6 +283,94 @@ pub async fn get_playlist_tracks(
                 limit,
             },
             PLAYLIST_TIMEOUT,
+        ))
+        .await?;
+    Ok(resp.into_inner())
+}
+
+/// Add rows and keep the whole answer: the created per-item ids are what the
+/// journal needs to reconcile its temporary rows.
+pub async fn add_playlist_items_full(
+    playlist_id: &str,
+    video_ids: &[String],
+    allow_duplicates: bool,
+) -> Result<PlaylistEditResponse> {
+    let mut client = connect().await?;
+    let resp = client
+        .add_playlist_items(with_timeout(
+            AddPlaylistItemsRequest {
+                playlist_id: playlist_id.to_string(),
+                video_ids: video_ids.to_vec(),
+                allow_duplicates,
+            },
+            PLAYLIST_TIMEOUT,
+        ))
+        .await?;
+    Ok(resp.into_inner())
+}
+
+pub async fn move_playlist_item(
+    playlist_id: &str,
+    set_video_id: &str,
+    before_set_video_id: &str,
+) -> Result<PlaylistEditResponse> {
+    let mut client = connect().await?;
+    let resp = client
+        .move_playlist_item(with_timeout(
+            MovePlaylistItemRequest {
+                playlist_id: playlist_id.to_string(),
+                set_video_id: set_video_id.to_string(),
+                before_set_video_id: before_set_video_id.to_string(),
+            },
+            PLAYLIST_TIMEOUT,
+        ))
+        .await?;
+    Ok(resp.into_inner())
+}
+
+pub async fn edit_playlist_meta(
+    playlist_id: &str,
+    title: &str,
+    description: &str,
+    privacy: &str,
+) -> Result<PlaylistEditResponse> {
+    let mut client = connect().await?;
+    let resp = client
+        .edit_playlist_meta(with_timeout(
+            EditPlaylistMetaRequest {
+                playlist_id: playlist_id.to_string(),
+                title: title.to_string(),
+                description: description.to_string(),
+                privacy: privacy.to_string(),
+            },
+            PLAYLIST_TIMEOUT,
+        ))
+        .await?;
+    Ok(resp.into_inner())
+}
+
+pub async fn rate_song(video_id: &str, rating: &str) -> Result<PlaylistEditResponse> {
+    let mut client = connect().await?;
+    let resp = client
+        .rate_song(with_timeout(
+            RateSongRequest {
+                video_id: video_id.to_string(),
+                rating: rating.to_string(),
+            },
+            CALL_TIMEOUT,
+        ))
+        .await?;
+    Ok(resp.into_inner())
+}
+
+pub async fn save_playlist_to_library(playlist_id: &str) -> Result<PlaylistEditResponse> {
+    let mut client = connect().await?;
+    let resp = client
+        .save_playlist_to_library(with_timeout(
+            DeletePlaylistRequest {
+                playlist_id: playlist_id.to_string(),
+            },
+            CALL_TIMEOUT,
         ))
         .await?;
     Ok(resp.into_inner())
