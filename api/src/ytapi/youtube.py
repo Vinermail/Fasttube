@@ -167,7 +167,10 @@ def remove_playlist_items(playlist_id: str, items: list[dict]) -> dict:
         if i.get("video_id") and i.get("set_video_id")
     ]
     if not videos:
-        return {"ok": False, "error": "не выбраны треки для удаления"}
+        return {
+            "ok": False,
+            "error": "у этих строк нет id строки плейлиста — обнови список",
+        }
     ytm = _session_client()
     if ytm is None:
         return {"ok": False, "error": "нужен вход в аккаунт YouTube"}

@@ -2247,6 +2247,17 @@ function buildRow(entry, i) {
         run: () => addVideoToYtPlaylist(row.id, row.title),
       });
     }
+    if (currentYtPlaylistId && !row.setVideoId) {
+      // A page cached before the rows carried their per-item id: one refetch
+      // makes removal possible again.
+      items.push({
+        label: "Обновить список (нет id строк)",
+        run: async () => {
+          await invoke("refresh_playlist_tracks", { playlistId: currentYtPlaylistId });
+          await reloadYtPlaylist();
+        },
+      });
+    }
     if (currentYtPlaylistId && row.setVideoId) {
       items.push({
         label: "Убрать из плейлиста",

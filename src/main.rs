@@ -910,7 +910,10 @@ async fn remove_playlist_tracks(
         })
         .collect();
     if refs.is_empty() {
-        return Err("в этом списке нельзя удалять треки (нужен вход в аккаунт)".to_string());
+        return Err(
+            "у этих строк нет id для удаления — обнови список кнопкой плейлиста ещё раз (или это чужой либо автоматический плейлист, его менять нельзя)"
+                .to_string(),
+        );
     }
     ensure_session_fresh(&app, &state).await;
     let resp = grpc::remove_playlist_items(&playlist_id, &refs)
@@ -921,6 +924,13 @@ async fn remove_playlist_tracks(
     }
     drop_playlist_cache(&playlist_id);
     Ok(())
+}
+
+/// Forgets the cached copy of a playlist: the next open reads it again, which
+/// is what gives every row its per-item id.
+#[tauri::command]
+fn refresh_playlist_tracks(playlist_id: String) {
+    drop_playlist_cache(&playlist_id);
 }
 
 #[tauri::command]
@@ -1733,6 +1743,7 @@ fn save_track_page(key: &str, offset: i32, tracks: &[SearchTrack], total: i32) {
     let mut cached = std::fs::read_to_string(&path)
         .ok()
         .and_then(|raw| serde_json::from_str::<CachedTracks>(&raw).ok())
+        .filter(|c| c.version >= TRACK_CACHE_VERSION)
         .unwrap_or_default();
     let offset = offset.max(0) as usize;
     if cached.tracks.len() < offset {
@@ -3600,6 +3611,7 @@ fn main() {
             remove_playlist_tracks,
             create_account_playlist,
             delete_account_playlist,
+            refresh_playlist_tracks,
             set_developer_mode,
             open_devtools
         ])
