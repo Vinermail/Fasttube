@@ -668,6 +668,15 @@ fn spawn_cache_sweeper(app: tauri::AppHandle) {
                 if !first {
                     std::thread::sleep(std::time::Duration::from_secs(300));
                 }
+                if first {
+                    // Once, before anything can be downloading: files a previous
+                    // build left half-written would otherwise play as silence.
+                    let dropped =
+                        downloader::sweep_broken_cache(&downloader::cache_dir());
+                    if dropped > 0 {
+                        eprintln!("[cache] dropped {dropped} unfinished file(s)");
+                    }
+                }
                 first = false;
                 run_cache_eviction(&app.state::<AppState>());
             }

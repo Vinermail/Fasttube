@@ -685,6 +685,56 @@ fn manual_acceptance() {
     let _ = &mut sidecar;
 }
 
+/// The real track behind the "plays nothing" report: 1.39 MiB, so the probe
+/// covers all but ~400 KB of it and the tail used to be skipped entirely.
+#[test]
+#[ignore = "needs the sidecar and the network"]
+fn a_track_that_used_to_be_truncated_downloads_whole() {
+    let sidecar = Sidecar::start(None);
+    {
+        let _enter = runtime().enter();
+        crate::grpc::set_endpoint(sidecar.port, sidecar.token.clone()).expect("endpoint");
+    }
+    let id = "yu8fhMZ2cVY";
+    let resolved = block(crate::grpc::resolve(id, "high", false)).expect("resolve");
+    assert!(resolved.ok, "resolve failed: {}", resolved.error);
+    say(&format!(
+        "resolved {id}: itag={} mime={}",
+        resolved.itag, resolved.mime_type
+    ));
+
+    let dir = std::env::temp_dir().join("fasttube-truncation-check");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let dest = dir.join("short.high.m4a");
+    let handle = crate::downloader::ProgressHandle::default();
+    block(crate::downloader::download(
+        &resolved.stream_url,
+        &dest,
+        &handle,
+    ))
+    .expect("download");
+
+    let size = std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
+    say(&format!("downloaded {size} bytes"));
+    assert!(
+        size > 1024 * 1024,
+        "the file is only the probe chunk: {size} bytes"
+    );
+
+    use rodio::Source as _;
+    let file = std::fs::File::open(&dest).expect("open");
+    match rodio::Decoder::try_from(file) {
+        Ok(decoder) => say(&format!(
+            "decoder opened it: {} Hz, {} channels",
+            decoder.sample_rate().get(),
+            decoder.channels().get()
+        )),
+        Err(e) => panic!("the decoder refuses the file: {e}"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// `HH:MM` without pulling in a date crate.
 fn chrono_like_stamp() -> String {
     let now = std::time::SystemTime::now()

@@ -84,6 +84,38 @@ pub fn settings_file() -> PathBuf {
     data_dir().join("settings.json")
 }
 
+/// Deletes what an earlier version left behind: files that are exactly one probe
+/// chunk long (a download that saved only the first megabyte) and half-written
+/// `.part` files. Returns how many files went away.
+pub fn sweep_broken_cache(dir: &Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut dropped = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        let broken = if name.ends_with(".part") {
+            true
+        } else if name.ends_with(".m4a") || name.ends_with(".webm") {
+            // A real track is never exactly the probe size: 1 048 576 bytes is
+            // the signature of the truncation bug.
+            std::fs::metadata(&path)
+                .map(|m| m.len() == PROBE_BYTES)
+                .unwrap_or(false)
+        } else {
+            false
+        };
+        if broken && std::fs::remove_file(&path).is_ok() {
+            dropped += 1;
+        }
+    }
+    dropped
+}
+
 /// Removes the whole download cache (audio files and covers).
 pub fn clear_cache() -> std::io::Result<()> {
     let dir = cache_dir();
@@ -355,12 +387,14 @@ pub async fn download(url: &str, dest: &Path, handle: &ProgressHandle) -> Result
     let tmp = dest.with_extension("part");
 
     let head = response.content_length().unwrap_or(0);
-    let chunks = chunk_count(total.saturating_sub(head));
-    let parallel = partial
-        && total > PARALLEL_THRESHOLD
-        && chunks >= 2
-        && head > 0
-        && head < total;
+    let rest = total.saturating_sub(head);
+    let chunks = chunk_count(rest);
+    // Whenever the answer is a range and the file is longer than that range, the
+    // rest has to be fetched. Requiring two chunks here was the bug: a track
+    // between one and two megabytes took the "sequential" path with the *probe*
+    // response, which only carries the first megabyte, and the truncated file
+    // was renamed into the cache as if it were complete.
+    let parallel = partial && head > 0 && total > head && rest > 0;
     let written = if parallel {
         parallel_download(&client, url, &tmp, total, head, chunks, handle, started, response)
             .await?
@@ -369,6 +403,17 @@ pub async fn download(url: &str, dest: &Path, handle: &ProgressHandle) -> Result
         0
     };
     let _ = written;
+
+    // The last line of defence: a file that is not exactly the size the server
+    // announced never reaches the cache. Without this a short write becomes a
+    // "cached" track that can never play.
+    let written_len = tokio::fs::metadata(&tmp).await?.len();
+    if total > 0 && written_len != total {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(anyhow!(
+            "the download stopped at {written_len} of {total} bytes"
+        ));
+    }
 
     tokio::fs::rename(&tmp, dest).await?;
     handle.done.store(true, Ordering::Relaxed);
@@ -393,8 +438,6 @@ pub async fn download(url: &str, dest: &Path, handle: &ProgressHandle) -> Result
 }
 
 const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)";
-/// Splitting a smaller transfer costs more in round trips than it saves.
-const PARALLEL_THRESHOLD: u64 = 1024 * 1024;
 const CHUNK_UNIT: u64 = 1024 * 1024;
 const MAX_CHUNKS: u64 = 4;
 /// Writes go out in 256 KiB blocks instead of whatever the socket delivers.
@@ -834,6 +877,61 @@ mod tests {
             }
         });
         (format!("http://127.0.0.1:{port}/file.bin"), ranges)
+    }
+
+    #[tokio::test]
+    async fn a_file_just_over_the_probe_size_arrives_whole() {
+        // 1 MiB probe + a bit: the rest fits in a single chunk, and that chunk
+        // still has to be fetched (it used to be skipped, leaving 1 MiB behind).
+        let _guard = crate::net::test_proxy_lock();
+        crate::net::set_override(Some(None));
+        let payload = sample(PROBE_BYTES as usize + 200 * 1024);
+        let (url, ranges) = serve(payload.clone()).await;
+
+        let dir = std::env::temp_dir().join(format!("ft-short-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("out.m4a");
+        let handle = ProgressHandle::default();
+        let result = download(&url, &dest, &handle).await;
+        crate::net::set_override(None);
+
+        result.expect("download failed");
+        let written = std::fs::read(&dest).unwrap();
+        assert_eq!(
+            written.len(),
+            payload.len(),
+            "the file is not the size the server announced"
+        );
+        assert!(written == payload, "the bytes are not the served ones");
+        let seen = ranges.lock().clone();
+        assert!(
+            seen.iter().any(|(start, _)| *start == PROBE_BYTES),
+            "the tail was never requested: {seen:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn broken_cache_files_are_swept_away() {
+        let dir = std::env::temp_dir().join(format!("ft-sweep-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let truncated = dir.join("truncated.high.m4a");
+        std::fs::write(&truncated, vec![0u8; PROBE_BYTES as usize]).unwrap();
+        let part = dir.join("half.part");
+        std::fs::write(&part, b"partial").unwrap();
+        let whole = dir.join("whole.m4a");
+        std::fs::write(&whole, vec![0u8; PROBE_BYTES as usize + 1]).unwrap();
+        let meta = dir.join("whole.high.json");
+        std::fs::write(&meta, b"title").unwrap();
+
+        let dropped = sweep_broken_cache(&dir);
+
+        assert_eq!(dropped, 2, "the truncated file and the .part go");
+        assert!(!truncated.exists());
+        assert!(!part.exists());
+        assert!(whole.exists(), "a complete file stays");
+        assert!(meta.exists(), "metadata is not a cache entry");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
