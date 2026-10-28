@@ -127,8 +127,36 @@ fn log_line(stream: &str, line: &str) {
 
 // ------------------------------------------------------------ child process
 
+/// Where `api/` lives. The build-tree path is baked in, so a binary run from the
+/// repository finds it there; a binary copied next to its own `api/` folder finds
+/// it there instead, which is what a release build needs.
 fn project_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    let built = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    // The folder the binary sits in wins: that is what a copied build uses, and
+    // the build tree is only a fallback for a binary running from target/.
+    let mut candidates = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        let mut dir = exe.parent().map(|p| p.to_path_buf());
+        while let Some(current) = dir {
+            candidates.push(current.clone());
+            dir = current.parent().map(|p| p.to_path_buf());
+        }
+    }
+    candidates.push(built.clone());
+    root_with_sidecar(candidates).unwrap_or(built)
+}
+
+/// The first candidate that actually holds the Python sidecar.
+fn root_with_sidecar(candidates: Vec<PathBuf>) -> Option<PathBuf> {
+    candidates.into_iter().find(|root| has_sidecar(root))
+}
+
+fn has_sidecar(root: &std::path::Path) -> bool {
+    root.join("api")
+        .join("src")
+        .join("ytapi")
+        .join("server.py")
+        .exists()
 }
 
 fn python_executable() -> PathBuf {
@@ -163,6 +191,14 @@ fn spawn_child(token: &str, port: Option<u16>) -> Result<(Child, u16), String> {
         // Ask the sidecar to exit when this process dies (stdin is its
         // liveness pipe). Off by default so manual runs work normally.
         .env("FASTTUBE_PARENT_PIPE", "1")
+        // A build tree is not a place to write at runtime: the sidecar keeps its
+        // cache next to the app's data instead of next to its sources.
+        .env(
+            "FASTTUBE_CACHE_DIR",
+            crate::downloader::data_dir()
+                .join("cache")
+                .join("sidecar"),
+        )
         // Piped stdio otherwise uses the console code page: keep it UTF-8 so
         // the handshake parses and the log stays readable.
         .env("PYTHONIOENCODING", "utf-8")
@@ -399,6 +435,24 @@ fn set_status(shared: &SharedApiStatus, state: &str, version: &str, auth_ok: boo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_sidecar_is_looked_up_in_the_order_given() {
+        let dir = std::env::temp_dir().join(format!("fasttube-root-{}", std::process::id()));
+        let package = dir.join("api").join("src").join("ytapi");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(package.join("server.py"), b"# stand-in").unwrap();
+
+        let missing = dir.join("nowhere");
+        assert_eq!(
+            root_with_sidecar(vec![missing.clone(), dir.clone()]),
+            Some(dir.clone()),
+            "the first folder that has api/src/ytapi/server.py wins"
+        );
+        assert_eq!(root_with_sidecar(vec![missing]), None);
+        assert!(has_sidecar(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn backoff_doubles_and_caps() {

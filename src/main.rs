@@ -1862,7 +1862,17 @@ fn set_developer_mode(enabled: bool, state: tauri::State<AppState>) {
 
 #[tauri::command]
 fn open_devtools(window: tauri::WebviewWindow) {
-    window.open_devtools();
+    // The devtools feature is only compiled into debug builds; a release binary
+    // has no inspector to open, so the setting simply does nothing there.
+    #[cfg(debug_assertions)]
+    {
+        window.open_devtools();
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = &window;
+        eprintln!("[ui] devtools are not part of a release build");
+    }
 }
 
 #[tauri::command]

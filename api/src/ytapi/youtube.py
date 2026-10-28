@@ -57,7 +57,11 @@ _RESOLVE_CACHE: dict[str, tuple[float, dict]] = {}
 _resolve_lock = threading.Lock()
 _RESOLVE_TTL = 14400  # 4 hours (googlevideo URLs expire in ~6h)
 
-CACHE_DIR = os.path.join(
+# The app passes its own data directory; without it (a manual run of the
+# sidecar) the cache stays next to the package, which keeps the interpreter
+# usable on its own but must not be the default when the app starts it: a build
+# tree is not a place to write at runtime.
+CACHE_DIR = os.environ.get("FASTTUBE_CACHE_DIR") or os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "cache"
 )
 _RESOLVE_CACHE_FILE = os.path.join(CACHE_DIR, "resolve.json")

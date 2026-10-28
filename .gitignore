@@ -1,4 +1,5 @@
 /target
+/dist
 /gen
 
 # Python
@@ -17,3 +18,6 @@ code.txt
 # Misc
 *.part
 api/.pytest_cache/
+
+# Archives dropped into the project root
+/*.zip
