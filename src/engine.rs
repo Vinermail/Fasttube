@@ -7,6 +7,9 @@ use std::sync::Arc;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use std::time::{Duration, Instant};
 
+/// One fade step: 150 ms covered in ten ticks.
+const FADE_STEP: f32 = 0.1;
+
 const BUFFER_FRAMES: u32 = 2048;
 
 pub enum Cmd {
@@ -121,7 +124,7 @@ impl EngineHandle {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Status {
     Playing,
     Paused,
@@ -164,11 +167,26 @@ struct Engine {
     speed: f32,
     gain: f32,
     target_gain: f32,
+    /// Multiplier for the short fades on pause, resume, stop and seek. 1.0 is
+    /// "no fade in progress".
+    fade: f32,
+    fade_target: f32,
+    /// What to do once the fade reaches its target.
+    fade_after: Option<FadeAfter>,
     curve: bool,
     status: Status,
     dirty: bool,
     /// Counter of successful starts, so the run loop can announce them.
     started: u64,
+}
+
+/// The work a fade is covering. Pausing and stopping are held back until the
+/// level is down, a seek is dipped through so the jump is inaudible.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum FadeAfter {
+    Pause,
+    Stop,
+    Seek(f64),
 }
 
 impl Engine {
@@ -202,6 +220,9 @@ impl Engine {
             speed: 1.0,
             gain: 1.0,
             target_gain: 1.0,
+            fade: 1.0,
+            fade_target: 1.0,
+            fade_after: None,
             curve: true,
             status: Status::Stopped,
             dirty: true,
@@ -326,7 +347,53 @@ impl Engine {
         let level = output_level(self.volume, self.muted, self.curve);
         // Safety net: gains are peak-limited elsewhere (never boosting into
         // clipping), the 4.0 cap only guards against corrupt cached values.
-        self.player.set_volume((level * self.gain).clamp(0.0, 4.0));
+        self.player
+            .set_volume((level * self.gain * self.fade).clamp(0.0, 4.0));
+    }
+
+    /// Starts a fade in the given direction; `after` runs once it lands.
+    fn begin_fade(&mut self, to: f32, after: Option<FadeAfter>) {
+        self.fade_target = to.clamp(0.0, 1.0);
+        self.fade_after = after;
+        self.dirty = true;
+    }
+
+    /// One step of a running fade, called from the run loop. Steps are sized for
+    /// a 150 ms fade at the tick interval the loop uses while a fade is active.
+    /// Returns whether the level moved.
+    fn fade_tick(&mut self, step: f32) -> bool {
+        if (self.fade - self.fade_target).abs() < f32::EPSILON {
+            return false;
+        }
+        if self.fade < self.fade_target {
+            self.fade = (self.fade + step).min(self.fade_target);
+        } else {
+            self.fade = (self.fade - step).max(self.fade_target);
+        }
+        self.apply_volume();
+        self.dirty = true;
+        if (self.fade - self.fade_target).abs() < f32::EPSILON {
+            self.finish_fade();
+        }
+        true
+    }
+
+    /// Runs the work the fade was covering. Only once: a second tick after the
+    /// landing has nothing left to do.
+    fn finish_fade(&mut self) {
+        match self.fade_after.take() {
+            Some(FadeAfter::Pause) => self.player.pause(),
+            Some(FadeAfter::Stop) => self.player.stop(),
+            Some(FadeAfter::Seek(secs)) => {
+                let _ = self.player.try_seek(Duration::from_secs_f64(secs.max(0.0)));
+                self.fade_target = 1.0;
+            }
+            None => {}
+        }
+    }
+
+    fn fading(&self) -> bool {
+        (self.fade - self.fade_target).abs() > f32::EPSILON
     }
 
     fn set_volume_curve(&mut self, enabled: bool) {
@@ -393,12 +460,17 @@ impl Engine {
     fn toggle_pause(&mut self) {
         match self.status {
             Status::Playing => {
-                self.player.pause();
+                // The state flips at once so the button and the overlay answer
+                // the click; the audio is held for the 150 ms of the fade.
+                self.begin_fade(0.0, Some(FadeAfter::Pause));
                 self.status = Status::Paused;
                 self.dirty = true;
             }
             Status::Paused => {
                 self.player.play();
+                self.fade = 0.0;
+                self.begin_fade(1.0, None);
+                self.apply_volume();
                 self.status = Status::Playing;
                 self.dirty = true;
             }
@@ -425,13 +497,17 @@ impl Engine {
     }
 
     fn stop(&mut self) {
-        self.player.stop();
+        // The sink runs on until the level is down; `stop` follows the fade.
+        self.begin_fade(0.0, Some(FadeAfter::Stop));
         self.status = Status::Stopped;
         self.dirty = true;
     }
 
     fn seek(&mut self, secs: f64) {
-        if self.status != Status::Stopped {
+        if self.status == Status::Playing {
+            // Dip through silence: a hard jump in the middle of a sample clicks.
+            self.begin_fade(0.0, Some(FadeAfter::Seek(secs.max(0.0))));
+        } else if self.status != Status::Stopped {
             let _ = self.player.try_seek(Duration::from_secs_f64(secs.max(0.0)));
         }
         self.dirty = true;
@@ -500,7 +576,11 @@ fn run(
             engine.as_ref().map(|e| e.status),
             Some(Status::Playing)
         );
-        let wait = if playing {
+        let wait = if engine.as_ref().map(|e| e.fading()).unwrap_or(false) {
+            // A fade is 150 ms long: stepping it at 15 ms keeps it smooth
+            // without keeping the loop this busy the rest of the time.
+            Duration::from_millis(15)
+        } else if playing {
             Duration::from_millis(150)
         } else {
             Duration::from_millis(500)
@@ -649,6 +729,9 @@ fn run(
         if let Some(e) = engine.as_mut() {
             e.dirty = false;
             e.ramp_tick();
+            if e.fading() {
+                e.fade_tick(FADE_STEP);
+            }
         }
     }
 }
@@ -780,6 +863,75 @@ mod tests {
     }
 
     use super::output_level;
+
+    /// An engine on a two second tone, created straight instead of through the
+    /// handle: the fades are internal, so the test needs the struct.
+    fn fading_engine(tag: &str) -> Engine {
+        let dir = std::env::temp_dir().join(format!("player_llm_{tag}_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let wav = dir.join("tone.wav");
+        write_wav(&wav, 2.0, 8000);
+        let mut engine = Engine::create().unwrap();
+        engine.set_playlist(Playlist {
+            name: "tone".into(),
+            tracks: vec![Track::new(wav, "tone".into())],
+        });
+        engine.volume = 0.0;
+        engine
+    }
+
+    #[test]
+    fn a_pause_fades_out_before_the_sink_stops() {
+        let mut engine = fading_engine("fade_pause");
+        assert_eq!(engine.status, Status::Playing);
+
+        engine.toggle_pause();
+        // The state answers the click at once, the level does not jump.
+        assert_eq!(engine.status, Status::Paused);
+        assert!(engine.fading(), "the pause must be covered by a fade");
+        assert_eq!(engine.fade, 1.0);
+
+        let mut ticks = 0;
+        while engine.fading() {
+            engine.fade_tick(FADE_STEP);
+            ticks += 1;
+            assert!(ticks < 50, "the fade never landed");
+        }
+        assert_eq!(engine.fade, 0.0);
+        assert!(engine.fade_after.is_none(), "the sink was paused at the bottom");
+        // A 150 ms fade at the loop's 15 ms tick.
+        assert!(ticks <= 12, "the fade took {ticks} ticks");
+    }
+
+    #[test]
+    fn a_resume_climbs_from_silence() {
+        let mut engine = fading_engine("fade_resume");
+        engine.toggle_pause();
+        while engine.fading() {
+            engine.fade_tick(FADE_STEP);
+        }
+        engine.toggle_pause();
+        assert_eq!(engine.status, Status::Playing);
+        assert_eq!(engine.fade, 0.0, "a resume starts from nothing");
+        while engine.fading() {
+            engine.fade_tick(FADE_STEP);
+        }
+        assert_eq!(engine.fade, 1.0);
+    }
+
+    #[test]
+    fn a_seek_dips_through_silence_and_comes_back() {
+        let mut engine = fading_engine("fade_seek");
+        engine.seek(1.2);
+        assert!(engine.fading());
+        while engine.fading() {
+            engine.fade_tick(FADE_STEP);
+        }
+        // The jump happened at the bottom and the level climbed back up.
+        assert_eq!(engine.fade, 1.0);
+        assert!(engine.fade_after.is_none());
+        assert!(engine.player.get_pos().as_secs_f64() >= 1.0);
+    }
 
     #[test]
     fn mute_is_silence_whatever_the_slider_says() {

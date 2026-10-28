@@ -1070,7 +1070,7 @@ if (event && event.listen) {
     }
     if (action.startsWith("seek:")) {
       const to = Number(action.slice(5));
-      if (Number.isFinite(to)) run("seek", { position: to });
+      if (Number.isFinite(to)) run("seek", { secs: to });
       return;
     }
     if (action.startsWith("seek-by:")) {
@@ -1078,7 +1078,7 @@ if (event && event.listen) {
       const current = (lastState && lastState.elapsed) || 0;
       const total = (lastState && lastState.total) || 0;
       const to = Math.max(0, Math.min(total || 1e9, current + (Number.isFinite(by) ? by : 0)));
-      run("seek", { position: to });
+      run("seek", { secs: to });
     }
   });
 
