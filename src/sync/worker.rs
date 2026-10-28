@@ -7,6 +7,7 @@
 use super::api::{ApiError, PlaylistApi};
 use super::model::*;
 use super::store::SnapshotStore;
+use serde_json::Value;
 use std::collections::HashMap;
 
 /// How long a snapshot is trusted before a background re-read.
@@ -15,6 +16,11 @@ pub const STALE_AFTER_SECS: f64 = 120.0;
 /// YouTube does not like a burst of writes: at most one request in this window,
 /// whichever playlist it belongs to.
 pub const MIN_WRITE_GAP_SECS: f64 = 0.3;
+
+/// How many times an operation may wait for the row it points at to get a real
+/// per-item id from YouTube before it is called a failure. The waits are backed
+/// off like network retries, so this is a few minutes, not a few seconds.
+const MAX_ID_WAITS: u32 = 12;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -328,6 +334,28 @@ impl<A: PlaylistApi> SyncEngine<A> {
             if blocked.contains(&playlist_id) {
                 continue;
             }
+            // A move or a removal that names a row YouTube has not named yet
+            // cannot be sent: it would either fail or hit the wrong row.
+            if let Some(pending) = blocking_temp_id(kind, &payload) {
+                let attempts = self.ops[index].attempts + 1;
+                self.ops[index].attempts = attempts;
+                if attempts > MAX_ID_WAITS {
+                    self.ops[index].state = OpState::Failed;
+                    let message = format!(
+                        "строка {pending} так и не получила id от YouTube"
+                    );
+                    self.ops[index].error = message.clone();
+                    self.errors.insert(playlist_id.clone(), message.clone());
+                    events.push(SyncEvent::Failed {
+                        id: playlist_id,
+                        error: message,
+                    });
+                } else {
+                    self.ops[index].not_before = now + backoff_secs(attempts);
+                    blocked.push(playlist_id);
+                }
+                continue;
+            }
             if !touched.contains(&playlist_id) {
                 touched.push(playlist_id.clone());
             }
@@ -407,7 +435,22 @@ impl<A: PlaylistApi> SyncEngine<A> {
                 if video_ids.is_empty() {
                     return Ok(());
                 }
-                let created = self.api.add_items(playlist_id, &video_ids, false)?;
+                let mut created = self.api.add_items(playlist_id, &video_ids, false)?;
+                if created.is_empty() {
+                    // YouTube said it worked but did not name the rows. Read the
+                    // playlist back: the journal cannot stay on a temporary id.
+                    if let Ok(read) = self.api.fetch_playlist(playlist_id) {
+                        created = read
+                            .tracks
+                            .iter()
+                            .filter(|row| {
+                                !row.set_video_id.is_empty()
+                                    && video_ids.iter().any(|v| v == &row.video_id)
+                            })
+                            .map(|row| (row.video_id.clone(), row.set_video_id.clone()))
+                            .collect();
+                    }
+                }
                 self.reconcile_add(playlist_id, &items, &created);
                 Ok(())
             }
@@ -481,29 +524,51 @@ impl<A: PlaylistApi> SyncEngine<A> {
         let Some(mut snapshot) = self.store.load(playlist_id) else {
             return;
         };
+        let mut rewrites: Vec<(String, String, String)> = Vec::new();
         for (video_id, set_video_id) in created {
             if let Some(row) = snapshot
                 .tracks
                 .iter_mut()
                 .find(|t| t.video_id == *video_id && t.set_video_id.is_empty())
             {
+                let temp = row.temp_id.clone();
                 row.set_video_id = set_video_id.clone();
                 row.temp_id.clear();
-            }
-        }
-        // A row that came back without an id (duplicate) is simply no longer
-        // temporary: YouTube already had it.
-        for (video_id, _) in items {
-            let known = snapshot
-                .tracks
-                .iter()
-                .any(|t| t.video_id == *video_id && t.set_video_id.is_empty());
-            if known {
-                continue;
+                if temp.starts_with("pending:") {
+                    rewrites.push((temp, set_video_id.clone(), video_id.clone()));
+                }
             }
         }
         snapshot.total = snapshot.tracks.len() as i32;
         let _ = self.store.save(playlist_id, &snapshot);
+        // Anything queued behind this row was written against the temporary id:
+        // the move that follows the add, the removal of a track added a second
+        // ago. They only ever reach YouTube with the real per-item id.
+        self.rewrite_temp_ids(&rewrites);
+        let _ = items;
+    }
+
+    /// `pending:<…>` → the id YouTube gave. Applied to every operation that has
+    /// not run yet: the row itself, whatever it must be moved in front of, and
+    /// the temporary ids of batched adds.
+    fn rewrite_temp_ids(&mut self, rewrites: &[(String, String, String)]) {
+        if rewrites.is_empty() {
+            return;
+        }
+        let mut touched = false;
+        for op in self.ops.iter_mut() {
+            if op.state != OpState::Pending {
+                continue;
+            }
+            for (temp, real, video_id) in rewrites {
+                touched |= rewrite_field(&mut op.payload, "set_video_id", temp, real);
+                touched |= rewrite_field(&mut op.payload, "before_set_video_id", temp, real);
+                touched |= rewrite_items_temp_id(&mut op.payload, temp, real, video_id);
+            }
+        }
+        if touched {
+            self.save();
+        }
     }
 
     fn forget_row(&mut self, playlist_id: &str, video_id: &str, set_video_id: &str) {
@@ -599,6 +664,63 @@ fn looks_missing(message: &str) -> bool {
         || text.contains("not found")
         || text.contains("missing")
         || text.contains("no longer")
+}
+
+/// The temporary id an operation is still pointing at, if any.
+fn blocking_temp_id(kind: OpKind, payload: &serde_json::Value) -> Option<String> {
+    if !matches!(kind, OpKind::Move | OpKind::Remove) {
+        return None;
+    }
+    let mut candidates = vec![payload_str(payload, "set_video_id")];
+    if kind == OpKind::Move {
+        candidates.push(payload_str(payload, "before_set_video_id"));
+    }
+    candidates
+        .into_iter()
+        .find(|id| id.starts_with("pending:") && id.len() > "pending:".len())
+}
+
+fn rewrite_field(payload: &mut serde_json::Value, key: &str, from: &str, to: &str) -> bool {
+    let Some(Value::String(current)) = payload.get_mut(key) else {
+        return false;
+    };
+    if current != from {
+        return false;
+    }
+    *current = to.to_string();
+    true
+}
+
+fn rewrite_items_temp_id(
+    payload: &mut serde_json::Value,
+    from: &str,
+    to: &str,
+    video_id: &str,
+) -> bool {
+    let Some(items) = payload.get_mut("items").and_then(|v| v.as_array_mut()) else {
+        return false;
+    };
+    let mut touched = false;
+    for item in items {
+        let Some(obj) = item.as_object_mut() else {
+            continue;
+        };
+        let id_matches = obj
+            .get("video_id")
+            .and_then(|v| v.as_str())
+            .map(|v| v == video_id)
+            .unwrap_or(false);
+        let temp_matches = obj
+            .get("temp_id")
+            .and_then(|v| v.as_str())
+            .map(|v| v == from)
+            .unwrap_or(false);
+        if temp_matches && id_matches {
+            obj.insert("temp_id".to_string(), Value::String(to.to_string()));
+            touched = true;
+        }
+    }
+    touched
 }
 
 fn payload_str(payload: &serde_json::Value, key: &str) -> String {
@@ -945,6 +1067,143 @@ mod tests {
         millis.store(1_000_800, std::sync::atomic::Ordering::Relaxed);
         engine.tick();
         assert_eq!(engine.api().calls().len(), 3);
+        let _ = std::fs::remove_dir_all(store.base());
+    }
+
+    #[test]
+    fn an_offline_add_then_move_sends_the_real_id() {
+        let api = FakeApi::default();
+        api.add
+            .lock()
+            .unwrap()
+            .push_back(Err(ApiError::Network("offline".into())));
+        let (mut engine, clock, store) = engine("temp-move", api);
+        store.save("PL", &snapshot(&[])).unwrap();
+
+        engine.enqueue(add_op("PL", &[("x", "pending:p1")]));
+        engine.enqueue(Op::new(
+            OpKind::Move,
+            "PL",
+            "acc",
+            serde_json::json!({"set_video_id": "pending:p1", "before_set_video_id": ""}),
+            1000.0,
+        ));
+        engine.tick();
+        assert!(
+            engine.api().calls().iter().all(|c| !c.starts_with("move:")),
+            "the move must not be sent while the row has no id: {:?}",
+            engine.api().calls()
+        );
+
+        // The network is back: the add lands, the journal learns the real id and
+        // the move goes out with it.
+        clock.fetch_add(2, std::sync::atomic::Ordering::Relaxed);
+        engine.tick();
+        clock.fetch_add(2, std::sync::atomic::Ordering::Relaxed);
+        engine.tick();
+
+        let calls = engine.api().calls();
+        assert!(
+            calls.contains(&"move:PL:sv-x->".to_string()),
+            "the move was not rewritten: {calls:?}"
+        );
+        assert!(
+            calls.iter().all(|c| !c.contains("pending:")),
+            "a temporary id reached YouTube: {calls:?}"
+        );
+        assert_eq!(engine.status("PL").state, SyncState::Synced);
+        let _ = std::fs::remove_dir_all(store.base());
+    }
+
+    #[test]
+    fn an_add_without_ids_is_reconciled_by_reading_the_playlist() {
+        let api = FakeApi::default();
+        // The answer names no rows; the playlist read does.
+        api.add.lock().unwrap().push_back(Ok(Vec::new()));
+        api.read.lock().unwrap().push_back(Ok(crate::sync::api::PlaylistRead {
+            tracks: vec![SnapshotTrack {
+                video_id: "x".to_string(),
+                set_video_id: "sv-x".to_string(),
+                title: "X".to_string(),
+                ..Default::default()
+            }],
+            total: 1,
+            owned: true,
+            title: "P".to_string(),
+            privacy: String::new(),
+        }));
+        let (mut engine, clock, store) = engine("reconcile-read", api);
+        store.save("PL", &snapshot(&[])).unwrap();
+
+        engine.enqueue(add_op("PL", &[("x", "pending:p2")]));
+        engine.enqueue(Op::new(
+            OpKind::Move,
+            "PL",
+            "acc",
+            serde_json::json!({"set_video_id": "pending:p2", "before_set_video_id": ""}),
+            1000.0,
+        ));
+
+        engine.tick();
+        // The write window is 300 ms wide: the next request needs a later tick.
+        clock.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        engine.tick();
+
+        let calls = engine.api().calls();
+        assert!(
+            calls.iter().any(|c| c == "read:PL"),
+            "the add had to be reconciled by reading the playlist: {calls:?}"
+        );
+        let row = engine
+            .snapshot("PL")
+            .expect("snapshot")
+            .tracks
+            .into_iter()
+            .find(|t| t.video_id == "x")
+            .expect("row");
+        assert_eq!(row.set_video_id, "sv-x", "the snapshot learned the id");
+        assert!(row.temp_id.is_empty());
+        assert!(
+            calls.contains(&"move:PL:sv-x->".to_string()),
+            "the queued move did not get the real id: {calls:?}"
+        );
+        assert!(
+            calls.iter().all(|c| !c.contains("pending:")),
+            "a temporary id reached YouTube: {calls:?}"
+        );
+        let _ = std::fs::remove_dir_all(store.base());
+    }
+
+    #[test]
+    fn a_move_for_a_row_that_never_gets_an_id_gives_up() {
+        let api = FakeApi::default();
+        let (mut engine, clock, store) = engine("temp-never", api);
+        store.save("PL", &snapshot(&[])).unwrap();
+        engine.enqueue(Op::new(
+            OpKind::Move,
+            "PL",
+            "acc",
+            serde_json::json!({"set_video_id": "pending:lost", "before_set_video_id": ""}),
+            1000.0,
+        ));
+
+        for _ in 0..=MAX_ID_WAITS {
+            engine.tick();
+            clock.fetch_add(65, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        let status = engine.status("PL");
+        assert_eq!(status.state, SyncState::Error, "{status:?}");
+        assert!(
+            status.error.contains("pending:lost"),
+            "the message names the row: {}",
+            status.error
+        );
+        assert!(
+            engine.api().calls().iter().all(|c| !c.starts_with("move:")),
+            "a temporary id was sent: {:?}",
+            engine.api().calls()
+        );
         let _ = std::fs::remove_dir_all(store.base());
     }
 

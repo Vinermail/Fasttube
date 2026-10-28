@@ -134,6 +134,17 @@ fn say(line: &str) {
     println!("[acceptance] {line}");
 }
 
+/// These tests talk to the real account. Off unless asked for explicitly, so a
+/// `cargo test -- --ignored` on a laptop does not create playlists behind the
+/// user's back.
+fn live() -> bool {
+    if std::env::var("FASTTUBE_LIVE_ACCEPTANCE").as_deref() == Ok("1") {
+        return true;
+    }
+    say("skipped: set FASTTUBE_LIVE_ACCEPTANCE=1 to run against the real account");
+    false
+}
+
 /// Spins until the journal is empty or the deadline passes.
 fn drain<A: crate::sync::api::PlaylistApi>(
     engine: &mut SyncEngine<A>,
@@ -207,6 +218,9 @@ fn a_track_of_theirs() -> (String, String, String) {
 #[test]
 #[ignore = "needs the sidecar, a signed-in account and the network"]
 fn manual_acceptance() {
+    if !live() {
+        return;
+    }
     let mut sidecar = Sidecar::start(None);
     // The channel is a tokio type: build it inside the runtime.
     {
@@ -690,6 +704,9 @@ fn manual_acceptance() {
 #[test]
 #[ignore = "needs the sidecar and the network"]
 fn a_track_that_used_to_be_truncated_downloads_whole() {
+    if !live() {
+        return;
+    }
     let sidecar = Sidecar::start(None);
     {
         let _enter = runtime().enter();
