@@ -23,12 +23,35 @@
       "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' asset: http://asset.localhost https: data:; connect-src ipc: http://ipc.localhost; font-src 'self'",
       "assetProtocol": {
         "enable": true,
-        "scope": ["$LOCALDATA/fasttube/cache/**",
-          "$LOCALDATA/fasttube/covers/**"]
+        "scope": [
+          "$LOCALDATA/fasttube/cache/**",
+          "$LOCALDATA/fasttube/covers/**"
+        ]
       }
     }
   },
   "bundle": {
-    "active": false
+    "active": true,
+    "icon": [
+      "icons/icon.ico"
+    ],
+    "targets": [
+      "nsis"
+    ],
+    "fileAssociations": [
+      {
+        "ext": [
+          "mp3",
+          "flac",
+          "m4a",
+          "ogg",
+          "wav",
+          "opus"
+        ],
+        "name": "Audio",
+        "description": "Аудиофайл",
+        "role": "Viewer"
+      }
+    ]
   }
 }

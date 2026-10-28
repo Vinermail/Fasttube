@@ -1034,6 +1034,76 @@ async function loadTrackPages(command, args, meta) {
   return seen;
 }
 
+/* ---------- system media keys and files from the shell ---------- */
+
+/// SMTC and tray events arrive as one action name; they take the same path as a
+/// click on the player bar.
+if (event && event.listen) {
+  event.listen("media-control", (e) => {
+    const action = String(e.payload || "");
+    const playing = !!lastState && lastState.status === "playing";
+    const run = (command, args) =>
+      invoke(command, args).then(refresh).catch((err) => showError(err));
+    if (action === "play") {
+      if (!playing) run("toggle_pause");
+      return;
+    }
+    if (action === "pause") {
+      if (playing) run("toggle_pause");
+      return;
+    }
+    if (action === "toggle") {
+      run("toggle_pause");
+      return;
+    }
+    if (action === "next") {
+      run("next_track");
+      return;
+    }
+    if (action === "prev") {
+      run("prev_track");
+      return;
+    }
+    if (action === "stop") {
+      run("stop");
+      return;
+    }
+    if (action.startsWith("seek:")) {
+      const to = Number(action.slice(5));
+      if (Number.isFinite(to)) run("seek", { position: to });
+      return;
+    }
+    if (action.startsWith("seek-by:")) {
+      const by = Number(action.slice(8));
+      const current = (lastState && lastState.elapsed) || 0;
+      const total = (lastState && lastState.total) || 0;
+      const to = Math.max(0, Math.min(total || 1e9, current + (Number.isFinite(by) ? by : 0)));
+      run("seek", { position: to });
+    }
+  });
+
+  // A file from Explorer, the command line or a second launch.
+  event.listen("open-file", (e) => playOpenFile(String(e.payload || "")));
+
+  // The file may have arrived before this script: the backend keeps it.
+  invoke("take_open_file")
+    .then((path) => playOpenFile(String(path || "")))
+    .catch(() => {});
+}
+
+/// Plays a file handed over by the shell. A library file plays from its folder,
+/// anything else as a one-track playlist.
+function playOpenFile(path) {
+  if (!path) return;
+  invoke("play_local_path", { path })
+    .then(() => refresh())
+    .catch(() =>
+      invoke("play_local_file", { path })
+        .then(() => refresh())
+        .catch((err) => showError(err))
+    );
+}
+
 /* ---------- music search: chips, suggestions, sections ---------- */
 
 const SEARCH_FILTERS = ["", "songs", "videos", "albums", "artists", "playlists"];
@@ -2326,6 +2396,40 @@ $("opt-dev-mode").addEventListener("change", async (e) => {
     showError(err);
   }
 });
+
+/* ---------- system integration switches ---------- */
+const INTEGRATION_OPTIONS = [
+  ["opt-close-to-tray", "set_close_to_tray", "close_to_tray"],
+  ["opt-autostart", "set_autostart", "autostart"],
+  ["opt-notify-track", "set_notify_track_change", "notify_track_change"],
+  ["opt-global-hotkeys", "set_global_hotkeys", "global_hotkeys"],
+];
+
+async function loadIntegration() {
+  try {
+    const state = await invoke("get_integration");
+    for (const [id, , key] of INTEGRATION_OPTIONS) {
+      const box = $(id);
+      if (box) box.checked = !!state[key];
+    }
+  } catch (e) {
+    // Asked before the backend answered: the defaults are fine.
+  }
+}
+
+for (const [id, command] of INTEGRATION_OPTIONS) {
+  const box = $(id);
+  if (!box) continue;
+  box.addEventListener("change", () => {
+    invoke(command, { enabled: box.checked }).catch(async (err) => {
+      showError(err);
+      box.checked = !box.checked;
+      await loadIntegration();
+    });
+  });
+}
+
+loadIntegration();
 
 $("btn-proxy-apply").onclick = async () => {
   const port = Number(proxyPortEl.value);

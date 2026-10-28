@@ -4,7 +4,9 @@ mod auth_window;
 mod browser;
 mod downloader;
 mod engine;
+mod integration;
 mod m3u;
+mod media;
 mod fsutil;
 mod grpc;
 mod home;
@@ -164,6 +166,18 @@ struct Settings {
     proxy_host: String,
     #[serde(default = "default_proxy_port")]
     proxy_port: u16,
+    /// Closing the window hides it into the tray instead of quitting.
+    #[serde(default)]
+    close_to_tray: bool,
+    /// Start with Windows. Off unless the user asks.
+    #[serde(default)]
+    autostart: bool,
+    /// A tray notification when the track changes.
+    #[serde(default)]
+    notify_track_change: bool,
+    /// Ctrl+Alt+Space / arrows, system-wide. Off by default: they are global.
+    #[serde(default)]
+    global_hotkeys: bool,
     /// Last played track and where it stopped: feeds the «Продолжить» shelf.
     #[serde(default)]
     resume: Option<ResumeState>,
@@ -241,6 +255,10 @@ impl Default for Settings {
             proxy_kind: default_proxy_kind(),
             proxy_host: default_proxy_host(),
             proxy_port: default_proxy_port(),
+            close_to_tray: false,
+            autostart: false,
+            notify_track_change: false,
+            global_hotkeys: false,
         }
     }
 }
@@ -746,6 +764,9 @@ struct FavoriteTrack {
 }
 
 struct AppState {
+    /// A file handed over by the shell (double click, «Открыть с помощью»,
+    /// a second launch). The frontend takes it once it is ready.
+    open_file: Mutex<Option<String>>,
     engine: Mutex<EngineHandle>,
     library: Mutex<Vec<Playlist>>,
     local_current: Mutex<Option<Vec<engine::TrackInfo>>>,
@@ -1863,6 +1884,54 @@ fn open_custom_playlist(
     Ok(load_local_playlist(pl, 0, &state))
 }
 
+/// What the integration section of the settings window shows.
+#[derive(Serialize)]
+struct IntegrationState {
+    close_to_tray: bool,
+    autostart: bool,
+    notify_track_change: bool,
+    global_hotkeys: bool,
+}
+
+#[tauri::command]
+fn get_integration(app: tauri::AppHandle, state: tauri::State<AppState>) -> IntegrationState {
+    let settings = state.settings.lock().clone();
+    IntegrationState {
+        close_to_tray: settings.close_to_tray,
+        // The registry is the truth for autostart: the user may have removed it
+        // by hand, and the checkbox must not lie.
+        autostart: integration::autostart_enabled(&app),
+        notify_track_change: settings.notify_track_change,
+        global_hotkeys: settings.global_hotkeys,
+    }
+}
+
+#[tauri::command]
+fn set_close_to_tray(enabled: bool, state: tauri::State<AppState>) {
+    state.settings.lock().close_to_tray = enabled;
+    save_settings(&state.settings.lock().clone());
+}
+
+#[tauri::command]
+fn set_autostart(enabled: bool, app: tauri::AppHandle, state: tauri::State<AppState>) {
+    state.settings.lock().autostart = enabled;
+    save_settings(&state.settings.lock().clone());
+    integration::apply_autostart(&app, enabled);
+}
+
+#[tauri::command]
+fn set_notify_track_change(enabled: bool, state: tauri::State<AppState>) {
+    state.settings.lock().notify_track_change = enabled;
+    save_settings(&state.settings.lock().clone());
+}
+
+#[tauri::command]
+fn set_global_hotkeys(enabled: bool, app: tauri::AppHandle, state: tauri::State<AppState>) {
+    state.settings.lock().global_hotkeys = enabled;
+    save_settings(&state.settings.lock().clone());
+    integration::apply_hotkeys(&app, enabled);
+}
+
 #[tauri::command]
 fn set_developer_mode(enabled: bool, state: tauri::State<AppState>) {
     state.settings.lock().developer_mode = enabled;
@@ -2022,6 +2091,13 @@ fn play_local_file(path: String, state: tauri::State<AppState>) -> Result<(), St
     load_local_playlist(playlist, 0, &state);
     state.engine.lock().send(Cmd::PlayTrack(0));
     Ok(())
+}
+
+/// A file queued before the frontend was listening. One shot: the caller plays
+/// it and the slot is empty again.
+#[tauri::command]
+fn take_open_file(state: tauri::State<AppState>) -> Option<String> {
+    state.open_file.lock().take()
 }
 
 #[tauri::command]
@@ -4214,6 +4290,7 @@ fn main() {
         .find(|p| p.is_dir());
 
     let app_state = AppState {
+        open_file: Mutex::new(None),
         engine: Mutex::new(EngineHandle::new()),
         library: Mutex::new(Vec::new()),
         local_current: Mutex::new(None),
@@ -4261,8 +4338,43 @@ fn main() {
     let sidecar_shutdown = shutdown.clone();
     let sidecar = sidecar::spawn_and_supervise(api_status, sidecar_shutdown, api_token);
 
+    let open_media = integration::media_argument(&std::env::args().collect::<Vec<_>>());
+
     let app = tauri::Builder::default()
+        // First, as the plugin requires: a second launch never gets further.
+        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+            integration::show_window(app);
+            if let Some(file) = integration::media_argument(&argv) {
+                *app.state::<AppState>().open_file.lock() = Some(file.clone());
+                let _ = app.emit("open-file", file);
+            }
+        }))
         .plugin(tauri_plugin_dialog::init())
+        // Geometry, maximised state and the monitor it was on.
+        .plugin(
+            tauri_plugin_window_state::Builder::default()
+                .with_state_flags(
+                    tauri_plugin_window_state::StateFlags::all()
+                        & !tauri_plugin_window_state::StateFlags::VISIBLE,
+                )
+                .build(),
+        )
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ))
+        .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                let state = window.state::<AppState>();
+                let hide = state.settings.lock().close_to_tray;
+                if hide {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            }
+        })
         .manage(app_state)
         .setup(move |app| {
             spawn_queue_watcher(app.handle().clone());
@@ -4309,6 +4421,22 @@ fn main() {
                         }
                     })
                     .expect("failed to spawn library scan thread");
+            }
+            // Desktop integration: tray, media keys, autostart, hotkeys.
+            let handle = app.handle().clone();
+            if let Err(e) = integration::setup_tray(&handle) {
+                eprintln!("[integration] no tray icon: {e}");
+            }
+            {
+                let settings = app.state::<AppState>().settings.lock().clone();
+                integration::apply_autostart(&handle, settings.autostart);
+                integration::apply_hotkeys(&handle, settings.global_hotkeys);
+            }
+            media::spawn_ticker(handle.clone());
+            if let Some(file) = open_media.clone() {
+                // The frontend may not be listening yet: it asks for the file
+                // once it is up.
+                *app.state::<AppState>().open_file.lock() = Some(file);
             }
             Ok(())
         })
@@ -4415,7 +4543,13 @@ fn main() {
             copy_playlist,
             resolve_playlist_url,
             set_developer_mode,
-            open_devtools
+            open_devtools,
+            take_open_file,
+            get_integration,
+            set_close_to_tray,
+            set_autostart,
+            set_notify_track_change,
+            set_global_hotkeys
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
