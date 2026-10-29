@@ -1034,74 +1034,37 @@ async function loadTrackPages(command, args, meta) {
   return seen;
 }
 
-/* ---------- system media keys and files from the shell ---------- */
+/* ---------- files from the shell ---------- */
 
-/// SMTC and tray events arrive as one action name; they take the same path as a
-/// click on the player bar.
-if (event && event.listen) {
-  event.listen("media-control", (e) => {
-    const action = String(e.payload || "");
-    const playing = !!lastState && lastState.status === "playing";
-    const run = (command, args) =>
-      invoke(command, args).then(refresh).catch((err) => showError(err));
-    if (action === "play") {
-      if (!playing) run("toggle_pause");
-      return;
-    }
-    if (action === "pause") {
-      if (playing) run("toggle_pause");
-      return;
-    }
-    if (action === "toggle") {
-      run("toggle_pause");
-      return;
-    }
-    if (action === "next") {
-      run("next_track");
-      return;
-    }
-    if (action === "prev") {
-      run("prev_track");
-      return;
-    }
-    if (action === "stop") {
-      run("stop");
-      return;
-    }
-    if (action.startsWith("seek:")) {
-      const to = Number(action.slice(5));
-      if (Number.isFinite(to)) run("seek", { secs: to });
-      return;
-    }
-    if (action.startsWith("seek-by:")) {
-      const by = Number(action.slice(8));
-      const current = (lastState && lastState.elapsed) || 0;
-      const total = (lastState && lastState.total) || 0;
-      const to = Math.max(0, Math.min(total || 1e9, current + (Number.isFinite(by) ? by : 0)));
-      run("seek", { secs: to });
-    }
-  });
+// The media keys, the tray and the hotkeys are handled in Rust: they call the
+// same functions the commands do and do not wait for this page. Only the files
+// the shell hands over arrive here, and they own the player's playlist.
+event.listen("open-files", () => takeOpenFiles());
+takeOpenFiles();
 
-  // A file from Explorer, the command line or a second launch.
-  event.listen("open-file", (e) => playOpenFile(String(e.payload || "")));
-
-  // The file may have arrived before this script: the backend keeps it.
-  invoke("take_open_file")
-    .then((path) => playOpenFile(String(path || "")))
-    .catch(() => {});
-}
-
-/// Plays a file handed over by the shell. A library file plays from its folder,
-/// anything else as a one-track playlist.
-function playOpenFile(path) {
-  if (!path) return;
-  invoke("play_local_path", { path })
-    .then(() => refresh())
-    .catch(() =>
-      invoke("play_local_file", { path })
-        .then(() => refresh())
-        .catch((err) => showError(err))
-    );
+/// Plays what the shell queued (double click, «Открыть с помощью», a second
+/// launch). Several files become one playlist in the order they arrived.
+async function takeOpenFiles() {
+  let paths = [];
+  try {
+    paths = await invoke("take_open_files");
+  } catch (e) {
+    return;
+  }
+  if (!Array.isArray(paths) || paths.length === 0) return;
+  try {
+    await invoke("play_local_files", { paths });
+    await refresh();
+  } catch (err) {
+    // A single library file still plays from its folder, which keeps «next»
+    // walking that folder instead of a one-track playlist.
+    try {
+      await invoke("play_local_path", { path: paths[0] });
+      await refresh();
+    } catch (e) {
+      showError(err);
+    }
+  }
 }
 
 /* ---------- music search: chips, suggestions, sections ---------- */

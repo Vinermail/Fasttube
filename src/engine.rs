@@ -245,6 +245,8 @@ impl Engine {
         self.playlist = playlist;
         self.idx = 0;
         self.player.stop();
+        self.reset_fade();
+        self.apply_volume();
         self.status = Status::Stopped;
         self.total = self
             .playlist
@@ -292,6 +294,8 @@ impl Engine {
                 self.idx = self.playlist.tracks.len();
                 self.total = Duration::ZERO;
                 self.player.stop();
+                self.reset_fade();
+                self.apply_volume();
                 self.status = Status::Stopped;
                 self.dirty = true;
                 return;
@@ -311,6 +315,7 @@ impl Engine {
         self.idx = idx;
         self.total = Duration::ZERO;
         self.player.stop();
+        self.reset_fade();
         self.status = Status::Loading;
         self.dirty = true;
 
@@ -396,6 +401,15 @@ impl Engine {
         (self.fade - self.fade_target).abs() > f32::EPSILON
     }
 
+    /// A fresh source starts at full level with nothing pending: a fade or a
+    /// deferred pause/stop/seek belonged to the track that just went away, and
+    /// carrying it over silenced the next one (or paused it, or seeked it).
+    fn reset_fade(&mut self) {
+        self.fade = 1.0;
+        self.fade_target = 1.0;
+        self.fade_after = None;
+    }
+
     fn set_volume_curve(&mut self, enabled: bool) {
         self.curve = enabled;
         // Force-apply the current volume under the new curve immediately.
@@ -467,8 +481,9 @@ impl Engine {
                 self.dirty = true;
             }
             Status::Paused => {
+                // Resume from the level the fade stopped at: a pause that was
+                // interrupted in the middle must not jump to silence first.
                 self.player.play();
-                self.fade = 0.0;
                 self.begin_fade(1.0, None);
                 self.apply_volume();
                 self.status = Status::Playing;
@@ -839,6 +854,9 @@ mod tests {
         );
         handle.send(Cmd::TogglePause);
         assert!(wait(&|s| s.status == "paused"), "pause did not work");
+        // The pause is covered by a 150 ms fade: the decoder keeps running
+        // until the level is down, so measure the stillness after it lands.
+        std::thread::sleep(Duration::from_millis(300));
         let paused_elapsed = handle.snapshot().map(|s| s.elapsed).unwrap_or(0.0);
         std::thread::sleep(Duration::from_millis(500));
         let still = handle.snapshot().map(|s| s.elapsed).unwrap_or(0.0);
@@ -867,17 +885,36 @@ mod tests {
     /// An engine on a two second tone, created straight instead of through the
     /// handle: the fades are internal, so the test needs the struct.
     fn fading_engine(tag: &str) -> Engine {
-        let dir = std::env::temp_dir().join(format!("player_llm_{tag}_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let wav = dir.join("tone.wav");
-        write_wav(&wav, 2.0, 8000);
         let mut engine = Engine::create().unwrap();
-        engine.set_playlist(Playlist {
-            name: "tone".into(),
-            tracks: vec![Track::new(wav, "tone".into())],
-        });
+        engine.set_playlist(tone_playlist(tag, 1));
         engine.volume = 0.0;
         engine
+    }
+
+    /// A playlist of `count` tones, one file each.
+    fn tone_playlist(tag: &str, count: usize) -> Playlist {
+        let dir = std::env::temp_dir().join(format!("player_llm_{tag}_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut tracks = Vec::new();
+        for i in 0..count {
+            let wav = dir.join(format!("tone{i}.wav"));
+            write_wav(&wav, 2.0, 8000);
+            tracks.push(Track::new(wav, format!("tone{i}")));
+        }
+        Playlist {
+            name: "tone".into(),
+            tracks,
+        }
+    }
+
+    /// Runs the fade to its landing point.
+    fn settle_fades(engine: &mut Engine) {
+        let mut ticks = 0;
+        while engine.fading() {
+            engine.fade_tick(FADE_STEP);
+            ticks += 1;
+            assert!(ticks < 100, "the fade never landed");
+        }
     }
 
     #[test]
@@ -931,6 +968,69 @@ mod tests {
         assert_eq!(engine.fade, 1.0);
         assert!(engine.fade_after.is_none());
         assert!(engine.player.get_pos().as_secs_f64() >= 1.0);
+    }
+
+    #[test]
+    fn a_finished_pause_does_not_silence_the_next_track() {
+        let mut engine = fading_engine("fade_leak_pause");
+        engine.toggle_pause();
+        settle_fades(&mut engine);
+        assert_eq!(engine.fade, 0.0);
+
+        // The next track starts from full level, not from the faded silence.
+        engine.load(0);
+        assert_eq!(engine.status, Status::Playing);
+        assert_eq!(engine.fade, 1.0);
+        assert!(engine.fade_after.is_none());
+        assert!(!engine.player.is_paused());
+    }
+
+    #[test]
+    fn a_stop_then_play_has_sound() {
+        let mut engine = fading_engine("fade_leak_stop");
+        engine.stop();
+        settle_fades(&mut engine);
+        assert_eq!(engine.status, Status::Stopped);
+        assert_eq!(engine.fade, 0.0);
+
+        engine.toggle_pause();
+        assert_eq!(engine.status, Status::Playing);
+        assert_eq!(engine.fade, 1.0, "the fade of the stop must not survive");
+        assert!(!engine.player.is_paused());
+    }
+
+    #[test]
+    fn a_next_in_the_middle_of_a_pause_is_not_paused() {
+        let mut engine = fading_engine("fade_leak_next");
+        engine.toggle_pause();
+        engine.fade_tick(FADE_STEP);
+        engine.fade_tick(FADE_STEP);
+        assert!(engine.fade < 1.0, "the fade is still running");
+
+        engine.next();
+        assert_eq!(engine.status, Status::Playing);
+        assert_eq!(engine.fade, 1.0);
+        assert!(
+            engine.fade_after.is_none(),
+            "the pending pause applied itself to the new track"
+        );
+        settle_fades(&mut engine);
+        assert!(!engine.player.is_paused(), "the new track was paused by the old fade");
+    }
+
+    #[test]
+    fn a_seek_in_flight_does_not_move_the_next_track() {
+        let mut engine = fading_engine("fade_leak_seek");
+        engine.seek(1.2);
+        assert!(engine.fading());
+
+        // Another track arrives before the dip reached the bottom.
+        engine.next();
+        settle_fades(&mut engine);
+        assert_eq!(engine.status, Status::Playing);
+        assert!(engine.fade_after.is_none());
+        let pos = engine.player.get_pos().as_secs_f64();
+        assert!(pos < 0.5, "the new track was seeked to {pos}s by the old fade");
     }
 
     #[test]

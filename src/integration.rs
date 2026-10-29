@@ -4,7 +4,7 @@
 use crate::AppState;
 use tauri::menu::MenuBuilder;
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Manager};
 
 /// The tray icon and its menu. Left click shows or hides the window, the menu
 /// carries the same commands as the player bar plus the way out.
@@ -24,18 +24,9 @@ pub fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
         .tooltip("Fasttube")
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id().as_ref() {
-            "toggle" => {
-                let _ = app.emit("media-control", "toggle");
-            }
-            "next" => {
-                let _ = app.emit("media-control", "next");
-            }
-            "prev" => {
-                let _ = app.emit("media-control", "prev");
-            }
             "show" => show_window(app),
             "quit" => app.exit(0),
-            _ => {}
+            action => crate::media_action(app, action),
         })
         .on_tray_icon_event(|tray, event| {
             if let TrayIconEvent::Click {
@@ -97,6 +88,11 @@ pub fn notify_track_change(app: &AppHandle, title: &str, artist: &str) {
 /// Autostart follows the setting; a failure is a log line, not a crash.
 pub fn apply_autostart(app: &AppHandle, enabled: bool) {
     use tauri_plugin_autostart::ManagerExt;
+    // Starting with Windows is a registry entry, and writing it on every launch
+    // is both pointless and a way to fight with the user's own choice.
+    if autostart_enabled(app) == enabled {
+        return;
+    }
     let manager = app.autolaunch();
     let result = if enabled {
         manager.enable()
@@ -127,10 +123,9 @@ pub fn apply_hotkeys(app: &AppHandle, enabled: bool) {
         ("Control+Alt+Right", "next"),
         ("Control+Alt+Left", "prev"),
     ] {
-        let app = app.clone();
-        if let Err(e) = shortcuts.on_shortcut(combination, move |_app, _shortcut, event| {
+        if let Err(e) = shortcuts.on_shortcut(combination, move |app, _shortcut, event| {
             if event.state == tauri_plugin_global_shortcut::ShortcutState::Pressed {
-                let _ = app.emit("media-control", action);
+                crate::media_action(app, action);
             }
         }) {
             eprintln!("[integration] hotkey {combination} is not available: {e}");
@@ -139,19 +134,21 @@ pub fn apply_hotkeys(app: &AppHandle, enabled: bool) {
 }
 
 /// Files and folders passed on the command line (double click, "Open with",
-/// a second launch). Returns the first existing media file.
-pub fn media_argument(args: &[String]) -> Option<String> {
+/// a second launch). Every existing media file, in order: selecting ten songs
+/// in Explorer and pressing Enter must queue ten songs, not play one.
+pub fn media_arguments(args: &[String]) -> Vec<String> {
+    let mut found = Vec::new();
     for arg in args.iter().skip(1) {
         let trimmed = arg.trim_matches('"');
         if trimmed.starts_with('-') {
             continue;
         }
         let path = std::path::Path::new(trimmed);
-        if path.is_file() && is_media(path) {
-            return Some(trimmed.to_string());
+        if path.is_file() && is_media(path) && !found.iter().any(|f: &String| f == trimmed) {
+            found.push(trimmed.to_string());
         }
     }
-    None
+    found
 }
 
 fn is_media(path: &std::path::Path) -> bool {
@@ -181,8 +178,8 @@ mod tests {
             other.to_string_lossy().to_string(),
             format!("\"{}\"", song.to_string_lossy()),
         ];
-        assert_eq!(media_argument(&args), Some(song.to_string_lossy().to_string()));
-        assert_eq!(media_argument(&["fasttube.exe".to_string()]), None);
+        assert_eq!(media_arguments(&args), vec![song.to_string_lossy().to_string()]);
+        assert!(media_arguments(&["fasttube.exe".to_string()]).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

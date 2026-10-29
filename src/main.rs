@@ -764,9 +764,9 @@ struct FavoriteTrack {
 }
 
 struct AppState {
-    /// A file handed over by the shell (double click, «Открыть с помощью»,
-    /// a second launch). The frontend takes it once it is ready.
-    open_file: Mutex<Option<String>>,
+    /// Files handed over by the shell (double click, «Открыть с помощью»,
+    /// a second launch). The frontend takes them once it is ready.
+    open_files: Mutex<Vec<String>>,
     engine: Mutex<EngineHandle>,
     library: Mutex<Vec<Playlist>>,
     local_current: Mutex<Option<Vec<engine::TrackInfo>>>,
@@ -2079,7 +2079,11 @@ fn play_local_path(path: String, state: tauri::State<AppState>) -> Result<(), St
 /// from «Избранное», for instance): play_local_path only knows library files.
 #[tauri::command]
 fn play_local_file(path: String, state: tauri::State<AppState>) -> Result<(), String> {
-    let file = std::path::PathBuf::from(&path);
+    do_play_local_file(&path, &state)
+}
+
+fn do_play_local_file(path: &str, state: &AppState) -> Result<(), String> {
+    let file = std::path::PathBuf::from(path);
     if !file.is_file() {
         return Err("file not found".to_string());
     }
@@ -2088,16 +2092,39 @@ fn play_local_file(path: String, state: tauri::State<AppState>) -> Result<(), St
         name: "File".to_string(),
         tracks: vec![track],
     };
-    load_local_playlist(playlist, 0, &state);
+    load_local_playlist(playlist, 0, state);
     state.engine.lock().send(Cmd::PlayTrack(0));
     Ok(())
 }
 
-/// A file queued before the frontend was listening. One shot: the caller plays
-/// it and the slot is empty again.
+/// Files queued before the frontend was listening. One shot: the caller plays
+/// them and the slot is empty again.
 #[tauri::command]
-fn take_open_file(state: tauri::State<AppState>) -> Option<String> {
-    state.open_file.lock().take()
+fn take_open_files(state: tauri::State<AppState>) -> Vec<String> {
+    std::mem::take(&mut *state.open_files.lock())
+}
+
+/// Plays the files the shell handed over as one playlist, in order: ten songs
+/// selected in Explorer become ten rows and the first one plays.
+#[tauri::command]
+fn play_local_files(paths: Vec<String>, state: tauri::State<AppState>) -> Result<(), String> {
+    let covers = downloader::covers_dir();
+    let tracks: Vec<playlist::Track> = paths
+        .iter()
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.is_file())
+        .map(|p| playlist::read_track(&p, &covers))
+        .collect();
+    if tracks.is_empty() {
+        return Err("no playable files".to_string());
+    }
+    let playlist = Playlist {
+        name: "File".to_string(),
+        tracks,
+    };
+    load_local_playlist(playlist, 0, &state);
+    state.engine.lock().send(Cmd::PlayTrack(0));
+    Ok(())
 }
 
 #[tauri::command]
@@ -2138,13 +2165,23 @@ fn play_track(index: usize, state: tauri::State<AppState>) {
     state.engine.lock().send(Cmd::PlayTrack(index));
 }
 
-#[tauri::command]
-fn toggle_pause(state: tauri::State<AppState>) {
+/// The pause toggle itself: the command, the media keys, the tray and the
+/// hotkeys all end here.
+fn do_toggle_pause(state: &AppState) {
     state.engine.lock().send(Cmd::TogglePause);
 }
 
-#[tauri::command]
-async fn next_track(state: tauri::State<'_, AppState>) -> Result<(), String> {
+/// `true` while the engine says a track is playing.
+fn is_playing(state: &AppState) -> bool {
+    state
+        .engine
+        .lock()
+        .snapshot()
+        .map(|s| s.status == "playing")
+        .unwrap_or(false)
+}
+
+async fn do_next_track(state: &AppState) -> Result<(), String> {
     let action = state.queue.lock().next();
     match action {
         // The queue is not driving playback: let the engine's own
@@ -2161,8 +2198,7 @@ async fn next_track(state: tauri::State<'_, AppState>) -> Result<(), String> {
     }
 }
 
-#[tauri::command]
-async fn prev_track(state: tauri::State<'_, AppState>) -> Result<(), String> {
+async fn do_prev_track(state: &AppState) -> Result<(), String> {
     let elapsed = state
         .engine
         .lock()
@@ -2179,15 +2215,142 @@ async fn prev_track(state: tauri::State<'_, AppState>) -> Result<(), String> {
     }
 }
 
-#[tauri::command]
-fn stop(state: tauri::State<AppState>) {
+fn do_stop(state: &AppState) {
     state.queue.lock().mark_manual_stop();
     state.engine.lock().send(Cmd::Stop);
 }
 
+fn do_seek(secs: f64, state: &AppState) {
+    state.engine.lock().send(Cmd::Seek(secs));
+}
+
+#[tauri::command]
+fn toggle_pause(state: tauri::State<AppState>) {
+    do_toggle_pause(&state);
+}
+
+#[tauri::command]
+async fn next_track(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    do_next_track(&state).await
+}
+
+#[tauri::command]
+async fn prev_track(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    do_prev_track(&state).await
+}
+
+#[tauri::command]
+fn stop(state: tauri::State<AppState>) {
+    do_stop(&state);
+}
+
 #[tauri::command]
 fn seek(secs: f64, state: tauri::State<AppState>) {
-    state.engine.lock().send(Cmd::Seek(secs));
+    do_seek(secs, &state);
+}
+
+/// A Play key on a cold start has nothing to toggle: the engine holds no
+/// playlist until something is chosen. Continue the last track instead — the
+/// same one the «Продолжить» shelf offers.
+fn resume_last_track(app: &tauri::AppHandle, state: &AppState) {
+    use tauri::Manager;
+
+    let Some(resume) = state.settings.lock().resume.clone() else {
+        return;
+    };
+    if resume.is_local && !resume.path.is_empty() {
+        if let Err(e) = do_play_local_file(&resume.path, state) {
+            eprintln!("[media] cannot continue {}: {e}", resume.path);
+            return;
+        }
+        if resume.position_secs > 1.0 {
+            do_seek(resume.position_secs, state);
+        }
+        return;
+    }
+    if !downloader::is_valid_video_id(&resume.id) {
+        return;
+    }
+    let item = QueueItem {
+        id: resume.id,
+        title: resume.title,
+        artist: resume.artist,
+        thumbnail: resume.thumbnail,
+        duration_secs: 0.0,
+    };
+    let app = app.clone();
+    let position = resume.position_secs;
+    tauri::async_runtime::spawn(async move {
+        let state = app.state::<AppState>();
+        state.queue.lock().set_items(vec![item], 0);
+        match play_current(&state).await {
+            Ok(()) => {
+                if position > 1.0 {
+                    do_seek(position, &state);
+                }
+            }
+            Err(e) => eprintln!("[media] cannot continue the last track: {e}"),
+        }
+    });
+}
+
+/// One entry point for everything outside the window: the media keys and the
+/// volume overlay (souvlaki), the tray menu and the global hotkeys. Same
+/// functions as the commands above, so a key behaves exactly like a click and
+/// does not depend on the page being awake.
+pub fn media_action(app: &tauri::AppHandle, action: &str) {
+    use tauri::Manager;
+
+    let state = app.state::<AppState>();
+    match action {
+        "toggle" | "play" if !is_playing(&state) && state.engine.lock().snapshot().is_none() => {
+            resume_last_track(app, &state);
+        }
+        "toggle" => do_toggle_pause(&state),
+        "play" => {
+            if !is_playing(&state) {
+                do_toggle_pause(&state);
+            }
+        }
+        "pause" => {
+            if is_playing(&state) {
+                do_toggle_pause(&state);
+            }
+        }
+        "stop" => do_stop(&state),
+        "next" | "prev" => {
+            // A track change can download: it must not block the media thread.
+            let app = app.clone();
+            let forward = action == "next";
+            tauri::async_runtime::spawn(async move {
+                let state = app.state::<AppState>();
+                let result = if forward {
+                    do_next_track(&state).await
+                } else {
+                    do_prev_track(&state).await
+                };
+                if let Err(e) = result {
+                    eprintln!("[media] {e}");
+                }
+            });
+        }
+        action if action.starts_with("seek:") => {
+            if let Ok(secs) = action["seek:".len()..].parse::<f64>() {
+                do_seek(secs.max(0.0), &state);
+            }
+        }
+        action if action.starts_with("seek-by:") => {
+            if let Ok(delta) = action["seek-by:".len()..].parse::<f64>() {
+                // The overlay sends a delta; the engine wants an absolute target.
+                let snapshot = state.engine.lock().snapshot();
+                let elapsed = snapshot.as_ref().map(|s| s.elapsed).unwrap_or(0.0);
+                let total = snapshot.map(|s| s.total).unwrap_or(0.0);
+                let target = (elapsed + delta).clamp(0.0, if total > 0.0 { total } else { f64::MAX });
+                do_seek(target, &state);
+            }
+        }
+        other => eprintln!("[media] unknown action {other}"),
+    }
 }
 
 #[tauri::command]
@@ -4290,7 +4453,7 @@ fn main() {
         .find(|p| p.is_dir());
 
     let app_state = AppState {
-        open_file: Mutex::new(None),
+        open_files: Mutex::new(Vec::new()),
         engine: Mutex::new(EngineHandle::new()),
         library: Mutex::new(Vec::new()),
         local_current: Mutex::new(None),
@@ -4338,15 +4501,19 @@ fn main() {
     let sidecar_shutdown = shutdown.clone();
     let sidecar = sidecar::spawn_and_supervise(api_status, sidecar_shutdown, api_token);
 
-    let open_media = integration::media_argument(&std::env::args().collect::<Vec<_>>());
+    let launch_args = std::env::args().collect::<Vec<_>>();
+    let open_media = integration::media_arguments(&launch_args);
+    let start_minimized = launch_args.iter().any(|a| a == "--minimized");
 
     let app = tauri::Builder::default()
         // First, as the plugin requires: a second launch never gets further.
         .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
             integration::show_window(app);
-            if let Some(file) = integration::media_argument(&argv) {
-                *app.state::<AppState>().open_file.lock() = Some(file.clone());
-                let _ = app.emit("open-file", file);
+            // Every path of the second launch joins the queue of the first.
+            let files = integration::media_arguments(&argv);
+            if !files.is_empty() {
+                *app.state::<AppState>().open_files.lock() = files;
+                let _ = app.emit("open-files", ());
             }
         }))
         .plugin(tauri_plugin_dialog::init())
@@ -4361,7 +4528,9 @@ fn main() {
         )
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
-            None,
+            // Started by Windows at login: straight into the tray, never a
+            // window on top of whatever the user is doing.
+            Some(vec!["--minimized"]),
         ))
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
@@ -4433,10 +4602,17 @@ fn main() {
                 integration::apply_hotkeys(&handle, settings.global_hotkeys);
             }
             media::spawn_ticker(handle.clone());
-            if let Some(file) = open_media.clone() {
-                // The frontend may not be listening yet: it asks for the file
+            if !open_media.is_empty() {
+                // The frontend may not be listening yet: it asks for the files
                 // once it is up.
-                *app.state::<AppState>().open_file.lock() = Some(file);
+                *app.state::<AppState>().open_files.lock() = open_media.clone();
+            }
+            if start_minimized && app.state::<AppState>().settings.lock().close_to_tray {
+                // `--minimized` only has somewhere to hide to when the tray
+                // keeps the app alive — otherwise it would look like a crash.
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.hide();
+                }
             }
             Ok(())
         })
@@ -4544,7 +4720,8 @@ fn main() {
             resolve_playlist_url,
             set_developer_mode,
             open_devtools,
-            take_open_file,
+            take_open_files,
+            play_local_files,
             get_integration,
             set_close_to_tray,
             set_autostart,

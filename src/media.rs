@@ -6,9 +6,9 @@ use souvlaki::{
     MediaControlEvent, MediaControls, MediaMetadata, MediaPlayback, MediaPosition, PlatformConfig,
 };
 use std::ffi::c_void;
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::time::Duration;
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Manager};
 
 /// What the overlay needs to know about the current track.
 pub struct NowPlaying {
@@ -20,9 +20,34 @@ pub struct NowPlaying {
     pub cover: String,
 }
 
+/// The two calls the presenter makes on the system session. A trait, so the
+/// stream logic runs in a test without Windows and without a real session.
+trait Controls {
+    fn put_metadata(&mut self, meta: MediaMetadata<'_>) -> Result<(), souvlaki::Error>;
+    fn put_playback(&mut self, playback: MediaPlayback) -> Result<(), souvlaki::Error>;
+}
+
+impl Controls for MediaControls {
+    fn put_metadata(&mut self, meta: MediaMetadata<'_>) -> Result<(), souvlaki::Error> {
+        self.set_metadata(meta)
+    }
+
+    fn put_playback(&mut self, playback: MediaPlayback) -> Result<(), souvlaki::Error> {
+        self.set_playback(playback)
+    }
+}
+
 enum Message {
     Metadata(Box<NowPlaying>),
-    State { playing: bool, position: f64, duration: f64 },
+    State {
+        playing: bool,
+        position: f64,
+        duration: f64,
+        /// Something is on screen even if it is not playing: the last track
+        /// after a start, for instance. Without it the session would report
+        /// Stopped and the overlay would show nothing at all.
+        has_track: bool,
+    },
 }
 
 /// The SMTC session. Created on the first tick, when the window and its HWND
@@ -61,12 +86,95 @@ impl MediaSession {
         let _ = self.tx.send(Message::Metadata(Box::new(meta)));
     }
 
-    pub fn set_state(&self, playing: bool, position: f64, duration: f64) {
+    pub fn set_state(&self, playing: bool, position: f64, duration: f64, has_track: bool) {
         let _ = self.tx.send(Message::State {
             playing,
             position,
             duration,
+            has_track,
         });
+    }
+}
+
+/// Keeps the system session in step with the messages it is fed. The last
+/// published playback state is remembered so a position update that changes
+/// nothing does not reach the shell.
+struct Presenter<C: Controls> {
+    controls: C,
+    last: Option<MediaPlayback>,
+}
+
+impl<C: Controls> Presenter<C> {
+    fn new(controls: C) -> Self {
+        Self {
+            controls,
+            last: None,
+        }
+    }
+
+    fn apply(&mut self, message: Message) {
+        let result = match message {
+            Message::Metadata(meta) => {
+                let cover = if meta.cover.is_empty() {
+                    None
+                } else {
+                    Some(meta.cover.as_str())
+                };
+                self.controls.put_metadata(MediaMetadata {
+                    title: Some(meta.title.as_str()),
+                    artist: Some(meta.artist.as_str()),
+                    album: Some(meta.album.as_str()),
+                    cover_url: cover,
+                    duration: (meta.duration > 0.0)
+                        .then(|| Duration::from_secs_f64(meta.duration)),
+                })
+            }
+            Message::State {
+                playing,
+                position,
+                duration,
+                has_track,
+            } => {
+                let progress = (position > 0.0)
+                    .then(|| MediaPosition(Duration::from_secs_f64(position)));
+                let playback = if playing {
+                    MediaPlayback::Playing { progress }
+                } else if has_track || duration > 0.0 || position > 0.0 {
+                    MediaPlayback::Paused { progress }
+                } else {
+                    MediaPlayback::Stopped
+                };
+                let same = match (&self.last, &playback) {
+                    (
+                        Some(MediaPlayback::Playing { progress: a }),
+                        MediaPlayback::Playing { progress: b },
+                    ) => a == b,
+                    (Some(a), b) => a == b,
+                    (None, _) => false,
+                };
+                if same {
+                    return;
+                }
+                self.last = Some(playback.clone());
+                self.controls.put_playback(playback)
+            }
+        };
+        if let Err(e) = result {
+            eprintln!("[media] cannot update the media controls: {e}");
+        }
+    }
+}
+
+/// Reads the queue until the channel closes. An idle period is not the end:
+/// this thread is the app's only link to the media keys and lives as long as
+/// the app does, so a timeout simply returns to waiting.
+fn pump<C: Controls>(rx: &Receiver<Message>, presenter: &mut Presenter<C>, idle: Duration) {
+    loop {
+        match rx.recv_timeout(idle) {
+            Ok(message) => presenter.apply(message),
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
     }
 }
 
@@ -108,7 +216,10 @@ fn run(hwnd: isize, rx: Receiver<Message>, app: AppHandle) {
         };
         if let Some(action) = action {
             eprintln!("[media] {action}");
-            let _ = emitter.emit("media-control", action);
+            // Straight into the same functions the commands call: the queue
+            // and the play state live in Rust, and a key must not depend on
+            // the page being awake.
+            crate::media_action(&emitter, &action);
         }
     });
     if let Err(e) = attached {
@@ -116,53 +227,8 @@ fn run(hwnd: isize, rx: Receiver<Message>, app: AppHandle) {
         return;
     }
 
-    let mut last: Option<MediaPlayback> = None;
-    while let Ok(message) = rx.recv_timeout(Duration::from_secs(5)) {
-        let result = match message {
-            Message::Metadata(meta) => {
-                let cover = if meta.cover.is_empty() {
-                    None
-                } else {
-                    Some(meta.cover.as_str())
-                };
-                controls.set_metadata(MediaMetadata {
-                    title: Some(meta.title.as_str()),
-                    artist: Some(meta.artist.as_str()),
-                    album: Some(meta.album.as_str()),
-                    cover_url: cover,
-                    duration: (meta.duration > 0.0)
-                        .then(|| Duration::from_secs_f64(meta.duration)),
-                })
-            }
-            Message::State {
-                playing,
-                position,
-                duration,
-            } => {
-                let progress = (position > 0.0).then(|| MediaPosition(Duration::from_secs_f64(position)));
-                let playback = if playing {
-                    MediaPlayback::Playing { progress }
-                } else if duration > 0.0 || position > 0.0 {
-                    MediaPlayback::Paused { progress }
-                } else {
-                    MediaPlayback::Stopped
-                };
-                let same = match (&last, &playback) {
-                    (Some(MediaPlayback::Playing { progress: a }), MediaPlayback::Playing { progress: b }) => a == b,
-                    (Some(a), b) => a == b,
-                    (None, _) => false,
-                };
-                if same {
-                    continue;
-                }
-                last = Some(playback.clone());
-                controls.set_playback(playback)
-            }
-        };
-        if let Err(e) = result {
-            eprintln!("[media] cannot update the media controls: {e}");
-        }
-    }
+    let mut presenter = Presenter::new(controls);
+    pump(&rx, &mut presenter, Duration::from_secs(5));
 }
 
 /// A `file://` URL the shell accepts: forward slashes, spaces escaped.
@@ -209,6 +275,7 @@ pub fn spawn_ticker(app: AppHandle) {
             let mut session: Option<MediaSession> = None;
             let mut announced = false;
             let mut last_key = String::new();
+            let mut last_title = String::new();
             let mut last_state = (false, 0i64);
             loop {
                 let state = app.state::<AppState>();
@@ -221,32 +288,44 @@ pub fn spawn_ticker(app: AppHandle) {
 
                 let snapshot = state.engine.lock().snapshot();
                 let item = state.queue.lock().current_item();
+                // Nothing loaded yet (a fresh start): show what would continue,
+                // so the overlay is not empty and the session is not "Stopped".
+                let at_rest = state.settings.lock().resume.clone();
 
-                let (title, artist, album) = match (&item, &snapshot) {
-                    (Some(item), _) => (item.title.clone(), item.artist.clone(), String::new()),
-                    (None, Some(snap)) => match &snap.track {
-                        Some(track) => (track.title.clone(), track.artist.clone(), String::new()),
-                        None => (String::new(), String::new(), String::new()),
-                    },
-                    _ => (String::new(), String::new(), String::new()),
-                };
+                let mut title = String::new();
+                let mut artist = String::new();
+                let mut cover = String::new();
+                let mut position = snapshot.as_ref().map(|s| s.elapsed).unwrap_or(0.0);
+                let mut duration = snapshot.as_ref().map(|s| s.total).unwrap_or(0.0);
                 let playing = snapshot
                     .as_ref()
                     .map(|s| s.status == "playing")
                     .unwrap_or(false);
-                let position = snapshot.as_ref().map(|s| s.elapsed).unwrap_or(0.0);
-                let duration = snapshot.as_ref().map(|s| s.total).unwrap_or(0.0);
 
-                let cover = match (&item, &snapshot) {
-                    (Some(item), _) if !item.thumbnail.is_empty() => item.thumbnail.clone(),
-                    (_, Some(snap)) => snap
-                        .track
-                        .as_ref()
-                        .and_then(|t| t.cover.as_deref())
-                        .map(|p| file_url(std::path::Path::new(p)))
-                        .unwrap_or_default(),
-                    _ => String::new(),
-                };
+                if let Some(item) = &item {
+                    title = item.title.clone();
+                    artist = item.artist.clone();
+                    cover = item.thumbnail.clone();
+                } else if let Some(snap) = &snapshot {
+                    if let Some(track) = &snap.track {
+                        title = track.title.clone();
+                        artist = track.artist.clone();
+                        cover = track
+                            .cover
+                            .as_deref()
+                            .map(|p| file_url(std::path::Path::new(p)))
+                            .unwrap_or_default();
+                    }
+                }
+                if title.is_empty() {
+                    if let Some(resume) = &at_rest {
+                        title = resume.title.clone();
+                        artist = resume.artist.clone();
+                        cover = resume.thumbnail.clone();
+                        position = resume.position_secs;
+                        duration = 0.0;
+                    }
+                }
 
                 // The session exists from the first tick, not from the first
                 // track: a media key pressed before anything plays must still
@@ -261,14 +340,20 @@ pub fn spawn_ticker(app: AppHandle) {
                         );
                     }
                 }
-                let key = format!("{title}\u{1}{artist}\u{1}{cover}");
+                // The duration belongs in the key: the timeline end is part of
+                // the metadata, and a track that starts before its length is
+                // known would otherwise never publish it.
+                let key = format!(
+                    "{title}\u{1}{artist}\u{1}{cover}\u{1}{}",
+                    duration.round() as i64
+                );
                 if let Some(session) = session.as_ref() {
                     if key != last_key {
                         last_key = key;
                         session.set_metadata(NowPlaying {
                             title: title.clone(),
                             artist: artist.clone(),
-                            album,
+                            album: String::new(),
                             duration,
                             cover,
                         });
@@ -277,14 +362,21 @@ pub fn spawn_ticker(app: AppHandle) {
                     let now_state = (playing, (position * 10.0) as i64);
                     if now_state != last_state {
                         last_state = now_state;
-                        session.set_state(playing, position, duration);
+                        session.set_state(playing, position, duration, !title.is_empty());
                     }
                 }
-                window_title(
-                    &app,
-                    (!title.is_empty()).then_some(title.as_str()),
-                    (!artist.is_empty()).then_some(artist.as_str()),
-                );
+                // A window title is a Win32 call per tick for nothing: only a
+                // real change is worth it. The separator keeps "a" + "bc" from
+                // looking like "ab" + "c".
+                let wanted = format!("{artist}\u{1}{title}");
+                if wanted != last_title {
+                    last_title = wanted;
+                    window_title(
+                        &app,
+                        (!title.is_empty()).then_some(title.as_str()),
+                        (!artist.is_empty()).then_some(artist.as_str()),
+                    );
+                }
             }
         });
 }
@@ -292,6 +384,98 @@ pub fn spawn_ticker(app: AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Records what the presenter pushed, so a test can see which messages
+    /// survived an idle period.
+    #[derive(Default)]
+    struct Recorder {
+        titles: Vec<String>,
+        playback: Vec<String>,
+    }
+
+    impl Controls for Recorder {
+        fn put_metadata(&mut self, meta: MediaMetadata<'_>) -> Result<(), souvlaki::Error> {
+            self.titles.push(meta.title.unwrap_or_default().to_string());
+            Ok(())
+        }
+
+        fn put_playback(&mut self, playback: MediaPlayback) -> Result<(), souvlaki::Error> {
+            self.playback.push(match playback {
+                MediaPlayback::Playing { .. } => "playing".to_string(),
+                MediaPlayback::Paused { .. } => "paused".to_string(),
+                MediaPlayback::Stopped => "stopped".to_string(),
+            });
+            Ok(())
+        }
+    }
+
+    fn track(title: &str) -> Message {
+        Message::Metadata(Box::new(NowPlaying {
+            title: title.to_string(),
+            artist: "tone".to_string(),
+            album: String::new(),
+            duration: 2.0,
+            cover: String::new(),
+        }))
+    }
+
+    #[test]
+    fn an_idle_period_does_not_end_the_stream() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let mut presenter = Presenter::new(Recorder::default());
+            pump(&rx, &mut presenter, Duration::from_millis(20));
+            presenter.controls
+        });
+
+        // Several idle periods go by with nothing to publish.
+        std::thread::sleep(Duration::from_millis(90));
+        tx.send(track("first")).unwrap();
+        std::thread::sleep(Duration::from_millis(60));
+        tx.send(Message::State {
+            playing: true,
+            position: 1.0,
+            duration: 2.0,
+            has_track: true,
+        })
+        .unwrap();
+        drop(tx);
+
+        let recorder = worker.join().unwrap();
+        assert_eq!(
+            recorder.titles,
+            vec!["first".to_string()],
+            "the message after the idle periods was dropped"
+        );
+        assert_eq!(recorder.playback, vec!["playing".to_string()]);
+    }
+
+    #[test]
+    fn the_same_playback_state_is_not_pushed_twice() {
+        let mut presenter = Presenter::new(Recorder::default());
+        presenter.apply(Message::State {
+            playing: true,
+            position: 1.0,
+            duration: 2.0,
+            has_track: true,
+        });
+        presenter.apply(Message::State {
+            playing: true,
+            position: 1.0,
+            duration: 2.0,
+            has_track: true,
+        });
+        presenter.apply(Message::State {
+            playing: false,
+            position: 1.0,
+            duration: 2.0,
+            has_track: true,
+        });
+        assert_eq!(
+            presenter.controls.playback,
+            vec!["playing".to_string(), "paused".to_string()]
+        );
+    }
 
     #[test]
     fn a_windows_path_becomes_a_file_url() {
