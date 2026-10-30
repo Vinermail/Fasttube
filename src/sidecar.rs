@@ -159,34 +159,62 @@ fn has_sidecar(root: &std::path::Path) -> bool {
         .exists()
 }
 
+/// The interpreter for the sidecar, in the order that keeps a shipped copy
+/// self-contained: an explicit override, the runtime that travels with the app,
+/// the development venv, then whatever `python` the PATH happens to know.
 fn python_executable() -> PathBuf {
-    // Prefer the project venv directly: we own the process and can kill it
-    // (spawning via `uv run` makes python a grandchild that survives kills).
+    let root = project_root();
+    if let Some(explicit) = std::env::var_os("FASTTUBE_PYTHON") {
+        return PathBuf::from(explicit);
+    }
+    if let Some(bundled) = bundled_python(&root) {
+        return bundled;
+    }
+    if let Some(venv) = venv_python(&root) {
+        return venv;
+    }
+    PathBuf::from("python")
+}
+
+/// `python/python.exe` (Windows) or `python/bin/python`: the runtime that the
+/// portable zip and the installer put next to the exe.
+fn bundled_python(root: &std::path::Path) -> Option<PathBuf> {
     #[cfg(target_os = "windows")]
-    let venv_python = project_root()
+    let candidate = root.join("python").join("python.exe");
+    #[cfg(not(target_os = "windows"))]
+    let candidate = root.join("python").join("bin").join("python");
+    candidate.exists().then_some(candidate)
+}
+
+/// The venv of a build tree. Never present in a shipped copy: that is the whole
+/// point of `bundled_python`.
+fn venv_python(root: &std::path::Path) -> Option<PathBuf> {
+    #[cfg(target_os = "windows")]
+    let candidate = root
         .join("api")
         .join(".venv")
         .join("Scripts")
         .join("python.exe");
     #[cfg(not(target_os = "windows"))]
-    let venv_python = project_root()
-        .join("api")
-        .join(".venv")
-        .join("bin")
-        .join("python");
-    if venv_python.exists() {
-        venv_python
-    } else {
-        PathBuf::from("python")
-    }
+    let candidate = root.join("api").join(".venv").join("bin").join("python");
+    candidate.exists().then_some(candidate)
 }
 
 /// Spawns the sidecar and waits for its `PORT=<n>` handshake on stdout.
 /// `port` is only set when restarting: re-using the first port keeps the app's
 /// single gRPC channel valid across restarts.
 fn spawn_child(token: &str, port: Option<u16>) -> Result<(Child, u16), String> {
+    let root = project_root();
     let mut cmd = Command::new(python_executable());
     cmd.args(["-m", "ytapi.server"])
+        // The package is source, not an installation: `api/src` on the import
+        // path is what `-m ytapi.server` needs in both layouts.
+        .env("PYTHONPATH", root.join("api").join("src"))
+        // A portable runtime must not inherit a home, a user site-packages or a
+        // start-up hook from whatever machine it was copied to.
+        .env_remove("PYTHONHOME")
+        .env_remove("PYTHONSTARTUP")
+        .env("PYTHONNOUSERSITE", "1")
         .env("FASTTUBE_API_TOKEN", token)
         // Ask the sidecar to exit when this process dies (stdin is its
         // liveness pipe). Off by default so manual runs work normally.
@@ -203,7 +231,7 @@ fn spawn_child(token: &str, port: Option<u16>) -> Result<(Child, u16), String> {
         // the handshake parses and the log stays readable.
         .env("PYTHONIOENCODING", "utf-8")
         .env("PYTHONUNBUFFERED", "1")
-        .current_dir(project_root())
+        .current_dir(root)
         // stdin is a liveness pipe: the sidecar exits when we do (see
         // _watch_parent_pipe in server.py), so a crash cannot orphan it.
         .stdin(Stdio::piped())
@@ -435,6 +463,35 @@ fn set_status(shared: &SharedApiStatus, state: &str, version: &str, auth_ok: boo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_bundled_runtime_wins_over_the_development_venv() {
+        let dir = std::env::temp_dir().join(format!("ft-python-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("python")).unwrap();
+        std::fs::create_dir_all(dir.join("api").join(".venv").join("Scripts")).unwrap();
+        std::fs::write(dir.join("python").join("python.exe"), b"x").unwrap();
+        std::fs::write(
+            dir.join("api").join(".venv").join("Scripts").join("python.exe"),
+            b"x",
+        )
+        .unwrap();
+
+        // Both exist: the one that ships with the app is the one to use.
+        assert_eq!(
+            bundled_python(&dir),
+            Some(dir.join("python").join("python.exe"))
+        );
+
+        // Without it the development venv is still found.
+        std::fs::remove_file(dir.join("python").join("python.exe")).unwrap();
+        assert_eq!(bundled_python(&dir), None);
+        assert_eq!(
+            venv_python(&dir),
+            Some(dir.join("api").join(".venv").join("Scripts").join("python.exe"))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn the_sidecar_is_looked_up_in_the_order_given() {

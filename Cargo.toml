@@ -46,7 +46,7 @@ panic = "abort"
 
 [build-dependencies]
 protoc-bin-vendored = "3.2.0"
-tauri-build = "2"
+tauri-build = { version = "2", features = [] }
 tonic-prost-build = "0.14"
 
 [target.'cfg(windows)'.dependencies]

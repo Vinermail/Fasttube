@@ -52,6 +52,16 @@
         "description": "Аудиофайл",
         "role": "Viewer"
       }
-    ]
+    ],
+    "resources": {
+      "dist/portable/api": "api",
+      "dist/portable/python": "python"
+    },
+    "windows": {
+      "webviewInstallMode": {
+        "type": "embedBootstrapper",
+        "silent": true
+      }
+    }
   }
 }

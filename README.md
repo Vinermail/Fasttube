@@ -76,6 +76,29 @@ cargo run
 cargo run -- "C:\путь\к\музыке"
 ```
 
+## Портативная сборка (не нужен Python на машине)
+
+```bash
+cargo build --release
+python scripts/portable.py
+```
+
+Скрипт скачивает `python-build-standalone` (CPython 3.12, Windows x64), ставит
+зависимости сайдкара из `api/uv.lock` через `uv pip install --target` и собирает
+`dist/portable/`: `fasttube.exe`, `api/` (только исходники `ytapi`), `python/`
+(интерпретатор вместе с пакетами). Плюс архив
+`dist/Fasttube-<версия>-windows-x64-portable.zip`.
+
+Тесты, `uv.lock`, `.venv` и кэши в сборку не попадают. Приложение ищет
+интерпретатор так: `FASTTUBE_PYTHON` → `python/python.exe` рядом с exe →
+`api/.venv` (дерево разработчика) → `python` из `PATH`; сайдкар запускается как
+`python -m ytapi.server` с `PYTHONPATH=api/src`, `PYTHONNOUSERSITE=1` и без
+`PYTHONHOME`, чтобы чужая машина не могла подсунуть свой Python.
+
+Установщик NSIS (`cargo tauri build`) кладёт те же две папки рядом с exe через
+`bundle.resources`, поэтому перед ним достаточно один раз выполнить
+`python scripts/portable.py --no-zip`.
+
 Генерация gRPC-стабов после изменения `proto/player_api.proto`:
 
 ```bash
