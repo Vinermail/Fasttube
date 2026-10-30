@@ -215,6 +215,9 @@ fn spawn_child(token: &str, port: Option<u16>) -> Result<(Child, u16), String> {
         .env_remove("PYTHONHOME")
         .env_remove("PYTHONSTARTUP")
         .env("PYTHONNOUSERSITE", "1")
+        // Never write into the installation: a Program Files copy is read only,
+        // and a portable folder should stay byte-identical to what shipped.
+        .env("PYTHONDONTWRITEBYTECODE", "1")
         .env("FASTTUBE_API_TOKEN", token)
         // Ask the sidecar to exit when this process dies (stdin is its
         // liveness pipe). Off by default so manual runs work normally.
