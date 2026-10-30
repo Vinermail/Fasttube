@@ -61,6 +61,9 @@ def rm(path: Path) -> None:
 
 
 def download_runtime() -> None:
+    # A fresh clone has no dist/ at all: caching a download there must not need
+    # a previous build (curl fails with "No such file or directory" otherwise).
+    DIST.mkdir(parents=True, exist_ok=True)
     if PYDIR.joinpath("python.exe").exists():
         print("[python] already unpacked")
         return
