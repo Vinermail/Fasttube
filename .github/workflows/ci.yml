@@ -26,8 +26,13 @@ jobs:
       # protoc comes from the protoc-bin-vendored build dependency, so the
       # runner needs no protobuf toolchain. Tests that need a sound card skip
       # themselves on a runner: there is no audio endpoint there.
+      # The runner has no real sound card: its virtual endpoint takes the test
+      # process down inside cpal instead of failing an assertion. The audio
+      # tests are skipped here and still run on a machine with a device.
       - name: cargo test
         run: cargo test --locked
+        env:
+          FASTTUBE_SKIP_AUDIO_TESTS: "1"
       - name: ui syntax
         run: node --check ui/main.js
 
