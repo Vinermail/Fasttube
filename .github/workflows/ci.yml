@@ -1,0 +1,50 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: rust (windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: .
+      # protoc comes from the protoc-bin-vendored build dependency, so the
+      # runner needs no protobuf toolchain. Tests that need a sound card skip
+      # themselves on a runner: there is no audio endpoint there.
+      - name: cargo test
+        run: cargo test --locked
+      - name: ui syntax
+        run: node --check ui/main.js
+
+  python:
+    name: python
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: api
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - name: sync
+        run: uv sync --frozen
+      - name: pytest
+        run: uv run pytest -q
+      - name: ruff
+        run: uv run ruff check

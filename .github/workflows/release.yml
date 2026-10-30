@@ -1,0 +1,88 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    name: windows x64
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: .
+      # The portable runtime script is plain Python; uv installs the sidecar
+      # dependencies into the bundled interpreter, not into the runner.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v6
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: tauri-cli
+
+      - name: version
+        id: v
+        shell: pwsh
+        run: |
+          $line = Select-String -Path Cargo.toml -Pattern '^version = "(.+)"' | Select-Object -First 1
+          $version = $line.Matches.Groups[1].Value
+          if (-not $version) { throw "version not found in Cargo.toml" }
+          "version=$version" >> $env:GITHUB_OUTPUT
+          Write-Output "building $version"
+
+      # The installer copies api/ and python/ from dist/portable, so the folder
+      # has to exist before the bundler runs, and the script needs the release
+      # binary to put into it.
+      - name: cargo build
+        run: cargo build --release --locked
+
+      - name: portable runtime and zip
+        run: python scripts/portable.py
+
+      - name: installer
+        run: cargo tauri build
+
+      - name: checksums
+        shell: pwsh
+        run: |
+          $version = "${{ steps.v.outputs.version }}"
+          $files = @(
+            "dist/Fasttube-$version-windows-x64-portable.zip",
+            "target/release/bundle/nsis/Fasttube_${version}_x64-setup.exe"
+          )
+          Remove-Item SHA256SUMS.txt -ErrorAction SilentlyContinue
+          foreach ($file in $files) {
+            if (-not (Test-Path $file)) { throw "missing artifact: $file" }
+            $hash = (Get-FileHash -Algorithm SHA256 -Path $file).Hash.ToLower()
+            $name = Split-Path $file -Leaf
+            "$hash  $name" | Out-File -Append -Encoding ascii -NoNewline:$false SHA256SUMS.txt
+          }
+          Get-Content SHA256SUMS.txt
+
+      - name: upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: fasttube-windows-x64
+          if-no-files-found: error
+          path: |
+            dist/*.zip
+            target/release/bundle/nsis/*.exe
+            SHA256SUMS.txt
+
+      - name: attach to the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          fail_on_unmatched_files: true
+          files: |
+            dist/*.zip
+            target/release/bundle/nsis/*.exe
+            SHA256SUMS.txt
