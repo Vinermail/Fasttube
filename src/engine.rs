@@ -781,6 +781,7 @@ mod tests {
 
     #[test]
     fn engine_plays_track() {
+        let _serial = audio_lock();
         if audio_device().is_none() {
             return;
         }
@@ -816,6 +817,7 @@ mod tests {
 
     #[test]
     fn engine_next_pause_seek_mid_play() {
+        let _serial = audio_lock();
         if audio_device().is_none() {
             return;
         }
@@ -913,8 +915,17 @@ mod tests {
         }
     }
 
-    /// A CI runner has no sound card. Tests that need an output device return
-    /// quietly instead of failing for a reason that says nothing about the code.
+    /// One audio device at a time. cpal/WASAPI tears itself down badly when
+    /// several tests open and drop devices in parallel — on a CI runner with a
+    /// virtual endpoint that showed up as STATUS_ACCESS_VIOLATION, not as a
+    /// failed assertion.
+    fn audio_lock() -> parking_lot::MutexGuard<'static, ()> {
+        static AUDIO: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+        AUDIO.lock()
+    }
+
+    /// A machine with no output device (a bare runner) skips these tests instead
+    /// of failing for a reason that says nothing about the code.
     fn audio_device() -> Option<Engine> {
         match Engine::create() {
             Ok(engine) => Some(engine),
@@ -937,6 +948,7 @@ mod tests {
 
     #[test]
     fn a_pause_fades_out_before_the_sink_stops() {
+        let _serial = audio_lock();
         let Some(mut engine) = fading_engine("fade_pause") else {
             return;
         };
@@ -962,6 +974,7 @@ mod tests {
 
     #[test]
     fn a_resume_climbs_from_silence() {
+        let _serial = audio_lock();
         let Some(mut engine) = fading_engine("fade_resume") else {
             return;
         };
@@ -980,6 +993,7 @@ mod tests {
 
     #[test]
     fn a_seek_dips_through_silence_and_comes_back() {
+        let _serial = audio_lock();
         let Some(mut engine) = fading_engine("fade_seek") else {
             return;
         };
@@ -996,6 +1010,7 @@ mod tests {
 
     #[test]
     fn a_finished_pause_does_not_silence_the_next_track() {
+        let _serial = audio_lock();
         let Some(mut engine) = fading_engine("fade_leak_pause") else {
             return;
         };
@@ -1013,6 +1028,7 @@ mod tests {
 
     #[test]
     fn a_stop_then_play_has_sound() {
+        let _serial = audio_lock();
         let Some(mut engine) = fading_engine("fade_leak_stop") else {
             return;
         };
@@ -1029,6 +1045,7 @@ mod tests {
 
     #[test]
     fn a_next_in_the_middle_of_a_pause_is_not_paused() {
+        let _serial = audio_lock();
         let Some(mut engine) = fading_engine("fade_leak_next") else {
             return;
         };
@@ -1050,6 +1067,7 @@ mod tests {
 
     #[test]
     fn a_seek_in_flight_does_not_move_the_next_track() {
+        let _serial = audio_lock();
         let Some(mut engine) = fading_engine("fade_leak_seek") else {
             return;
         };
