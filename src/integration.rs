@@ -4,7 +4,9 @@
 use crate::AppState;
 use tauri::menu::MenuBuilder;
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Manager};
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::time::{Duration, Instant};
+use tauri::{AppHandle, Emitter, Manager};
 
 /// The tray icon and its menu. Left click shows or hides the window, the menu
 /// carries the same commands as the player bar plus the way out.
@@ -133,6 +135,118 @@ pub fn apply_hotkeys(app: &AppHandle, enabled: bool) {
     }
 }
 
+/// How long a burst of launches is collected before the paths are handed over.
+/// Explorer starts one process per selected file, so ten files mean ten
+/// processes a few dozen milliseconds apart.
+pub const LAUNCH_WINDOW: Duration = Duration::from_millis(400);
+
+/// Collects the paths of a burst of launches. No Tauri and no clock of its own:
+/// the caller passes `now`, so the whole rule is testable.
+#[derive(Debug, Default)]
+pub struct LaunchBuffer {
+    pending: Vec<String>,
+    deadline: Option<Instant>,
+}
+
+impl LaunchBuffer {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Adds the paths of one launch in arrival order, dropping anything already
+    /// waiting. The deadline only moves when something new arrived: a burst of
+    /// duplicates must not keep the list open forever.
+    pub fn push(&mut self, now: Instant, window: Duration, paths: Vec<String>) -> usize {
+        let mut added = 0;
+        for path in paths {
+            if path.is_empty() || self.pending.contains(&path) {
+                continue;
+            }
+            self.pending.push(path);
+            added += 1;
+        }
+        if added > 0 {
+            self.deadline = Some(now + window);
+        }
+        added
+    }
+
+    /// The paths to hand over, if the window has closed. Clears the buffer.
+    pub fn take_due(&mut self, now: Instant) -> Option<Vec<String>> {
+        let deadline = self.deadline?;
+        if now < deadline || self.pending.is_empty() {
+            return None;
+        }
+        self.deadline = None;
+        Some(std::mem::take(&mut self.pending))
+    }
+
+    /// How long the caller may wait before checking again; `None` means "nothing
+    /// is waiting, block until the next launch".
+    pub fn wait_time(&self, now: Instant) -> Option<Duration> {
+        let deadline = self.deadline?;
+        Some(deadline.saturating_duration_since(now))
+    }
+
+    #[cfg(test)]
+    fn pending(&self) -> &[String] {
+        &self.pending
+    }
+}
+
+/// Appends without repeating: the slot may still hold paths the frontend has
+/// not taken yet, and a second launch naming the same file must not queue it
+/// twice.
+pub fn append_unique(slot: &mut Vec<String>, paths: Vec<String>) -> usize {
+    let mut added = 0;
+    for path in paths {
+        if path.is_empty() || slot.iter().any(|p| p == &path) {
+            continue;
+        }
+        slot.push(path);
+        added += 1;
+    }
+    added
+}
+
+/// Hands a finished burst to the frontend: the paths are appended to the slot
+/// the page drains, then the page is told there is something to take.
+fn deliver(app: &AppHandle, paths: Vec<String>) {
+    let state = app.state::<crate::AppState>();
+    let added = append_unique(&mut state.open_files.lock(), paths);
+    if added > 0 {
+        let _ = app.emit("open-files", ());
+    }
+}
+
+/// The thread that owns the buffer. It waits for launches and for the end of
+/// the current window, whichever comes first.
+pub fn spawn_launch_collector(app: AppHandle, rx: Receiver<Vec<String>>) {
+    let _ = std::thread::Builder::new()
+        .name("launch-collector".to_string())
+        .spawn(move || {
+            let mut buffer = LaunchBuffer::new();
+            loop {
+                // A long wait stands for "until the next launch": the channel
+                // wakes the thread before that anyway.
+                let wait = buffer
+                    .wait_time(Instant::now())
+                    .unwrap_or(Duration::from_secs(3600));
+                match rx.recv_timeout(wait) {
+                    Ok(paths) => {
+                        buffer.push(Instant::now(), LAUNCH_WINDOW, paths);
+                    }
+                    Err(RecvTimeoutError::Timeout) => {
+                        if let Some(paths) = buffer.take_due(Instant::now()) {
+                            deliver(&app, paths);
+                        }
+                    }
+                    Err(RecvTimeoutError::Disconnected) => break,
+                }
+            }
+        });
+}
+
 /// Files and folders passed on the command line (double click, "Open with",
 /// a second launch). Every existing media file, in order: selecting ten songs
 /// in Explorer and pressing Enter must queue ten songs, not play one.
@@ -162,6 +276,50 @@ fn is_media(path: &std::path::Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_burst_of_launches_becomes_one_list_in_arrival_order() {
+        let window = Duration::from_millis(400);
+        let t0 = Instant::now();
+        let mut buffer = LaunchBuffer::new();
+
+        assert_eq!(buffer.push(t0, window, vec!["a.mp3".into()]), 1);
+        assert_eq!(
+            buffer.push(t0 + Duration::from_millis(100), window, vec!["b.mp3".into()]),
+            1
+        );
+        // The same file again from a third launch: queued once, no new window.
+        assert_eq!(
+            buffer.push(t0 + Duration::from_millis(200), window, vec!["a.mp3".into()]),
+            0
+        );
+        assert_eq!(buffer.pending(), ["a.mp3", "b.mp3"]);
+
+        // The window was extended by the second launch, not by the third.
+        assert_eq!(buffer.take_due(t0 + Duration::from_millis(499)), None);
+        assert_eq!(
+            buffer.take_due(t0 + Duration::from_millis(500)),
+            Some(vec!["a.mp3".to_string(), "b.mp3".to_string()])
+        );
+        assert_eq!(buffer.take_due(t0 + Duration::from_secs(2)), None);
+        assert!(buffer.pending().is_empty());
+    }
+
+    #[test]
+    fn a_quiet_buffer_blocks_until_a_launch_comes() {
+        let buffer = LaunchBuffer::new();
+        assert_eq!(buffer.wait_time(Instant::now()), None);
+    }
+
+    #[test]
+    fn the_slot_never_repeats_a_path() {
+        let mut slot = vec!["a.mp3".to_string()];
+        assert_eq!(
+            append_unique(&mut slot, vec!["a.mp3".into(), "b.mp3".into()]),
+            1
+        );
+        assert_eq!(slot, ["a.mp3", "b.mp3"]);
+    }
 
     #[test]
     fn the_media_file_is_picked_out_of_the_arguments() {

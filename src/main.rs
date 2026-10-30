@@ -767,6 +767,10 @@ struct AppState {
     /// Files handed over by the shell (double click, «Открыть с помощью»,
     /// a second launch). The frontend takes them once it is ready.
     open_files: Mutex<Vec<String>>,
+    /// Launches report their paths here; one thread collects a burst of them
+    /// (Explorer starts a process per selected file) and hands the whole list
+    /// over at once.
+    launch_tx: std::sync::mpsc::Sender<Vec<String>>,
     engine: Mutex<EngineHandle>,
     library: Mutex<Vec<Playlist>>,
     local_current: Mutex<Option<Vec<engine::TrackInfo>>>,
@@ -4452,8 +4456,12 @@ fn main() {
         .map(std::path::PathBuf::from)
         .find(|p| p.is_dir());
 
+    // The collector owns the receiving end; every launch only sends paths.
+    let (launch_tx, launch_rx) = std::sync::mpsc::channel::<Vec<String>>();
+
     let app_state = AppState {
         open_files: Mutex::new(Vec::new()),
+        launch_tx,
         engine: Mutex::new(EngineHandle::new()),
         library: Mutex::new(Vec::new()),
         local_current: Mutex::new(None),
@@ -4509,11 +4517,11 @@ fn main() {
         // First, as the plugin requires: a second launch never gets further.
         .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
             integration::show_window(app);
-            // Every path of the second launch joins the queue of the first.
+            // Every path of the second launch joins the burst the collector is
+            // assembling: a run of launches becomes one list, in arrival order.
             let files = integration::media_arguments(&argv);
             if !files.is_empty() {
-                *app.state::<AppState>().open_files.lock() = files;
-                let _ = app.emit("open-files", ());
+                let _ = app.state::<AppState>().launch_tx.send(files);
             }
         }))
         .plugin(tauri_plugin_dialog::init())
@@ -4602,10 +4610,15 @@ fn main() {
                 integration::apply_hotkeys(&handle, settings.global_hotkeys);
             }
             media::spawn_ticker(handle.clone());
+            integration::spawn_launch_collector(handle.clone(), launch_rx);
             if !open_media.is_empty() {
                 // The frontend may not be listening yet: it asks for the files
-                // once it is up.
-                *app.state::<AppState>().open_files.lock() = open_media.clone();
+                // once it is up. A launch that names several files carries all
+                // of them in one argv, so this burst needs no collecting.
+                integration::append_unique(
+                    &mut app.state::<AppState>().open_files.lock(),
+                    open_media.clone(),
+                );
             }
             if start_minimized && app.state::<AppState>().settings.lock().close_to_tray {
                 // `--minimized` only has somewhere to hide to when the tray
