@@ -121,12 +121,13 @@ def runtime_requirements() -> list[str]:
 
 def install_deps() -> None:
     site_packages = PYDIR / "Lib" / "site-packages"
+    # Always exported: the file is also the record of what a build shipped with.
+    runtime_requirements()
     stamp = site_packages / "yt_dlp"
     if stamp.exists():
         print("[deps] already installed")
-        return
-    runtime_requirements()
-    print("[deps] installing into the bundled runtime")
+    else:
+        print("[deps] installing into the bundled runtime")
     run(
         [
             "uv",
@@ -141,13 +142,22 @@ def install_deps() -> None:
         ],
         cwd=ROOT,
     )
-    # uv seeds pip into a fresh target; a shipped runtime does not install
-    # anything, so it goes away with the rest of the build-only packages.
+    trim(site_packages)
+
+
+def trim(site_packages: Path) -> None:
+    """Removes what only the build needs: uv seeds pip into a fresh target, and
+    a shipped runtime installs nothing. Always runs, also on a cached install."""
+    dropped = []
     for pattern in ("pip", "pip-*", "setuptools", "setuptools-*", "pkg_resources"):
         for path in site_packages.glob(pattern):
             rm(path)
+            dropped.append(path.name)
     for path in (PYDIR / "Scripts").glob("pip*.exe"):
         rm(path)
+        dropped.append(path.name)
+    if dropped:
+        print(f"[deps] removed from the runtime: {', '.join(sorted(set(dropped)))}")
 
 
 def copy_api(target: Path) -> None:
@@ -185,6 +195,9 @@ def smoke(folder: Path) -> None:
         "PYTHONPATH": str(folder / "api" / "src"),
         "PYTHONNOUSERSITE": "1",
         "PYTHONIOENCODING": "utf-8",
+        # A smoke run must not leave bytecode in the tree that is about to be
+        # packed: the api sources ship without __pycache__.
+        "PYTHONDONTWRITEBYTECODE": "1",
         "SYSTEMROOT": os.environ.get("SYSTEMROOT", r"C:\Windows"),
         "LOCALAPPDATA": os.environ.get("LOCALAPPDATA", ""),
         "TEMP": os.environ.get("TEMP", ""),
@@ -200,6 +213,16 @@ def smoke(folder: Path) -> None:
         env=env,
         cwd=folder,
     )
+
+
+def drop_bytecode(folder: Path) -> None:
+    """The api tree is source: no __pycache__ from the smoke run or a stray run."""
+    removed = 0
+    for cache in (folder / "api").rglob("__pycache__"):
+        shutil.rmtree(cache, ignore_errors=True)
+        removed += 1
+    if removed:
+        print(f"[layout] dropped {removed} __pycache__ from api")
 
 
 def zip_folder(folder: Path, version: str) -> Path:
@@ -223,6 +246,7 @@ def main() -> int:
     install_deps()
     folder = assemble()
     smoke(folder)
+    drop_bytecode(folder)
     if args.no_zip:
         print(f"[done] {folder}")
         return 0
