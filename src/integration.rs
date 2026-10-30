@@ -90,20 +90,134 @@ pub fn notify_track_change(app: &AppHandle, title: &str, artist: &str) {
 /// Autostart follows the setting; a failure is a log line, not a crash.
 pub fn apply_autostart(app: &AppHandle, enabled: bool) {
     use tauri_plugin_autostart::ManagerExt;
-    // Starting with Windows is a registry entry, and writing it on every launch
-    // is both pointless and a way to fight with the user's own choice.
-    if autostart_enabled(app) == enabled {
+    let manager = app.autolaunch();
+    let installed = autostart_enabled(app);
+
+    if installed != enabled {
+        let result = if enabled {
+            manager.enable()
+        } else {
+            manager.disable()
+        };
+        if let Err(e) = result {
+            eprintln!("[integration] cannot change autostart: {e}");
+        }
         return;
     }
-    let manager = app.autolaunch();
-    let result = if enabled {
-        manager.enable()
-    } else {
-        manager.disable()
-    };
-    if let Err(e) = result {
-        eprintln!("[integration] cannot change autostart: {e}");
+    if !enabled {
+        return;
     }
+
+    // The entry is already there and wants to be: the only thing that can be
+    // stale is its command line. Builds before the tray registered the exe
+    // without `--minimized`, so the app would open a window at login. Rewrite
+    // the entry once — the user's choice stays as it is, only the argument of
+    // the same registration is brought up to date.
+    match autostart_command(app) {
+        Some(command) if lacks_minimized(&command) => {
+            if let Err(e) = manager.disable() {
+                eprintln!("[integration] cannot rewrite autostart: {e}");
+                return;
+            }
+            if let Err(e) = manager.enable() {
+                eprintln!("[integration] cannot rewrite autostart: {e}");
+                return;
+            }
+            eprintln!("[integration] autostart entry rewritten with --minimized");
+        }
+        Some(_) => {}
+        None => eprintln!("[integration] the autostart entry could not be read"),
+    }
+}
+
+/// Whether a registry command line starts the app without `--minimized`.
+/// Compared by tokens, not by `contains`: a path may carry the word itself.
+pub fn lacks_minimized(command: &str) -> bool {
+    !command
+        .split_whitespace()
+        .any(|token| token.eq_ignore_ascii_case("--minimized"))
+}
+
+/// The command line of the Run entry the autostart plugin writes, if there is
+/// one. The plugin names the value after the package name and writes
+/// `"<exe>" <args>` into HKCU\...\Run.
+#[cfg(windows)]
+fn autostart_command(app: &AppHandle) -> Option<String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::ERROR_SUCCESS;
+    use windows_sys::Win32::System::Registry::{
+        HKEY, HKEY_CURRENT_USER, KEY_QUERY_VALUE, REG_NONE, RegCloseKey, RegOpenKeyExW,
+        RegQueryValueExW,
+    };
+
+    const RUN_KEY: &str = "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run";
+
+    fn wide(text: &str) -> Vec<u16> {
+        std::ffi::OsStr::new(text)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    }
+
+    let name = app.package_info().name.clone();
+    let subkey = wide(RUN_KEY);
+
+    unsafe {
+        let mut key: HKEY = std::ptr::null_mut();
+        if RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            subkey.as_ptr(),
+            0,
+            KEY_QUERY_VALUE,
+            &mut key,
+        ) != ERROR_SUCCESS
+        {
+            return None;
+        }
+
+        let value_name = wide(&name);
+        let mut kind = REG_NONE;
+        let mut size: u32 = 0;
+        let mut command = None;
+
+        if RegQueryValueExW(
+            key,
+            value_name.as_ptr(),
+            std::ptr::null_mut(),
+            &mut kind,
+            std::ptr::null_mut(),
+            &mut size,
+        ) == ERROR_SUCCESS
+            && size > 1
+        {
+            // The size is in bytes and includes the terminating null.
+            let mut buffer = vec![0u8; size as usize];
+            if RegQueryValueExW(
+                key,
+                value_name.as_ptr(),
+                std::ptr::null_mut(),
+                &mut kind,
+                buffer.as_mut_ptr(),
+                &mut size,
+            ) == ERROR_SUCCESS
+            {
+                let units: Vec<u16> = buffer
+                    .chunks_exact(2)
+                    .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                    .take_while(|unit| *unit != 0)
+                    .collect();
+                command = Some(String::from_utf16_lossy(&units));
+            }
+        }
+
+        RegCloseKey(key);
+        command
+    }
+}
+
+#[cfg(not(windows))]
+fn autostart_command(_app: &AppHandle) -> Option<String> {
+    None
 }
 
 pub fn autostart_enabled(app: &AppHandle) -> bool {
@@ -319,6 +433,18 @@ mod tests {
             1
         );
         assert_eq!(slot, ["a.mp3", "b.mp3"]);
+    }
+
+    #[test]
+    fn an_entry_without_the_flag_needs_a_rewrite() {
+        // What an older build wrote: the exe alone.
+        assert!(lacks_minimized(r#""C:\Program Files\Fasttube\fasttube.exe""#));
+        // What the plugin writes now.
+        assert!(!lacks_minimized(
+            r#""C:\Program Files\Fasttube\fasttube.exe" --minimized"#
+        ));
+        // The word inside a path is not the flag.
+        assert!(lacks_minimized(r#""C:\a--minimized\fasttube.exe""#));
     }
 
     #[test]
