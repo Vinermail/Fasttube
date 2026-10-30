@@ -276,7 +276,12 @@ pub fn spawn_ticker(app: AppHandle) {
             let mut announced = false;
             let mut last_key = String::new();
             let mut last_title = String::new();
-            let mut last_state = (false, 0i64);
+            // Nothing is published while the last state equals the current one,
+            // so the first tick has to differ from anything the engine can
+            // report. Otherwise a start with no history would send no state at
+            // all, and the session would stay unannounced ("Opened") until the
+            // first track instead of declaring itself Stopped or Paused.
+            let mut last_state = (true, -1i64);
             loop {
                 let state = app.state::<AppState>();
                 let visible = app
