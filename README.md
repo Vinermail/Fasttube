@@ -95,9 +95,22 @@ python scripts/portable.py
 `python -m ytapi.server` с `PYTHONPATH=api/src`, `PYTHONNOUSERSITE=1` и без
 `PYTHONHOME`, чтобы чужая машина не могла подсунуть свой Python.
 
-Установщик NSIS (`cargo tauri build`) кладёт те же две папки рядом с exe через
-`bundle.resources`, поэтому перед ним достаточно один раз выполнить
-`python scripts/portable.py --no-zip`.
+Установщик NSIS кладёт те же две папки рядом с exe через `bundle.resources`.
+В базовом `tauri.conf.json` этих ресурсов нет намеренно: `tauri-build` проверяет
+их существование ещё на компиляции, и обычный `cargo build` в свежем клоне падал
+бы без `dist/portable`. Поэтому сборка установщика передаёт наложение отдельным
+файлом:
+
+```bash
+python scripts/portable.py --no-zip
+cat > dist/bundle-resources.json <<'JSON'
+{"bundle":{"resources":{"dist/portable/api":"api","dist/portable/python":"python"}}}
+JSON
+cargo tauri build --config dist/bundle-resources.json
+```
+
+То же самое делает CI (`.github/workflows/release.yml`) на тег `v*` и по кнопке:
+собирает zip и NSIS-установщик и прикладывает `SHA256SUMS.txt`.
 
 Генерация gRPC-стабов после изменения `proto/player_api.proto`:
 

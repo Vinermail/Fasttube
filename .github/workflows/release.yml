@@ -47,8 +47,23 @@ jobs:
       - name: portable runtime and zip
         run: python scripts/portable.py
 
+      # The resources live in a build-time overlay, not in the committed config:
+      # tauri-build checks them at compile time, so a base config that names
+      # dist/portable makes every `cargo test` fail on a fresh clone.
       - name: installer
-        run: cargo tauri build
+        shell: pwsh
+        run: |
+          $config = @{
+            bundle = @{
+              resources = @{
+                "dist/portable/api" = "api"
+                "dist/portable/python" = "python"
+              }
+            }
+          }
+          $config | ConvertTo-Json -Depth 5 | Out-File -Encoding utf8 dist/bundle-resources.json
+          Get-Content dist/bundle-resources.json
+          cargo tauri build --config dist/bundle-resources.json
 
       - name: checksums
         shell: pwsh
